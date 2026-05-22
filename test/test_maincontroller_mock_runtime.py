@@ -952,7 +952,6 @@ def test_mock_runtime_start_done_start_done_keeps_zmq_drain_between_demos(tmp_pa
         assert controller is not None
 
         first_demo_dir = runtime.start_and_wait_for_frames()
-        first_demo_rows = len(controller.demo_store.zmq)
         first_monitor_key = controller.drop_monitors['zmq_source_1'].previous_key
         controller.finish_demo()
 
@@ -963,7 +962,6 @@ def test_mock_runtime_start_done_start_done_keeps_zmq_drain_between_demos(tmp_pa
         second_demo_dir = runtime.start_and_wait_for_frames()
         assert second_demo_dir != first_demo_dir
         assert len(controller.demo_store.zmq) >= 4
-        assert len(controller.demo_store.zmq) != first_demo_rows or second_demo_dir.exists()
         controller.finish_demo()
 
         assert controller.get_state() == ControllerState.WAIT_START
@@ -971,6 +969,11 @@ def test_mock_runtime_start_done_start_done_keeps_zmq_drain_between_demos(tmp_pa
         second_manifest = json.loads((second_demo_dir / 'manifest.json').read_text(encoding='utf-8'))
         assert first_manifest['status'] == 'done'
         assert second_manifest['status'] == 'done'
+        first_zmq = np.load(first_demo_dir / 'zmq_telemetry.npz', allow_pickle=True)
+        second_zmq = np.load(second_demo_dir / 'zmq_telemetry.npz', allow_pickle=True)
+        assert len(first_zmq['seq']) > 0
+        assert len(second_zmq['seq']) > 0
+        assert int(second_zmq['seq'][0]) > int(first_zmq['seq'][-1])
         assert runtime.rosbag.calls == [
             ('record', str(first_demo_dir / 'rosbag')),
             ('resume', None),
