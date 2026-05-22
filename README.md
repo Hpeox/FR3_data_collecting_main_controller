@@ -102,4 +102,8 @@ conda deactivate
 python -m pytest MainController/src/main_controller/test/test_maincontroller_mock_runtime.py -q
 ```
 
-该测试不需要真实 FT300S 或 Xense 硬件：FT300S 使用 100 Hz UDS mock，Xense 使用 30 Hz UDS mock，ZMQ 使用本进程 endpoint，rosbag2 service 和 RealSense metadata subscriber 使用 fake 对象。测试会覆盖 `s -> p -> s -> d`、`s -> d -> s -> d`、`s -> x -> s -> d`、暂停和 demo 间隙的 ZMQ 持续 drain、4 相机 / 8 metadata streams、`.npz`/manifest 保存，以及 RealSense fatal error 自动暂停和重启逻辑。
+该测试不需要真实 FT300S 或 Xense 硬件：FT300S 使用 100 Hz UDS mock，Xense 使用 30 Hz UDS mock，ZMQ 使用本进程 endpoint，rosbag2 service 和 RealSense metadata subscriber 使用 fake 对象。测试会覆盖 `s -> p -> s -> d`、`s -> d -> s -> d`、`s -> x -> s -> d`、paused resume rollback、rosbag pause/stop transaction failure、UDS finalization timeout / disconnect、暂停和 demo 间隙的 ZMQ 持续 drain、4 相机 / 8 metadata streams、`.npz`/manifest 保存，以及 RealSense fatal error 自动暂停和重启逻辑。
+
+## 硬件验收边界
+
+mock 测试只能证明 formal mode 会按配置要求 4 相机 / 8 image topics，并在缺失 topic 时 fail closed；不能证明现场物理 RealSense 均在线。最终硬件验收需要在真实四相机环境运行 formal capture，确认 `cam1` 到 `cam4` 的 color `image_raw` 和 `aligned_depth_to_color/image_raw` 均 ready、被 rosbag 记录，并通过 demo 完成后的 metadata post-check。
