@@ -71,3 +71,12 @@ RealSense 只订阅 metadata topic 进行时间戳和丢帧监控，不在主控
 conda deactivate
 python -m pytest MainController/src/MainController/test/test_maincontroller_core.py -q
 ```
+
+mock 集成测试：
+
+```bash
+conda deactivate
+python -m pytest MainController/src/MainController/test/test_maincontroller_mock_runtime.py -q
+```
+
+该测试不需要真实 FT300S 或 Xense 硬件：FT300S 使用 100 Hz UDS mock，Xense 使用 30 Hz UDS mock，ZMQ 使用本进程 endpoint，rosbag2 service 和 RealSense metadata subscriber 使用 fake 对象。测试会覆盖 `s -> p -> s -> d`、`s -> d -> s -> d`、`s -> x -> s -> d`、暂停和 demo 间隙的 ZMQ 持续 drain、4 相机 / 8 metadata streams、`.npz`/manifest 保存，以及 RealSense fatal error 自动暂停和重启逻辑。

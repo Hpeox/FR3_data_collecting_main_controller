@@ -164,8 +164,7 @@ class MainController:
 
         new_demo = state == ControllerState.WAIT_START
         if new_demo:
-            demo_tag = time.strftime('demo_%Y%m%d_%H%M%S')
-            demo_dir = self.session_dir / 'demos' / demo_tag
+            demo_dir = self._new_demo_dir()
             demo_dir.mkdir(parents=True, exist_ok=True)
             self.demo_store = DemoStore(demo_dir)
             self.demo_started_ns = time.time_ns()
@@ -455,6 +454,20 @@ class MainController:
         }
         manifest_path = self.demo_store.write_manifest(manifest)
         self.log('demo_saved', status=status, manifest=str(manifest_path), npz=npz_paths)
+
+    def _new_demo_dir(self) -> Path:
+        """Return a unique demo directory path for rapid repeated captures."""
+        base = time.strftime('demo_%Y%m%d_%H%M%S')
+        demos_dir = self.session_dir / 'demos'
+        candidate = demos_dir / base
+        if not candidate.exists():
+            return candidate
+        suffix = 1
+        while True:
+            candidate = demos_dir / f'{base}_{suffix:03d}'
+            if not candidate.exists():
+                return candidate
+            suffix += 1
 
     def reset_drop_baselines(self) -> None:
         """Reset every monitor baseline after pause/resume boundaries."""
