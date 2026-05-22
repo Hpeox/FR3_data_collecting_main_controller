@@ -7,3 +7,6 @@ __pycache__/
 tmp/
 temp/
 .cache/
+
+.pytest_cache/
+runtime_sessions/
