@@ -57,6 +57,8 @@ class MockUdsSensor:
         self.saved_file = str(socket_path.with_suffix('.npy'))
         self.commands: list[str] = []
         self.error_commands: set[str] = set()
+        self.no_ack_commands: set[str] = set()
+        self.close_commands: set[str] = set()
         self.received_magics: list[bytes] = []
         self.frames_sent = 0
         self._stop = threading.Event()
@@ -150,6 +152,11 @@ class MockUdsSensor:
             self.commands.append('DEMO_DONE_REQ')
             if self._send_error_for('DEMO_DONE_REQ'):
                 return
+            if self._close_for('DEMO_DONE_REQ'):
+                return
+            if self._no_ack_for('DEMO_DONE_REQ'):
+                self._collecting.clear()
+                return
             self._collecting.clear()
             self._send_ack('DEMO_DONE_REQ', saved_file=self.saved_file)
             return
@@ -196,6 +203,22 @@ class MockUdsSensor:
         if cmd not in self.error_commands:
             return False
         self._send(self.protocol.MsgType.ERROR, payload={'cmd': cmd, 'reason': f'injected {cmd} error'})
+        return True
+
+    def _no_ack_for(self, cmd: str) -> bool:
+        return cmd in self.no_ack_commands
+
+    def _close_for(self, cmd: str) -> bool:
+        if cmd not in self.close_commands:
+            return False
+        conn = self._conn
+        self._conn = None
+        self._collecting.clear()
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
         return True
 
     def _send(self, msg_type: Any, frame_id: int = -1, payload: dict[str, Any] | None = None) -> None:
@@ -1003,6 +1026,53 @@ def test_finish_rosbag_stop_failure_writes_failed_manifest_and_skips_postcheck(t
         assert manifest['realsense_rosbag_postcheck'] is None
         assert runtime.rosbag.postcheck_requirements == ()
         assert manifest['npz']
+
+
+def test_finish_demo_done_no_ack_times_out_and_stops(tmp_path, monkeypatch):
+    with MockRuntime(
+        tmp_path,
+        monkeypatch,
+        sensor_flush_timeout_s=0.05,
+        progress_log_period_s=0.01,
+    ) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+        runtime.xense.no_ack_commands.add('DEMO_DONE_REQ')
+
+        controller.finish_demo()
+
+        assert controller.get_state() == ControllerState.STOPPED
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'failed'
+        assert manifest['failure_stage'] == 'finish_command'
+        assert manifest['command_results']['ft300']['ok'] is True
+        assert manifest['command_results']['xense']['ok'] is False
+        assert manifest['command_results']['xense']['error']['error'] == 'ack_timeout'
+        assert manifest['command_results']['xense']['error']['timeout_s'] == 0.05
+
+
+def test_finish_demo_done_peer_disconnect_wakes_ack_waiter(tmp_path, monkeypatch):
+    with MockRuntime(
+        tmp_path,
+        monkeypatch,
+        sensor_flush_timeout_s=5.0,
+        progress_log_period_s=0.01,
+    ) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+        runtime.xense.close_commands.add('DEMO_DONE_REQ')
+
+        controller.finish_demo()
+
+        assert controller.get_state() == ControllerState.STOPPED
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'failed'
+        assert manifest['failure_stage'] == 'finish_command'
+        assert manifest['command_results']['ft300']['ok'] is True
+        assert manifest['command_results']['xense']['ok'] is False
+        assert manifest['command_results']['xense']['error']['error'] == 'uds_disconnected'
 
 
 def test_discard_partial_failure_writes_failed_manifest_and_stops(tmp_path, monkeypatch):

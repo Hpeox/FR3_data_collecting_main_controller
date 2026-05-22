@@ -26,7 +26,8 @@ ros2 run main_controller main_controller
 ```bash
 ros2 run main_controller main_controller -- \
   --zmq-connect tcp://127.0.0.1:6000 \
-  --output-dir ../runtime_sessions
+  --output-dir ../runtime_sessions \
+  --sensor-flush-timeout-s 300
 ```
 
 其他参数可用：
@@ -41,7 +42,8 @@ ros2 run main_controller main_controller -- --help
 
 - `s`：开始新 demo，或从暂停状态恢复采集。
 - `p`：暂停当前 demo；会暂停传感器和 rosbag2 recorder。
-- `d`：结束并保存当前 demo；传感器 flush 无硬超时。
+- `d`：结束并保存当前 demo；传感器 flush 默认有有限 timeout，可用
+  `--sensor-flush-timeout-s none` 显式切到无界等待。
 - `x`：丢弃当前 demo。
 - `q`：退出主控；如果正在 finalizing，会等待保存结束后退出。
 
@@ -54,6 +56,8 @@ post-checks passed；`discarded` 表示用户 `x` 发起的 discard transaction 
 operation 返回 `ERROR`、超时或抛错，都会在 manifest 中记录 `failure_stage`、
 `failure_reason` 和 per-operation command result。pause/discard/failed finish 会进入
 `ERROR -> STOPPING -> STOPPED`，避免主控状态与物理 sensor 状态不一致。
+UDS peer disconnect 会唤醒 pending ACK wait 并把对应 command 标记为
+`uds_disconnected`；flush timeout 会记录 `ack_timeout` 和 timeout 秒数。
 
 `s` 的 start/resume 流程由 MainController 作为多传感器事务 owner 协调。FT300S
 和 XenseTacSensor 必须全部 ACK `START_REQ`，且 rosbag `record` / `resume`

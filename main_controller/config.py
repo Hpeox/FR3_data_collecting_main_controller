@@ -38,6 +38,7 @@ class RuntimeConfig:
     startup_timeout_s: float = 60.0
     init_timeout_s: float = 15.0
     ack_timeout_s: float = 2.0
+    sensor_flush_timeout_s: float | None = 300.0
     progress_log_period_s: float = 5.0
     zmq_first_frame_timeout_s: float = 5.0
     rosbag_timeout_s: float = 15.0

@@ -303,8 +303,18 @@ class MainController:
         self.set_state(ControllerState.FINALIZING)
         self.log('finalizing_started')
 
-        ft_result = self._sensor_command_result_no_timeout(self.ft_client, MsgType.DEMO_DONE_REQ, 'DEMO_DONE_REQ')
-        xense_result = self._sensor_command_result_no_timeout(self.xense_client, MsgType.DEMO_DONE_REQ, 'DEMO_DONE_REQ')
+        ft_result = self._sensor_command_result_with_progress(
+            self.ft_client,
+            MsgType.DEMO_DONE_REQ,
+            'DEMO_DONE_REQ',
+            self.config.sensor_flush_timeout_s,
+        )
+        xense_result = self._sensor_command_result_with_progress(
+            self.xense_client,
+            MsgType.DEMO_DONE_REQ,
+            'DEMO_DONE_REQ',
+            self.config.sensor_flush_timeout_s,
+        )
         self.sensor_saved_files = {
             'ft300': None if ft_result['payload'] is None else ft_result['payload'].get('saved_file'),
             'xense': None if xense_result['payload'] is None else xense_result['payload'].get('saved_file'),
@@ -592,17 +602,29 @@ class MainController:
             'error': None if payload is not None else client.last_error_for(cmd_name),
         }
 
-    def _sensor_command_no_timeout(self, client: UdsClient, msg_type: MsgType, cmd_name: str) -> dict[str, Any] | None:
+    def _sensor_command_with_progress(
+        self,
+        client: UdsClient,
+        msg_type: MsgType,
+        cmd_name: str,
+        timeout_s: float | None,
+    ) -> dict[str, Any] | None:
         return client.send_and_wait_ack(
             msg_type,
             cmd_name,
-            timeout_s=None,
+            timeout_s=timeout_s,
             progress_period_s=self.config.progress_log_period_s,
             on_progress=lambda elapsed: self.log('sensor_flush_waiting', sensor=client.name, cmd=cmd_name, elapsed_s=round(elapsed, 3)),
         )
 
-    def _sensor_command_result_no_timeout(self, client: UdsClient, msg_type: MsgType, cmd_name: str) -> dict[str, Any]:
-        payload = self._sensor_command_no_timeout(client, msg_type, cmd_name)
+    def _sensor_command_result_with_progress(
+        self,
+        client: UdsClient,
+        msg_type: MsgType,
+        cmd_name: str,
+        timeout_s: float | None,
+    ) -> dict[str, Any]:
+        payload = self._sensor_command_with_progress(client, msg_type, cmd_name, timeout_s)
         self.log('sensor_command', sensor=client.name, cmd=cmd_name, ok=payload is not None, payload=payload)
         return {
             'sensor': client.name,
@@ -822,6 +844,13 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
+def _float_or_none(value: str) -> float | None:
+    lowered = value.strip().lower()
+    if lowered in {'none', 'unbounded'}:
+        return None
+    return float(value)
+
+
 def parse_args() -> argparse.Namespace:
     """Parse MainController CLI arguments."""
     parser = argparse.ArgumentParser(description='MainController for multi-sensor data collection')
@@ -829,6 +858,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--output-dir', default=None)
     parser.add_argument('--startup-timeout-s', type=float, default=60.0)
     parser.add_argument('--ack-timeout-s', type=float, default=2.0)
+    parser.add_argument('--sensor-flush-timeout-s', type=_float_or_none, default=300.0)
     parser.add_argument('--progress-log-period-s', type=float, default=5.0)
     return parser.parse_args()
 
@@ -841,6 +871,7 @@ def build_config(args: argparse.Namespace) -> RuntimeConfig:
         zmq_connect=args.zmq_connect,
         startup_timeout_s=args.startup_timeout_s,
         ack_timeout_s=args.ack_timeout_s,
+        sensor_flush_timeout_s=args.sensor_flush_timeout_s,
         progress_log_period_s=args.progress_log_period_s,
     )
 

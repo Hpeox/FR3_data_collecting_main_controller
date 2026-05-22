@@ -160,6 +160,7 @@ class UdsClient:
 
         if not self.send_msg(msg_type):
             with self._ack_lock:
+                self._ack_errors.setdefault(cmd_name, {'error': 'send_failed', 'cmd': cmd_name})
                 self._pending_ack_cmds.discard(cmd_name)
             return None
 
@@ -170,6 +171,8 @@ class UdsClient:
                 if timeout_s is not None:
                     remaining = timeout_s - (time.monotonic() - start)
                     if remaining <= 0:
+                        with self._ack_lock:
+                            self._ack_errors[cmd_name] = {'error': 'ack_timeout', 'cmd': cmd_name, 'timeout_s': timeout_s}
                         return None
                     wait_s = min(wait_s, remaining)
                 if event.wait(timeout=wait_s):
@@ -293,6 +296,12 @@ class UdsClient:
 
     def _mark_disconnected(self) -> None:
         self._connected.clear()
+        with self._ack_lock:
+            for pending_cmd in list(self._pending_ack_cmds):
+                self._ack_errors[pending_cmd] = {'error': 'uds_disconnected', 'cmd': pending_cmd}
+                event = self._ack_events.get(pending_cmd)
+                if event is not None:
+                    event.set()
         self._close_socket()
 
     def _close_socket(self) -> None:
