@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import struct
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from MainController.drop_monitor import DropMonitor
 from MainController.realsense_metadata import metadata_int, metadata_ms_to_ns
