@@ -266,16 +266,27 @@ class MainController:
         self.log('pause_started', reason=reason)
         ft_result = self._sensor_command_result(self.ft_client, MsgType.PAUSE_REQ, 'PAUSE_REQ', self.config.ack_timeout_s)
         xense_result = self._sensor_command_result(self.xense_client, MsgType.PAUSE_REQ, 'PAUSE_REQ', self.config.ack_timeout_s)
+        rosbag_pause_result: dict[str, Any] = {'ok': True, 'action': 'pause'}
         try:
             if self.rosbag is not None:
                 self.rosbag.pause(timeout_s=self.config.rosbag_timeout_s)
         except Exception as exc:
+            rosbag_pause_result = {'ok': False, 'action': 'pause', 'error': str(exc)}
             self.log('rosbag_pause_failed', error=str(exc))
+        if not rosbag_pause_result['ok']:
+            self._handle_command_transaction_failure(
+                failure_stage='rosbag_pause',
+                failure_reason='rosbag pause failed',
+                command_results={'ft300': ft_result, 'xense': xense_result, 'rosbag_pause': rosbag_pause_result},
+                clear_demo=False,
+                stop_system=True,
+            )
+            return False
         if not ft_result['ok'] or not xense_result['ok']:
             self._handle_command_transaction_failure(
                 failure_stage='pause_command',
                 failure_reason='required sensor PAUSE_REQ failed',
-                command_results={'ft300': ft_result, 'xense': xense_result},
+                command_results={'ft300': ft_result, 'xense': xense_result, 'rosbag_pause': rosbag_pause_result},
                 clear_demo=False,
                 stop_system=True,
             )
@@ -299,13 +310,15 @@ class MainController:
             'xense': None if xense_result['payload'] is None else xense_result['payload'].get('saved_file'),
         }
 
+        rosbag_stop_result: dict[str, Any] = {'ok': True, 'action': 'stop'}
         try:
             if self.rosbag is not None:
                 self.rosbag.stop(timeout_s=self.config.rosbag_timeout_s)
         except Exception as exc:
+            rosbag_stop_result = {'ok': False, 'action': 'stop', 'error': str(exc)}
             self.log('rosbag_stop_failed', error=str(exc))
 
-        command_failed = not ft_result['ok'] or not xense_result['ok']
+        command_failed = not ft_result['ok'] or not xense_result['ok'] or not rosbag_stop_result['ok']
         if command_failed:
             self.realsense_postcheck_manifest = None
             status = 'failed'
@@ -316,10 +329,16 @@ class MainController:
             status = 'failed'
         extra = None
         if command_failed:
+            if not rosbag_stop_result['ok']:
+                failure_stage = 'rosbag_stop'
+                failure_reason = 'rosbag stop failed'
+            else:
+                failure_stage = 'finish_command'
+                failure_reason = 'required sensor DEMO_DONE_REQ failed'
             extra = {
-                'failure_stage': 'finish_command',
-                'failure_reason': 'required sensor DEMO_DONE_REQ failed',
-                'command_results': {'ft300': ft_result, 'xense': xense_result},
+                'failure_stage': failure_stage,
+                'failure_reason': failure_reason,
+                'command_results': {'ft300': ft_result, 'xense': xense_result, 'rosbag_stop': rosbag_stop_result},
             }
         self._save_current_demo(status=status, extra=extra)
         if command_failed:

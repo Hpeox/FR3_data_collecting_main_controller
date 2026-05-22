@@ -941,6 +941,26 @@ def test_pause_partial_failure_writes_failed_manifest_and_stops(tmp_path, monkey
         assert manifest['npz'] == {}
 
 
+def test_rosbag_pause_failure_writes_failed_manifest_and_stops(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+        runtime.rosbag.fail_methods.add('pause')
+
+        assert controller.pause_demo(reason='test') is False
+
+        assert controller.get_state() == ControllerState.STOPPED
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'failed'
+        assert manifest['failure_stage'] == 'rosbag_pause'
+        assert manifest['command_results']['ft300']['ok'] is True
+        assert manifest['command_results']['xense']['ok'] is True
+        assert manifest['command_results']['rosbag_pause']['ok'] is False
+        assert manifest['command_results']['rosbag_pause']['error'] == 'injected rosbag pause failure'
+        assert manifest['npz'] == {}
+
+
 def test_finish_partial_failure_writes_failed_manifest_and_stops(tmp_path, monkeypatch):
     with MockRuntime(tmp_path, monkeypatch) as runtime:
         controller = runtime.controller
@@ -958,6 +978,30 @@ def test_finish_partial_failure_writes_failed_manifest_and_stops(tmp_path, monke
         assert manifest['sensor_saved_files']['xense'] is None
         assert manifest['command_results']['ft300']['ok'] is True
         assert manifest['command_results']['xense']['ok'] is False
+        assert manifest['npz']
+
+
+def test_finish_rosbag_stop_failure_writes_failed_manifest_and_skips_postcheck(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+        runtime.rosbag.fail_methods.add('stop')
+
+        controller.finish_demo()
+
+        assert controller.get_state() == ControllerState.STOPPED
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'failed'
+        assert manifest['failure_stage'] == 'rosbag_stop'
+        assert manifest['sensor_saved_files']['ft300'] == runtime.ft300.saved_file
+        assert manifest['sensor_saved_files']['xense'] == runtime.xense.saved_file
+        assert manifest['command_results']['ft300']['ok'] is True
+        assert manifest['command_results']['xense']['ok'] is True
+        assert manifest['command_results']['rosbag_stop']['ok'] is False
+        assert manifest['command_results']['rosbag_stop']['error'] == 'injected rosbag stop failure'
+        assert manifest['realsense_rosbag_postcheck'] is None
+        assert runtime.rosbag.postcheck_requirements == ()
         assert manifest['npz']
 
 
