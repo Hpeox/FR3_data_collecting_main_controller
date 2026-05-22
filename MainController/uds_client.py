@@ -106,6 +106,8 @@ class UdsClient:
         self._ack_lock = threading.Lock()
         self._ack_events: dict[str, threading.Event] = {}
         self._ack_payloads: dict[str, dict[str, Any]] = {}
+        self._ack_errors: dict[str, dict[str, Any]] = {}
+        self._pending_ack_cmds: set[str] = set()
 
     def start(self) -> None:
         """Start background connection and receive handling."""
@@ -153,24 +155,34 @@ class UdsClient:
         event.clear()
         with self._ack_lock:
             self._ack_payloads.pop(cmd_name, None)
+            self._ack_errors.pop(cmd_name, None)
+            self._pending_ack_cmds.add(cmd_name)
 
         if not self.send_msg(msg_type):
+            with self._ack_lock:
+                self._pending_ack_cmds.discard(cmd_name)
             return None
 
-        start = time.monotonic()
-        while not self._stop.is_set():
-            wait_s = progress_period_s
-            if timeout_s is not None:
-                remaining = timeout_s - (time.monotonic() - start)
-                if remaining <= 0:
-                    return None
-                wait_s = min(wait_s, remaining)
-            if event.wait(timeout=wait_s):
-                with self._ack_lock:
-                    return self._ack_payloads.get(cmd_name, {})
-            if on_progress is not None:
-                on_progress(time.monotonic() - start)
-        return None
+        try:
+            start = time.monotonic()
+            while not self._stop.is_set():
+                wait_s = progress_period_s
+                if timeout_s is not None:
+                    remaining = timeout_s - (time.monotonic() - start)
+                    if remaining <= 0:
+                        return None
+                    wait_s = min(wait_s, remaining)
+                if event.wait(timeout=wait_s):
+                    with self._ack_lock:
+                        if cmd_name in self._ack_errors:
+                            return None
+                        return self._ack_payloads.get(cmd_name, {})
+                if on_progress is not None:
+                    on_progress(time.monotonic() - start)
+            return None
+        finally:
+            with self._ack_lock:
+                self._pending_ack_cmds.discard(cmd_name)
 
     def wait_init_ready(self, timeout_s: float) -> bool:
         """Send INIT_REQ and wait for INIT_READY."""
@@ -239,6 +251,9 @@ class UdsClient:
         if event.msg_type == MsgType.INIT_READY:
             self.init_ready.set()
             return
+        if event.msg_type == MsgType.ERROR:
+            self._handle_error_event(event.payload)
+            return
         if event.msg_type != MsgType.ACK:
             return
         cmd = event.payload.get('cmd')
@@ -247,7 +262,21 @@ class UdsClient:
         ack_event = self._ack_event(cmd)
         with self._ack_lock:
             self._ack_payloads[cmd] = event.payload
+            self._ack_errors.pop(cmd, None)
         ack_event.set()
+
+    def _handle_error_event(self, payload: dict[str, Any]) -> None:
+        cmd = payload.get('cmd')
+        with self._ack_lock:
+            if isinstance(cmd, str) and cmd in self._pending_ack_cmds:
+                pending = [cmd]
+            else:
+                pending = list(self._pending_ack_cmds)
+            for pending_cmd in pending:
+                self._ack_errors[pending_cmd] = payload
+                event = self._ack_events.get(pending_cmd)
+                if event is not None:
+                    event.set()
 
     def _ack_event(self, cmd_name: str) -> threading.Event:
         with self._ack_lock:

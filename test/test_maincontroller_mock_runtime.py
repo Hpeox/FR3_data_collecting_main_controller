@@ -21,6 +21,7 @@ from MainController.buffers import DemoStore
 from MainController.config import RuntimeConfig
 from MainController.main import ControllerState, MainController
 from MainController.realsense_metadata import RealSenseMetadataEvent
+from MainController.uds_client import MsgType
 from MainController.zmq_telemetry import FRAME_STRUCT, MAGIC, VERSION
 import XenseTacSensor.protocol.messages as xense_protocol
 
@@ -54,6 +55,7 @@ class MockUdsSensor:
         self.protocol = protocol
         self.saved_file = str(socket_path.with_suffix('.npy'))
         self.commands: list[str] = []
+        self.error_commands: set[str] = set()
         self.received_magics: list[bytes] = []
         self.frames_sent = 0
         self._stop = threading.Event()
@@ -131,26 +133,36 @@ class MockUdsSensor:
             return
         if msg_type == protocol_msg.START_REQ:
             self.commands.append('START_REQ')
+            if self._send_error_for('START_REQ'):
+                return
             self._send_ack('START_REQ')
             self._collecting.set()
             return
         if msg_type == protocol_msg.PAUSE_REQ:
             self.commands.append('PAUSE_REQ')
+            if self._send_error_for('PAUSE_REQ'):
+                return
             self._collecting.clear()
             self._send_ack('PAUSE_REQ')
             return
         if msg_type == protocol_msg.DEMO_DONE_REQ:
             self.commands.append('DEMO_DONE_REQ')
+            if self._send_error_for('DEMO_DONE_REQ'):
+                return
             self._collecting.clear()
             self._send_ack('DEMO_DONE_REQ', saved_file=self.saved_file)
             return
         if msg_type == protocol_msg.DEMO_DISCARD_REQ:
             self.commands.append('DEMO_DISCARD_REQ')
+            if self._send_error_for('DEMO_DISCARD_REQ'):
+                return
             self._collecting.clear()
             self._send_ack('DEMO_DISCARD_REQ')
             return
         if msg_type == protocol_msg.STOP_REQ:
             self.commands.append('STOP_REQ')
+            if self._send_error_for('STOP_REQ'):
+                return
             self._collecting.clear()
             self._send_ack('STOP_REQ')
 
@@ -178,6 +190,12 @@ class MockUdsSensor:
     def _send_ack(self, cmd: str, **extra: Any) -> None:
         payload = {'cmd': cmd, **extra}
         self._send(self.protocol.MsgType.ACK, payload=payload)
+
+    def _send_error_for(self, cmd: str) -> bool:
+        if cmd not in self.error_commands:
+            return False
+        self._send(self.protocol.MsgType.ERROR, payload={'cmd': cmd, 'reason': f'injected {cmd} error'})
+        return True
 
     def _send(self, msg_type: Any, frame_id: int = -1, payload: dict[str, Any] | None = None) -> None:
         conn = self._conn
@@ -384,6 +402,25 @@ def emit_realsense_metadata(controller: MainController, frame_number: int) -> No
         )
 
 
+def run_with_timeout(fn, timeout_s: float = 1.0):
+    result: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            result['value'] = fn()
+        except BaseException as exc:
+            result['exc'] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout_s)
+    if thread.is_alive():
+        raise AssertionError('operation did not complete before timeout')
+    if 'exc' in result:
+        raise result['exc']
+    return result.get('value')
+
+
 def test_default_realsense_topics_are_four_cameras_eight_streams():
     topics = RuntimeConfig().realsense_metadata_topics
 
@@ -453,6 +490,58 @@ def test_mock_runtime_start_pause_resume_done(tmp_path, monkeypatch):
         assert len(xense_npz['frame_id']) >= 1
         assert len(realsense_npz['topic']) == 16
         assert len(zmq_npz['seq']) >= 4
+
+
+def test_mock_runtime_paused_finish_returns_to_wait_start(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        runtime.start_and_wait_for_frames()
+
+        assert controller.pause_demo(reason='test')
+        assert controller.get_state() == ControllerState.PAUSED
+
+        run_with_timeout(controller.finish_demo)
+
+        assert controller.get_state() == ControllerState.WAIT_START
+        assert runtime.ft300.commands == ['START_REQ', 'PAUSE_REQ', 'DEMO_DONE_REQ']
+        assert runtime.xense.commands == ['START_REQ', 'PAUSE_REQ', 'DEMO_DONE_REQ']
+
+
+def test_mock_runtime_paused_discard_returns_to_wait_start(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        runtime.start_and_wait_for_frames()
+
+        assert controller.pause_demo(reason='test')
+        assert controller.get_state() == ControllerState.PAUSED
+
+        run_with_timeout(controller.discard_demo)
+
+        assert controller.get_state() == ControllerState.WAIT_START
+        assert controller.demo_store is None
+        assert runtime.ft300.commands == ['START_REQ', 'PAUSE_REQ', 'DEMO_DISCARD_REQ']
+        assert runtime.xense.commands == ['START_REQ', 'PAUSE_REQ', 'DEMO_DISCARD_REQ']
+
+
+def test_uds_error_response_wakes_ack_waiter(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        runtime.xense.error_commands.add('DEMO_DONE_REQ')
+
+        result = run_with_timeout(
+            lambda: controller.xense_client.send_and_wait_ack(
+                MsgType.DEMO_DONE_REQ,
+                'DEMO_DONE_REQ',
+                timeout_s=None,
+                progress_period_s=100.0,
+            )
+        )
+
+        assert result is None
+        assert runtime.xense.commands == ['DEMO_DONE_REQ']
 
 
 def test_mock_runtime_start_done_start_done_keeps_zmq_drain_between_demos(tmp_path, monkeypatch):
