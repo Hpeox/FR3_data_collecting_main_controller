@@ -496,6 +496,14 @@ def run_with_timeout(fn, timeout_s: float = 1.0):
     return result.get('value')
 
 
+def assert_npz_fields_same_length(npz) -> int:
+    assert npz.files
+    expected = len(npz[npz.files[0]])
+    for field in npz.files:
+        assert len(npz[field]) == expected, field
+    return expected
+
+
 def test_default_realsense_topics_are_four_cameras_eight_streams():
     topics = RuntimeConfig().realsense_metadata_topics
 
@@ -561,16 +569,20 @@ def test_mock_runtime_start_pause_resume_done(tmp_path, monkeypatch):
         xense_npz = np.load(demo_dir / 'xense_timestamps.npz', allow_pickle=True)
         realsense_npz = np.load(demo_dir / 'realsense_metadata.npz', allow_pickle=True)
         zmq_npz = np.load(demo_dir / 'zmq_telemetry.npz', allow_pickle=True)
+        ft_rows = assert_npz_fields_same_length(ft_npz)
+        xense_rows = assert_npz_fields_same_length(xense_npz)
+        realsense_rows = assert_npz_fields_same_length(realsense_npz)
+        zmq_rows = assert_npz_fields_same_length(zmq_npz)
         assert manifest['frame_counts'] == {
-            'ft300': len(ft_npz['frame_id']),
-            'xense': len(xense_npz['frame_id']),
-            'realsense': len(realsense_npz['topic']),
-            'zmq': len(zmq_npz['seq']),
+            'ft300': ft_rows,
+            'xense': xense_rows,
+            'realsense': realsense_rows,
+            'zmq': zmq_rows,
         }
-        assert len(ft_npz['frame_id']) >= 4
-        assert len(xense_npz['frame_id']) >= 1
-        assert len(realsense_npz['topic']) == 16
-        assert len(zmq_npz['seq']) >= 4
+        assert ft_rows >= 4
+        assert xense_rows >= 1
+        assert realsense_rows == 16
+        assert zmq_rows >= 4
 
 
 def test_mock_runtime_paused_finish_returns_to_wait_start(tmp_path, monkeypatch):
