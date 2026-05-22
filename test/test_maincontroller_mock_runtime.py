@@ -14,13 +14,15 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
+import FT300S.protocol.messages as ft300_protocol
 from MainController.buffers import DemoStore
 from MainController.config import RuntimeConfig
 from MainController.main import ControllerState, MainController
 from MainController.realsense_metadata import RealSenseMetadataEvent
-from MainController.uds_client import HEADER_SIZE, MsgType, decode_payload, pack_message, unpack_header
 from MainController.zmq_telemetry import FRAME_STRUCT, MAGIC, VERSION
+import XenseTacSensor.protocol.messages as xense_protocol
 
 
 def wait_for(predicate, timeout_s: float = 2.0) -> None:
@@ -45,12 +47,14 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
 
 
 class MockUdsSensor:
-    def __init__(self, name: str, socket_path: Path, hz: float):
+    def __init__(self, name: str, socket_path: Path, hz: float, protocol: Any):
         self.name = name
         self.socket_path = socket_path
         self.hz = hz
+        self.protocol = protocol
         self.saved_file = str(socket_path.with_suffix('.npy'))
         self.commands: list[str] = []
+        self.received_magics: list[bytes] = []
         self.frames_sent = 0
         self._stop = threading.Event()
         self._collecting = threading.Event()
@@ -108,10 +112,11 @@ class MockUdsSensor:
     def _serve_connection(self, conn: socket.socket) -> None:
         while not self._stop.is_set():
             try:
-                header = recv_exact(conn, HEADER_SIZE)
-                _version, msg_type, _flags, payload_len, _frame_id = unpack_header(header)
+                header = recv_exact(conn, self.protocol.HEADER_SIZE)
+                self.received_magics.append(header[:2])
+                _version, msg_type, _flags, payload_len, _frame_id = self.protocol.unpack_header(header)
                 if payload_len:
-                    decode_payload(recv_exact(conn, payload_len))
+                    self.protocol.decode_payload(recv_exact(conn, payload_len))
                 self._handle_command(msg_type)
             except socket.timeout:
                 continue
@@ -119,31 +124,32 @@ class MockUdsSensor:
                 self._collecting.clear()
                 return
 
-    def _handle_command(self, msg_type: MsgType) -> None:
-        if msg_type == MsgType.INIT_REQ:
-            self._send(MsgType.INIT_READY, payload={'sensor': self.name})
+    def _handle_command(self, msg_type: Any) -> None:
+        protocol_msg = self.protocol.MsgType
+        if msg_type == protocol_msg.INIT_REQ:
+            self._send(protocol_msg.INIT_READY, payload={'sensor': self.name})
             return
-        if msg_type == MsgType.START_REQ:
+        if msg_type == protocol_msg.START_REQ:
             self.commands.append('START_REQ')
             self._send_ack('START_REQ')
             self._collecting.set()
             return
-        if msg_type == MsgType.PAUSE_REQ:
+        if msg_type == protocol_msg.PAUSE_REQ:
             self.commands.append('PAUSE_REQ')
             self._collecting.clear()
             self._send_ack('PAUSE_REQ')
             return
-        if msg_type == MsgType.DEMO_DONE_REQ:
+        if msg_type == protocol_msg.DEMO_DONE_REQ:
             self.commands.append('DEMO_DONE_REQ')
             self._collecting.clear()
             self._send_ack('DEMO_DONE_REQ', saved_file=self.saved_file)
             return
-        if msg_type == MsgType.DEMO_DISCARD_REQ:
+        if msg_type == protocol_msg.DEMO_DISCARD_REQ:
             self.commands.append('DEMO_DISCARD_REQ')
             self._collecting.clear()
             self._send_ack('DEMO_DISCARD_REQ')
             return
-        if msg_type == MsgType.STOP_REQ:
+        if msg_type == protocol_msg.STOP_REQ:
             self.commands.append('STOP_REQ')
             self._collecting.clear()
             self._send_ack('STOP_REQ')
@@ -166,18 +172,18 @@ class MockUdsSensor:
                 payload = {'timestamp_ns_0': stamp_ns, 'timestamp_ns_1': stamp_ns + 100}
             else:
                 payload = {'timestamp_ns': stamp_ns}
-            self._send(MsgType.FRAME_READY, frame_id=self.frames_sent, payload=payload)
+            self._send(self.protocol.MsgType.FRAME_READY, frame_id=self.frames_sent, payload=payload)
             next_time += period_s
 
     def _send_ack(self, cmd: str, **extra: Any) -> None:
         payload = {'cmd': cmd, **extra}
-        self._send(MsgType.ACK, payload=payload)
+        self._send(self.protocol.MsgType.ACK, payload=payload)
 
-    def _send(self, msg_type: MsgType, frame_id: int = -1, payload: dict[str, Any] | None = None) -> None:
+    def _send(self, msg_type: Any, frame_id: int = -1, payload: dict[str, Any] | None = None) -> None:
         conn = self._conn
         if conn is None:
             return
-        data = pack_message(msg_type, frame_id=frame_id, payload=payload)
+        data = self.protocol.pack_message(msg_type, frame_id=frame_id, payload=payload)
         with self._send_lock:
             try:
                 conn.sendall(data)
@@ -302,8 +308,8 @@ class MockRuntime:
         from MainController import main as main_module
 
         self.tmp_path = tmp_path
-        self.ft300 = MockUdsSensor('ft300', tmp_path / 'ft300.sock', hz=100.0)
-        self.xense = MockUdsSensor('xense', tmp_path / 'xense.sock', hz=30.0)
+        self.ft300 = MockUdsSensor('ft300', tmp_path / 'ft300.sock', hz=100.0, protocol=ft300_protocol)
+        self.xense = MockUdsSensor('xense', tmp_path / 'xense.sock', hz=30.0, protocol=xense_protocol)
         self.zmq_pub = LocalZmqTelemetryPublisher(hz=80.0)
         self.rosbag = FakeRosbagControl()
 
@@ -333,6 +339,10 @@ class MockRuntime:
         self._monkeypatch.setattr(self.controller, '_start_processes', lambda: None)
         self.controller.startup()
         assert self.controller.get_state() == ControllerState.WAIT_START
+        assert self.ft300.received_magics
+        assert self.xense.received_magics
+        assert all(magic == ft300_protocol.MAGIC for magic in self.ft300.received_magics)
+        assert all(magic == xense_protocol.MAGIC for magic in self.xense.received_magics)
         return self
 
     def __exit__(self, _exc_type, _exc, _tb):
@@ -427,6 +437,8 @@ def test_mock_runtime_start_pause_resume_done(tmp_path, monkeypatch):
         assert runtime.ft300.commands[:3] == ['START_REQ', 'PAUSE_REQ', 'START_REQ']
         assert 'DEMO_DONE_REQ' in runtime.ft300.commands
         assert 'DEMO_DONE_REQ' in runtime.xense.commands
+        assert all(magic == ft300_protocol.MAGIC for magic in runtime.ft300.received_magics)
+        assert all(magic == xense_protocol.MAGIC for magic in runtime.xense.received_magics)
 
         manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'done'

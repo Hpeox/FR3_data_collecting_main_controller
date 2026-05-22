@@ -17,6 +17,7 @@ from .drop_monitor import DropMonitor, DropWarning
 from .processes import ManagedProcess, bash_cmd
 from .realsense_metadata import RealSenseMetadataEvent, RealSenseMetadataMonitor
 from .rosbag_control import RosbagControl
+from .uds_client import MAGIC as FT300_MAGIC
 from .uds_client import MsgType, UdsClient, UdsEvent
 from .zmq_telemetry import TelemetryFrame, ZmqTelemetryReceiver
 
@@ -101,8 +102,8 @@ class MainController:
         self.rosbag: RosbagControl | None = None
         self.realsense_monitor: RealSenseMetadataMonitor | None = None
         self.zmq_receiver: ZmqTelemetryReceiver | None = None
-        self.ft_client = UdsClient('ft300', config.ft_uds_path, self._on_uds_event)
-        self.xense_client = UdsClient('xense', config.xense_uds_path, self._on_uds_event)
+        self.ft_client = UdsClient('ft300', config.ft_uds_path, self._on_uds_event, magic=FT300_MAGIC)
+        self.xense_client = UdsClient('xense', config.xense_uds_path, self._on_uds_event, magic=b'XS')
 
     def run(self) -> None:
         """Start the controller and process commands until shutdown."""

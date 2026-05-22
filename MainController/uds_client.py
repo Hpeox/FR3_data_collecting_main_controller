@@ -51,19 +51,20 @@ def pack_message(
     payload: dict[str, Any] | None = None,
     version: int = 1,
     flags: int = 0,
+    magic: bytes = MAGIC,
 ) -> bytes:
     """Serialize a UDS protocol message."""
     payload_bytes = b''
     if payload is not None:
         payload_bytes = json.dumps(payload, ensure_ascii=True).encode('utf-8')
-    header = struct.pack(HEADER_FMT, MAGIC, version, int(msg_type), flags, len(payload_bytes), int(frame_id))
+    header = struct.pack(HEADER_FMT, magic, version, int(msg_type), flags, len(payload_bytes), int(frame_id))
     return header + payload_bytes
 
 
-def unpack_header(header_bytes: bytes) -> tuple[int, MsgType, int, int, int]:
+def unpack_header(header_bytes: bytes, expected_magic: bytes = MAGIC) -> tuple[int, MsgType, int, int, int]:
     """Deserialize and validate a UDS header."""
     magic, version, msg_type, flags, payload_len, frame_id = struct.unpack(HEADER_FMT, header_bytes)
-    if magic != MAGIC:
+    if magic != expected_magic:
         raise ValueError('invalid UDS magic')
     return int(version), MsgType(msg_type), int(flags), int(payload_len), int(frame_id)
 
@@ -84,6 +85,7 @@ class UdsClient:
         socket_path: str,
         on_event: Callable[[UdsEvent], None],
         protocol_version: int = 1,
+        magic: bytes = MAGIC,
         retry_interval_s: float = 0.5,
         recv_timeout_s: float = 0.2,
     ):
@@ -91,6 +93,7 @@ class UdsClient:
         self.socket_path = socket_path
         self.on_event = on_event
         self.protocol_version = protocol_version
+        self.magic = magic
         self.retry_interval_s = retry_interval_s
         self.recv_timeout_s = recv_timeout_s
         self.init_ready = threading.Event()
@@ -125,7 +128,7 @@ class UdsClient:
 
     def send_msg(self, msg_type: MsgType, frame_id: int = -1, payload: dict[str, Any] | None = None) -> bool:
         """Send one message if connected."""
-        data = pack_message(msg_type, frame_id=frame_id, payload=payload, version=self.protocol_version)
+        data = pack_message(msg_type, frame_id=frame_id, payload=payload, version=self.protocol_version, magic=self.magic)
         with self._send_lock:
             sock = self._sock
             if sock is None:
@@ -183,7 +186,7 @@ class UdsClient:
                 continue
             try:
                 header = self._recv_exact(HEADER_SIZE)
-                version, msg_type, _flags, payload_len, frame_id = unpack_header(header)
+                version, msg_type, _flags, payload_len, frame_id = unpack_header(header, expected_magic=self.magic)
                 if version != self.protocol_version:
                     raise ValueError(f'protocol version mismatch: {version}')
                 payload_bytes = self._recv_exact(payload_len) if payload_len else b''
