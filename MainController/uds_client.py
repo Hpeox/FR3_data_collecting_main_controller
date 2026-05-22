@@ -191,6 +191,11 @@ class UdsClient:
         self.send_msg(MsgType.INIT_REQ)
         return self.init_ready.wait(timeout=timeout_s)
 
+    def last_error_for(self, cmd_name: str) -> dict[str, Any] | None:
+        """Return the last relevant ERROR payload observed while waiting for cmd."""
+        with self._ack_lock:
+            return self._ack_errors.get(cmd_name)
+
     def _run(self) -> None:
         while not self._stop.is_set():
             if not self._ensure_connected():

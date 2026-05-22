@@ -366,6 +366,9 @@ class FakeSensorClient:
     def stop(self) -> None:
         self.stop_count += 1
 
+    def last_error_for(self, _cmd_name: str):
+        return None
+
 
 class FakeProcess:
     def __init__(self):
@@ -844,6 +847,62 @@ def test_realsense_debug_degraded_mode_uses_configured_subset(tmp_path, monkeypa
         assert manifest['realsense_image_readiness']['mode'] == 'debug_degraded'
         assert manifest['realsense_image_readiness']['required_topics'] == list(subset)
         assert manifest['realsense_rosbag_postcheck']['required_topics'] == list(subset)
+
+
+def test_pause_partial_failure_writes_failed_manifest_and_stops(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+        runtime.xense.error_commands.add('PAUSE_REQ')
+
+        assert controller.pause_demo(reason='test') is False
+
+        assert controller.get_state() == ControllerState.STOPPED
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'failed'
+        assert manifest['failure_stage'] == 'pause_command'
+        assert manifest['command_results']['ft300']['ok'] is True
+        assert manifest['command_results']['xense']['ok'] is False
+        assert manifest['npz'] == {}
+
+
+def test_finish_partial_failure_writes_failed_manifest_and_stops(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+        runtime.xense.error_commands.add('DEMO_DONE_REQ')
+
+        controller.finish_demo()
+
+        assert controller.get_state() == ControllerState.STOPPED
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'failed'
+        assert manifest['failure_stage'] == 'finish_command'
+        assert manifest['sensor_saved_files']['ft300'] == runtime.ft300.saved_file
+        assert manifest['sensor_saved_files']['xense'] is None
+        assert manifest['command_results']['ft300']['ok'] is True
+        assert manifest['command_results']['xense']['ok'] is False
+        assert manifest['npz']
+
+
+def test_discard_partial_failure_writes_failed_manifest_and_stops(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+        runtime.xense.error_commands.add('DEMO_DISCARD_REQ')
+
+        controller.discard_demo()
+
+        assert controller.get_state() == ControllerState.STOPPED
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'failed'
+        assert manifest['failure_stage'] == 'discard_command'
+        assert manifest['command_results']['ft300']['ok'] is True
+        assert manifest['command_results']['xense']['ok'] is False
+        assert manifest['npz'] == {}
 
 
 def test_zmq_warning_does_not_stop_controller(tmp_path):

@@ -256,16 +256,25 @@ class MainController:
             return False
         self.set_state(ControllerState.PAUSED)
         self.log('pause_started', reason=reason)
-        ft_ok = self._sensor_command(self.ft_client, MsgType.PAUSE_REQ, 'PAUSE_REQ', self.config.ack_timeout_s)
-        xense_ok = self._sensor_command(self.xense_client, MsgType.PAUSE_REQ, 'PAUSE_REQ', self.config.ack_timeout_s)
+        ft_result = self._sensor_command_result(self.ft_client, MsgType.PAUSE_REQ, 'PAUSE_REQ', self.config.ack_timeout_s)
+        xense_result = self._sensor_command_result(self.xense_client, MsgType.PAUSE_REQ, 'PAUSE_REQ', self.config.ack_timeout_s)
         try:
             if self.rosbag is not None:
                 self.rosbag.pause(timeout_s=self.config.rosbag_timeout_s)
         except Exception as exc:
             self.log('rosbag_pause_failed', error=str(exc))
+        if not ft_result['ok'] or not xense_result['ok']:
+            self._handle_command_transaction_failure(
+                failure_stage='pause_command',
+                failure_reason='required sensor PAUSE_REQ failed',
+                command_results={'ft300': ft_result, 'xense': xense_result},
+                clear_demo=False,
+                stop_system=True,
+            )
+            return False
         self.reset_drop_baselines()
-        self.log('pause_done', reason=reason, ft300=ft_ok, xense=xense_ok)
-        return ft_ok and xense_ok
+        self.log('pause_done', reason=reason, ft300=ft_result['ok'], xense=xense_result['ok'])
+        return True
 
     def finish_demo(self) -> None:
         """Finish the current demo and save all controller buffers."""
@@ -275,11 +284,11 @@ class MainController:
         self.set_state(ControllerState.FINALIZING)
         self.log('finalizing_started')
 
-        ft_payload = self._sensor_command_no_timeout(self.ft_client, MsgType.DEMO_DONE_REQ, 'DEMO_DONE_REQ')
-        xense_payload = self._sensor_command_no_timeout(self.xense_client, MsgType.DEMO_DONE_REQ, 'DEMO_DONE_REQ')
+        ft_result = self._sensor_command_result_no_timeout(self.ft_client, MsgType.DEMO_DONE_REQ, 'DEMO_DONE_REQ')
+        xense_result = self._sensor_command_result_no_timeout(self.xense_client, MsgType.DEMO_DONE_REQ, 'DEMO_DONE_REQ')
         self.sensor_saved_files = {
-            'ft300': None if ft_payload is None else ft_payload.get('saved_file'),
-            'xense': None if xense_payload is None else xense_payload.get('saved_file'),
+            'ft300': None if ft_result['payload'] is None else ft_result['payload'].get('saved_file'),
+            'xense': None if xense_result['payload'] is None else xense_result['payload'].get('saved_file'),
         }
 
         try:
@@ -288,11 +297,31 @@ class MainController:
         except Exception as exc:
             self.log('rosbag_stop_failed', error=str(exc))
 
-        self.realsense_postcheck_manifest = self._run_realsense_rosbag_postcheck()
-        status = 'done'
-        if self.realsense_postcheck_manifest is not None and not self.realsense_postcheck_manifest.get('ok', False):
+        command_failed = not ft_result['ok'] or not xense_result['ok']
+        if command_failed:
+            self.realsense_postcheck_manifest = None
             status = 'failed'
-        self._save_current_demo(status=status)
+        else:
+            self.realsense_postcheck_manifest = self._run_realsense_rosbag_postcheck()
+            status = 'done'
+        if not command_failed and self.realsense_postcheck_manifest is not None and not self.realsense_postcheck_manifest.get('ok', False):
+            status = 'failed'
+        extra = None
+        if command_failed:
+            extra = {
+                'failure_stage': 'finish_command',
+                'failure_reason': 'required sensor DEMO_DONE_REQ failed',
+                'command_results': {'ft300': ft_result, 'xense': xense_result},
+            }
+        self._save_current_demo(status=status, extra=extra)
+        if command_failed:
+            self.demo_store = None
+            self.demo_started_ns = None
+            self.rosbag_record_started = False
+            self.rosbag_uri = None
+            self.set_state(ControllerState.ERROR)
+            self.stop_all()
+            return
         self.demo_store = None
         self.rosbag_record_started = False
         self.rosbag_uri = None
@@ -308,13 +337,24 @@ class MainController:
             return
         self.set_state(ControllerState.DISCARDING)
         self.log('discard_started')
-        self._sensor_command(self.ft_client, MsgType.DEMO_DISCARD_REQ, 'DEMO_DISCARD_REQ', self.config.ack_timeout_s)
-        self._sensor_command(self.xense_client, MsgType.DEMO_DISCARD_REQ, 'DEMO_DISCARD_REQ', self.config.ack_timeout_s)
+        ft_result = self._sensor_command_result(self.ft_client, MsgType.DEMO_DISCARD_REQ, 'DEMO_DISCARD_REQ', self.config.ack_timeout_s)
+        xense_result = self._sensor_command_result(self.xense_client, MsgType.DEMO_DISCARD_REQ, 'DEMO_DISCARD_REQ', self.config.ack_timeout_s)
+        rosbag_stop_result: dict[str, Any] = {'ok': True}
         try:
             if self.rosbag is not None:
                 self.rosbag.stop(timeout_s=self.config.rosbag_timeout_s)
         except Exception as exc:
+            rosbag_stop_result = {'ok': False, 'error': str(exc)}
             self.log('rosbag_stop_failed', error=str(exc))
+        if not ft_result['ok'] or not xense_result['ok'] or not rosbag_stop_result['ok']:
+            self._handle_command_transaction_failure(
+                failure_stage='discard_command',
+                failure_reason='user discard transaction failed',
+                command_results={'ft300': ft_result, 'xense': xense_result, 'rosbag_stop': rosbag_stop_result},
+                clear_demo=True,
+                stop_system=True,
+            )
+            return
         self.demo_store = None
         self.rosbag_record_started = False
         self.rosbag_uri = None
@@ -510,6 +550,16 @@ class MainController:
         self.log('sensor_command', sensor=client.name, cmd=cmd_name, ok=payload is not None, payload=payload)
         return payload
 
+    def _sensor_command_result(self, client: UdsClient, msg_type: MsgType, cmd_name: str, timeout_s: float | None) -> dict[str, Any]:
+        payload = self._sensor_command(client, msg_type, cmd_name, timeout_s)
+        return {
+            'sensor': client.name,
+            'cmd': cmd_name,
+            'ok': payload is not None,
+            'payload': payload,
+            'error': None if payload is not None else client.last_error_for(cmd_name),
+        }
+
     def _sensor_command_no_timeout(self, client: UdsClient, msg_type: MsgType, cmd_name: str) -> dict[str, Any] | None:
         return client.send_and_wait_ack(
             msg_type,
@@ -518,6 +568,46 @@ class MainController:
             progress_period_s=self.config.progress_log_period_s,
             on_progress=lambda elapsed: self.log('sensor_flush_waiting', sensor=client.name, cmd=cmd_name, elapsed_s=round(elapsed, 3)),
         )
+
+    def _sensor_command_result_no_timeout(self, client: UdsClient, msg_type: MsgType, cmd_name: str) -> dict[str, Any]:
+        payload = self._sensor_command_no_timeout(client, msg_type, cmd_name)
+        self.log('sensor_command', sensor=client.name, cmd=cmd_name, ok=payload is not None, payload=payload)
+        return {
+            'sensor': client.name,
+            'cmd': cmd_name,
+            'ok': payload is not None,
+            'payload': payload,
+            'error': None if payload is not None else client.last_error_for(cmd_name),
+        }
+
+    def _handle_command_transaction_failure(
+        self,
+        *,
+        failure_stage: str,
+        failure_reason: str,
+        command_results: dict[str, Any],
+        clear_demo: bool,
+        stop_system: bool,
+    ) -> None:
+        self._write_current_demo_manifest(
+            status='failed',
+            npz_paths={},
+            extra={
+                'failure_stage': failure_stage,
+                'failure_reason': failure_reason,
+                'command_results': command_results,
+            },
+        )
+        self.log('command_transaction_failed', failure_stage=failure_stage, failure_reason=failure_reason, command_results=command_results)
+        if clear_demo:
+            self.demo_store = None
+            self.demo_started_ns = None
+            self.rosbag_record_started = False
+            self.rosbag_uri = None
+        if stop_system:
+            if self.get_state() != ControllerState.ERROR:
+                self.set_state(ControllerState.ERROR)
+            self.stop_all()
 
     def _fail_start_resume_transaction(
         self,
@@ -567,11 +657,11 @@ class MainController:
         self.realsense_postcheck_manifest = None
         self.set_state(ControllerState.WAIT_START)
 
-    def _save_current_demo(self, status: str) -> None:
+    def _save_current_demo(self, status: str, extra: dict[str, Any] | None = None) -> None:
         if self.demo_store is None:
             return
         npz_paths = self.demo_store.save_all()
-        self._write_current_demo_manifest(status=status, npz_paths=npz_paths)
+        self._write_current_demo_manifest(status=status, npz_paths=npz_paths, extra=extra)
 
     def _write_current_demo_manifest(
         self,

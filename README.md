@@ -47,6 +47,13 @@ ros2 run MainController main_controller -- --help
 
 初始化在启动后自动执行，不需要额外交互命令。
 
+`done` 表示所有 required finish 操作完成；`discarded` 表示用户 `x` 发起的 discard
+transaction 成功完成；`failed` 表示系统或 command transaction 未成功。`PAUSE_REQ`、
+`DEMO_DONE_REQ` 或用户 `DEMO_DISCARD_REQ` 中任一 required sensor 返回 `ERROR` 或超时，
+都会在 manifest 中记录 `failure_stage`、`failure_reason` 和 per-sensor command result。
+pause/discard 失败会进入 `ERROR -> STOPPING -> STOPPED`，避免主控状态与物理 sensor 状态
+不一致。
+
 `s` 的 start/resume 流程由 MainController 作为多传感器事务 owner 协调。FT300S
 和 XenseTacSensor 必须全部 ACK `START_REQ`，且 rosbag `record` / `resume`
 必须成功后才进入 `COLLECTING`。如果任一 required sensor 返回 `ERROR`、超时，或
