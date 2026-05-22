@@ -181,22 +181,46 @@ class MainController:
             self.sensor_saved_files = {}
             self.log('demo_created', demo_dir=str(demo_dir))
 
+        acked_start_sensors: list[tuple[str, UdsClient]] = []
         if not self._sensor_command(self.ft_client, MsgType.START_REQ, 'START_REQ', self.config.ack_timeout_s):
-            self.log('start_failed', sensor='ft300')
+            self._fail_start_resume_transaction(
+                new_demo=new_demo,
+                failure_stage='ft300_start',
+                failure_reason='FT300S START_REQ failed',
+                acked_start_sensors=acked_start_sensors,
+            )
             return
-        if not self._sensor_command(self.xense_client, MsgType.START_REQ, 'START_REQ', self.config.ack_timeout_s):
-            self.log('start_failed', sensor='xense')
-            return
+        acked_start_sensors.append(('ft300', self.ft_client))
 
+        if not self._sensor_command(self.xense_client, MsgType.START_REQ, 'START_REQ', self.config.ack_timeout_s):
+            self._fail_start_resume_transaction(
+                new_demo=new_demo,
+                failure_stage='xense_start',
+                failure_reason='Xense START_REQ failed',
+                acked_start_sensors=acked_start_sensors,
+            )
+            return
+        acked_start_sensors.append(('xense', self.xense_client))
+
+        rosbag_action: str | None = None
         try:
             if self.rosbag is not None and self.rosbag_uri is not None:
                 if not self.rosbag_record_started:
+                    rosbag_action = 'record'
                     self.rosbag.record(self.rosbag_uri, timeout_s=self.config.rosbag_timeout_s)
                     self.rosbag_record_started = True
+                rosbag_action = 'resume'
                 self.rosbag.resume(timeout_s=self.config.rosbag_timeout_s)
         except Exception as exc:
-            self.log('rosbag_start_failed', error=str(exc))
+            self.log('rosbag_start_failed', action=rosbag_action, error=str(exc))
             print(f'[ERROR] rosbag start/resume failed: {exc}')
+            self._fail_start_resume_transaction(
+                new_demo=new_demo,
+                failure_stage=f'rosbag_{rosbag_action or "start"}',
+                failure_reason=str(exc),
+                acked_start_sensors=acked_start_sensors,
+                rosbag_state={'failed_action': rosbag_action},
+            )
             return
 
         self.reset_drop_baselines()
@@ -453,10 +477,66 @@ class MainController:
             on_progress=lambda elapsed: self.log('sensor_flush_waiting', sensor=client.name, cmd=cmd_name, elapsed_s=round(elapsed, 3)),
         )
 
+    def _fail_start_resume_transaction(
+        self,
+        *,
+        new_demo: bool,
+        failure_stage: str,
+        failure_reason: str,
+        acked_start_sensors: list[tuple[str, UdsClient]],
+        rosbag_state: dict[str, Any] | None = None,
+    ) -> None:
+        rollback_results: dict[str, dict[str, Any]] = {}
+        for sensor, client in acked_start_sensors:
+            payload = self._sensor_command(client, MsgType.DEMO_DISCARD_REQ, 'DEMO_DISCARD_REQ', self.config.ack_timeout_s)
+            rollback_results[sensor] = {'ok': payload is not None, 'payload': payload}
+
+        rosbag_stop: dict[str, Any] | None = None
+        if self.rosbag is not None and self.rosbag_record_started:
+            try:
+                self.rosbag.stop(timeout_s=self.config.rosbag_timeout_s)
+                rosbag_stop = {'ok': True}
+            except Exception as exc:
+                rosbag_stop = {'ok': False, 'error': str(exc)}
+                self.log('rosbag_stop_failed', error=str(exc))
+
+        failed_details = {
+            'failure_stage': failure_stage,
+            'failure_reason': failure_reason,
+            'new_demo': new_demo,
+            'acked_start_sensors': [sensor for sensor, _client in acked_start_sensors],
+            'rollback_action': 'DEMO_DISCARD_REQ',
+            'rollback_results': rollback_results,
+            'rosbag_record_resume': {
+                'record_started': self.rosbag_record_started,
+                'uri': None if self.rosbag_uri is None else str(self.rosbag_uri),
+                'stop': rosbag_stop,
+                **(rosbag_state or {}),
+            },
+        }
+        self._write_current_demo_manifest(status='failed', npz_paths={}, extra=failed_details)
+        self.log('start_resume_transaction_failed', **failed_details)
+        self.demo_store = None
+        self.demo_started_ns = None
+        self.rosbag_record_started = False
+        self.rosbag_uri = None
+        self.sensor_saved_files = {}
+        self.set_state(ControllerState.WAIT_START)
+
     def _save_current_demo(self, status: str) -> None:
         if self.demo_store is None:
             return
         npz_paths = self.demo_store.save_all()
+        self._write_current_demo_manifest(status=status, npz_paths=npz_paths)
+
+    def _write_current_demo_manifest(
+        self,
+        status: str,
+        npz_paths: dict[str, str],
+        extra: dict[str, Any] | None = None,
+    ) -> Path | None:
+        if self.demo_store is None:
+            return None
         manifest = {
             'status': status,
             'started_ns': self.demo_started_ns,
@@ -468,8 +548,11 @@ class MainController:
             'realsense_restart_count': self.realsense_restart_count,
             'realsense_restart_events': self.realsense_restart_events,
         }
+        if extra is not None:
+            manifest.update(extra)
         manifest_path = self.demo_store.write_manifest(manifest)
         self.log('demo_saved', status=status, manifest=str(manifest_path), npz=npz_paths)
+        return manifest_path
 
     def _new_demo_dir(self) -> Path:
         """Return a unique demo directory path for rapid repeated captures."""

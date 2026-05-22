@@ -47,6 +47,13 @@ ros2 run MainController main_controller -- --help
 
 初始化在启动后自动执行，不需要额外交互命令。
 
+`s` 的 start/resume 流程由 MainController 作为多传感器事务 owner 协调。FT300S
+和 XenseTacSensor 必须全部 ACK `START_REQ`，且 rosbag `record` / `resume`
+必须成功后才进入 `COLLECTING`。如果任一 required sensor 返回 `ERROR`、超时，或
+rosbag record/resume 失败，MainController 会对已 ACK start 的 sensor 发送
+`DEMO_DISCARD_REQ` 回滚，写入 `status: "failed"` 的轻量 manifest，并清空当前
+demo context。`status: "discarded"` 只表示用户 `x` 命令成功完成。
+
 ## 输出
 
 默认输出目录为仓库根目录下的 `runtime_sessions/session_YYYYmmdd_HHMMSS/`：

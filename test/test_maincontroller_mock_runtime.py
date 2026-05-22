@@ -279,20 +279,29 @@ class FakeRealSenseMetadataMonitor:
 class FakeRosbagControl:
     def __init__(self):
         self.calls: list[tuple[str, str | None]] = []
+        self.fail_methods: set[str] = set()
 
     def wait_ready(self, _timeout_s: float) -> bool:
         return True
 
     def record(self, uri: Path, timeout_s: float) -> None:
+        if 'record' in self.fail_methods:
+            raise RuntimeError('injected rosbag record failure')
         self.calls.append(('record', str(uri)))
 
     def resume(self, timeout_s: float) -> None:
+        if 'resume' in self.fail_methods:
+            raise RuntimeError('injected rosbag resume failure')
         self.calls.append(('resume', None))
 
     def pause(self, timeout_s: float) -> None:
+        if 'pause' in self.fail_methods:
+            raise RuntimeError('injected rosbag pause failure')
         self.calls.append(('pause', None))
 
     def stop(self, timeout_s: float) -> None:
+        if 'stop' in self.fail_methods:
+            raise RuntimeError('injected rosbag stop failure')
         self.calls.append(('stop', None))
 
     def close(self) -> None:
@@ -640,6 +649,80 @@ def test_start_processes_stops_earlier_processes_on_later_failure(tmp_path, monk
     assert by_name['xense'].stop_count == 0
     assert by_name['realsense_camera'].stop_count == 0
     assert by_name['rosbag_recorder'].stop_count == 0
+
+
+def test_start_transaction_rolls_back_acked_sensor_on_later_sensor_error(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        runtime.xense.error_commands.add('START_REQ')
+
+        controller.start_or_resume_demo()
+
+        assert controller.get_state() == ControllerState.WAIT_START
+        assert controller.demo_store is None
+        assert runtime.ft300.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+        assert runtime.xense.commands == ['START_REQ']
+        demo_dirs = sorted((controller.session_dir / 'demos').iterdir())
+        assert len(demo_dirs) == 1
+        manifest = json.loads((demo_dirs[0] / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'failed'
+        assert manifest['failure_stage'] == 'xense_start'
+        assert manifest['acked_start_sensors'] == ['ft300']
+        assert manifest['rollback_action'] == 'DEMO_DISCARD_REQ'
+        assert manifest['rollback_results']['ft300']['ok'] is True
+        assert manifest['npz'] == {}
+        assert not (demo_dirs[0] / 'ft300_timestamps.npz').exists()
+
+
+def test_resume_transaction_failure_invalidates_paused_demo(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+        assert controller.pause_demo(reason='test')
+        runtime.xense.error_commands.add('START_REQ')
+
+        controller.start_or_resume_demo()
+
+        assert controller.get_state() == ControllerState.WAIT_START
+        assert controller.demo_store is None
+        assert runtime.ft300.commands == ['START_REQ', 'PAUSE_REQ', 'START_REQ', 'DEMO_DISCARD_REQ']
+        assert runtime.xense.commands == ['START_REQ', 'PAUSE_REQ', 'START_REQ']
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'failed'
+        assert manifest['failure_stage'] == 'xense_start'
+        assert manifest['new_demo'] is False
+        assert manifest['acked_start_sensors'] == ['ft300']
+        assert manifest['npz'] == {}
+
+
+def test_rosbag_resume_failure_rolls_back_started_sensors_and_writes_failed_manifest(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        runtime.rosbag.fail_methods.add('resume')
+
+        controller.start_or_resume_demo()
+
+        assert controller.get_state() == ControllerState.WAIT_START
+        assert controller.demo_store is None
+        assert runtime.ft300.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+        assert runtime.xense.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+        demo_dirs = sorted((controller.session_dir / 'demos').iterdir())
+        assert len(demo_dirs) == 1
+        manifest = json.loads((demo_dirs[0] / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'failed'
+        assert manifest['failure_stage'] == 'rosbag_resume'
+        assert manifest['acked_start_sensors'] == ['ft300', 'xense']
+        assert manifest['rosbag_record_resume']['record_started'] is True
+        assert manifest['rosbag_record_resume']['failed_action'] == 'resume'
+        assert manifest['rosbag_record_resume']['stop']['ok'] is True
+        assert manifest['npz'] == {}
+        assert runtime.rosbag.calls == [
+            ('record', str(demo_dirs[0] / 'rosbag')),
+            ('stop', None),
+        ]
 
 
 def test_mock_runtime_start_done_start_done_keeps_zmq_drain_between_demos(tmp_path, monkeypatch):
