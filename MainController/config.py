@@ -46,7 +46,21 @@ class RuntimeConfig:
     realsense_debug_image_topics: tuple[str, ...] = ()
     realsense_rosbag_count_skew_limit: int = 3
     rate: RateConfig = field(default_factory=RateConfig)
+    
     cameras: tuple[str, ...] = ('cam1', 'cam2', 'cam3', 'cam4')
+    # Current-site RealSense image baseline from the checked-in launch profile.
+    # If RealSense launch parameters change, update these values in the same
+    # change so readiness and rosbag post-checks stay aligned with recording.
+    realsense_image_message_type: str = 'sensor_msgs/msg/Image'
+    realsense_color_width: int = 640
+    realsense_color_height: int = 480
+    realsense_color_encoding: str = 'rgb8'
+    realsense_color_step: int = 1920
+    realsense_depth_width: int = 640
+    realsense_depth_height: int = 480
+    realsense_depth_encoding: str = '16UC1'
+    realsense_depth_step: int = 1280
+
     fatal_realsense_patterns: tuple[str, ...] = (
         'Hardware Error',
         'Depth stream start failure',
@@ -64,7 +78,18 @@ class RuntimeConfig:
     @property
     def formal_realsense_image_requirements(self) -> tuple[ImageTopicRequirement, ...]:
         """Return the formal RealSense image recording requirements."""
-        return formal_image_requirements(self.cameras)
+        return formal_image_requirements(
+            cameras=self.cameras,
+            image_message_type=self.realsense_image_message_type,
+            color_width=self.realsense_color_width,
+            color_height=self.realsense_color_height,
+            color_encoding=self.realsense_color_encoding,
+            color_step=self.realsense_color_step,
+            depth_width=self.realsense_depth_width,
+            depth_height=self.realsense_depth_height,
+            depth_encoding=self.realsense_depth_encoding,
+            depth_step=self.realsense_depth_step,
+        )
 
     @property
     def realsense_image_requirements(self) -> tuple[ImageTopicRequirement, ...]:

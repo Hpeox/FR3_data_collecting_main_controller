@@ -8,18 +8,6 @@ from pathlib import Path
 from typing import Any
 
 
-FORMAL_REALSENSE_CAMERAS = ('cam1', 'cam2', 'cam3', 'cam4')
-COLOR_WIDTH = 640
-COLOR_HEIGHT = 480
-COLOR_ENCODING = 'rgb8'
-COLOR_STEP = 1920
-DEPTH_WIDTH = 640
-DEPTH_HEIGHT = 480
-DEPTH_ENCODING = '16UC1'
-DEPTH_STEP = 1280
-IMAGE_MESSAGE_TYPE = 'sensor_msgs/msg/Image'
-
-
 @dataclass(frozen=True)
 class ImageTopicRequirement:
     """Stable schema expected for one RealSense image topic."""
@@ -120,29 +108,41 @@ class RosbagImagePostcheckResult:
         }
 
 
-def formal_image_requirements(cameras: tuple[str, ...] = FORMAL_REALSENSE_CAMERAS) -> tuple[ImageTopicRequirement, ...]:
+def formal_image_requirements(
+    *,
+    cameras: tuple[str, ...],
+    image_message_type: str,
+    color_width: int,
+    color_height: int,
+    color_encoding: str,
+    color_step: int,
+    depth_width: int,
+    depth_height: int,
+    depth_encoding: str,
+    depth_step: int,
+) -> tuple[ImageTopicRequirement, ...]:
     """Return the authoritative formal 4-camera / 8-image-topic requirement."""
     requirements: list[ImageTopicRequirement] = []
     for camera in cameras:
         requirements.append(
             ImageTopicRequirement(
                 topic=f'/{camera}/camera/color/image_raw',
-                message_type=IMAGE_MESSAGE_TYPE,
-                width=COLOR_WIDTH,
-                height=COLOR_HEIGHT,
-                encoding=COLOR_ENCODING,
-                step=COLOR_STEP,
+                message_type=image_message_type,
+                width=color_width,
+                height=color_height,
+                encoding=color_encoding,
+                step=color_step,
                 stream_role='color',
             )
         )
         requirements.append(
             ImageTopicRequirement(
                 topic=f'/{camera}/camera/aligned_depth_to_color/image_raw',
-                message_type=IMAGE_MESSAGE_TYPE,
-                width=DEPTH_WIDTH,
-                height=DEPTH_HEIGHT,
-                encoding=DEPTH_ENCODING,
-                step=DEPTH_STEP,
+                message_type=image_message_type,
+                width=depth_width,
+                height=depth_height,
+                encoding=depth_encoding,
+                step=depth_step,
                 stream_role='aligned_depth',
             )
         )
