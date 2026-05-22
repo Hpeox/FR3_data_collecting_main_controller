@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'MainController'
+package_name = 'main_controller'
 
 setup(
     name=package_name,
@@ -24,7 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'main_controller = MainController.main:main',
+            'main_controller = main_controller.main:main',
         ],
     },
 )

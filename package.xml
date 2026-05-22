@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>MainController</name>
+  <name>main_controller</name>
   <version>0.0.0</version>
   <description>Main controller for multi-sensor imitation-learning data capture</description>
   <maintainer email="hpx.peipei@gmail.com">robot</maintainer>

@@ -10,11 +10,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from MainController.drop_monitor import DropMonitor
-from MainController.config import RuntimeConfig
-from MainController.realsense_image_guard import validate_rosbag_image_metadata
-from MainController.realsense_metadata import metadata_int, metadata_ms_to_ns
-from MainController.zmq_telemetry import FRAME_SIZE, FRAME_STRUCT, MAGIC, VERSION, ZmqTelemetryReceiver, unpack_frame
+from main_controller.drop_monitor import DropMonitor
+from main_controller.config import RuntimeConfig
+from main_controller.realsense_image_guard import validate_rosbag_image_metadata
+from main_controller.realsense_metadata import metadata_int, metadata_ms_to_ns
+from main_controller.zmq_telemetry import FRAME_SIZE, FRAME_STRUCT, MAGIC, VERSION, ZmqTelemetryReceiver, unpack_frame
 
 
 def test_zmq_unpack_frame_minimal():

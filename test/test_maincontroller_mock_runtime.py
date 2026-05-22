@@ -17,13 +17,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
 import FT300S.protocol.messages as ft300_protocol
-from MainController.buffers import DemoStore
-from MainController.config import RuntimeConfig
-from MainController.main import Command, ControllerState, MainController
-from MainController.realsense_image_guard import ImageReadinessResult, ImageTopicBaseline, validate_rosbag_image_metadata
-from MainController.realsense_metadata import RealSenseMetadataEvent
-from MainController.uds_client import MsgType
-from MainController.zmq_telemetry import FRAME_STRUCT, MAGIC, VERSION
+from main_controller.buffers import DemoStore
+from main_controller.config import RuntimeConfig
+from main_controller.main import Command, ControllerState, MainController
+from main_controller.realsense_image_guard import ImageReadinessResult, ImageTopicBaseline, validate_rosbag_image_metadata
+from main_controller.realsense_metadata import RealSenseMetadataEvent
+from main_controller.uds_client import MsgType
+from main_controller.zmq_telemetry import FRAME_STRUCT, MAGIC, VERSION
 import XenseTacSensor.protocol.messages as xense_protocol
 
 
@@ -396,7 +396,7 @@ class FakeReceiver:
 
 class MockRuntime:
     def __init__(self, tmp_path: Path, monkeypatch, **config_overrides):
-        from MainController import main as main_module
+        from main_controller import main as main_module
 
         self.tmp_path = tmp_path
         self.ft300 = MockUdsSensor('ft300', tmp_path / 'ft300.sock', hz=100.0, protocol=ft300_protocol)
@@ -680,7 +680,7 @@ def test_startup_failure_cleans_started_resources_and_reraises(tmp_path, monkeyp
 
 
 def test_start_processes_stops_earlier_processes_on_later_failure(tmp_path, monkeypatch):
-    from MainController import main as main_module
+    from main_controller import main as main_module
 
     instances: list[Any] = []
 

@@ -16,15 +16,15 @@ MainController 是本项目的数据采集主控包。它作为 ROS2 `ament_pyth
 ```bash
 conda deactivate
 cd MainController
-colcon build --packages-select MainController
+colcon build --packages-select main_controller
 source install/setup.bash
-ros2 run MainController main_controller
+ros2 run main_controller main_controller
 ```
 
 常用参数：
 
 ```bash
-ros2 run MainController main_controller -- \
+ros2 run main_controller main_controller -- \
   --zmq-connect tcp://127.0.0.1:6000 \
   --output-dir ../runtime_sessions
 ```
@@ -32,7 +32,7 @@ ros2 run MainController main_controller -- \
 其他参数可用：
 
 ```bash
-ros2 run MainController main_controller -- --help
+ros2 run main_controller main_controller -- --help
 ```
 
 ## 交互命令
