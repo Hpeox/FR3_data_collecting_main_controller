@@ -63,11 +63,13 @@ class ZmqTelemetryReceiver:
         endpoint: str,
         on_frame: Callable[[TelemetryFrame, int, int], None],
         on_error: Callable[[str], None] | None = None,
+        on_fatal: Callable[[str], None] | None = None,
         rcv_hwm: int = 1000,
     ):
         self.endpoint = endpoint
         self.on_frame = on_frame
         self.on_error = on_error
+        self.on_fatal = on_fatal
         self.rcv_hwm = rcv_hwm
         self.first_frame = threading.Event()
         self._stop = threading.Event()
@@ -116,8 +118,12 @@ class ZmqTelemetryReceiver:
                 self.first_frame.set()
                 self.on_frame(frame, recv_time_ns, recv_monotonic_ns)
         except Exception as exc:
-            if self.on_error is not None:
-                self.on_error(f'ZMQ receiver failed: {exc}')
+            if not self._stop.is_set():
+                message = f'ZMQ receiver failed: {exc}'
+                if self.on_fatal is not None:
+                    self.on_fatal(message)
+                elif self.on_error is not None:
+                    self.on_error(message)
         finally:
             try:
                 poller.unregister(socket)

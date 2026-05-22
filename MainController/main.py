@@ -160,6 +160,8 @@ class MainController:
                 self.stop_all()
         elif name == 'realsense_fatal':
             self.handle_realsense_fatal(command.payload or {})
+        elif name == 'zmq_fatal':
+            self.handle_zmq_fatal(command.payload or {})
         else:
             self.log('unknown_command', command=name)
 
@@ -342,6 +344,14 @@ class MainController:
         self.reset_realsense_drop_baselines()
         self.log('realsense_restart_done', count=self.realsense_restart_count)
 
+    def handle_zmq_fatal(self, payload: dict[str, Any]) -> None:
+        """Treat receiver-loop termination as an unrecoverable controller error."""
+        self.log('zmq_fatal_detected', **payload)
+        print(f"[ERROR] ZMQ receiver fatal: {payload.get('message')}")
+        if self.get_state() != ControllerState.ERROR:
+            self.set_state(ControllerState.ERROR)
+        self.stop_all()
+
     def _start_processes(self) -> None:
         logs = self.session_dir / 'process_logs'
         root = self.config.repo_root
@@ -388,7 +398,12 @@ class MainController:
             raise
 
     def _start_receivers(self) -> None:
-        self.zmq_receiver = ZmqTelemetryReceiver(self.config.zmq_connect, self._on_zmq_frame, self._on_zmq_error)
+        self.zmq_receiver = ZmqTelemetryReceiver(
+            self.config.zmq_connect,
+            self._on_zmq_frame,
+            self._on_zmq_error,
+            self._on_zmq_fatal,
+        )
         self.zmq_receiver.start()
         self.ft_client.start()
         self.xense_client.start()
@@ -440,6 +455,9 @@ class MainController:
     def _on_zmq_error(self, message: str) -> None:
         self.log('zmq_error', message=message)
         print(f'[WARN] {message}')
+
+    def _on_zmq_fatal(self, message: str) -> None:
+        self.commands.put(Command('zmq_fatal', {'message': message, 'time_ns': time.time_ns()}))
 
     def _on_realsense_metadata(self, event) -> None:
         assert isinstance(event, RealSenseMetadataEvent)

@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 import FT300S.protocol.messages as ft300_protocol
 from MainController.buffers import DemoStore
 from MainController.config import RuntimeConfig
-from MainController.main import ControllerState, MainController
+from MainController.main import Command, ControllerState, MainController
 from MainController.realsense_metadata import RealSenseMetadataEvent
 from MainController.uds_client import MsgType
 from MainController.zmq_telemetry import FRAME_STRUCT, MAGIC, VERSION
@@ -312,10 +312,14 @@ class FakeSensorClient:
     def __init__(self, name: str):
         self.name = name
         self.commands: list[str] = []
+        self.stop_count = 0
 
     def send_and_wait_ack(self, _msg_type, cmd_name, timeout_s, **_kwargs):
         self.commands.append(cmd_name)
         return {'cmd': cmd_name}
+
+    def stop(self) -> None:
+        self.stop_count += 1
 
 
 class FakeProcess:
@@ -723,6 +727,41 @@ def test_rosbag_resume_failure_rolls_back_started_sensors_and_writes_failed_mani
             ('record', str(demo_dirs[0] / 'rosbag')),
             ('stop', None),
         ]
+
+
+def test_zmq_warning_does_not_stop_controller(tmp_path):
+    controller = MainController(RuntimeConfig(output_dir=tmp_path / 'sessions'))
+    controller.set_state(ControllerState.COLLECTING)
+
+    controller._on_zmq_error('invalid ZMQ frame: injected')
+
+    assert controller.get_state() == ControllerState.COLLECTING
+
+
+def test_zmq_fatal_stops_controller_and_cleans_resources(tmp_path):
+    controller = MainController(RuntimeConfig(output_dir=tmp_path / 'sessions', ack_timeout_s=0.01, rosbag_timeout_s=0.01))
+    fake_rosbag = FakeRosbagControl()
+    fake_receiver = FakeReceiver()
+    fake_monitor = FakeRealSenseMetadataMonitor((), lambda _event: None)
+    fake_process = FakeProcess()
+    controller.ft_client = FakeSensorClient('ft300')
+    controller.xense_client = FakeSensorClient('xense')
+    controller.rosbag = fake_rosbag
+    controller.zmq_receiver = fake_receiver
+    controller.realsense_monitor = fake_monitor
+    controller.processes['ft300'] = fake_process
+    controller.set_state(ControllerState.COLLECTING)
+
+    controller.handle_command(Command('zmq_fatal', {'message': 'injected receiver failure'}))
+
+    assert controller.get_state() == ControllerState.STOPPED
+    assert controller.ft_client.commands == ['STOP_REQ']
+    assert controller.xense_client.commands == ['STOP_REQ']
+    assert ('stop', None) in fake_rosbag.calls
+    assert ('close', None) in fake_rosbag.calls
+    assert fake_receiver.stop_count == 1
+    assert fake_monitor.stopped
+    assert fake_process.stop_count == 1
 
 
 def test_mock_runtime_start_done_start_done_keeps_zmq_drain_between_demos(tmp_path, monkeypatch):
