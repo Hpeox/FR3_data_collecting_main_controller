@@ -187,6 +187,8 @@ class MainController:
             self.realsense_postcheck_manifest = None
             self.log('demo_created', demo_dir=str(demo_dir))
 
+        required_sensors = [('ft300', self.ft_client), ('xense', self.xense_client)]
+        rollback_target_sensors: list[tuple[str, UdsClient]] = [] if new_demo else list(required_sensors)
         acked_start_sensors: list[tuple[str, UdsClient]] = []
         if not self._sensor_command(self.ft_client, MsgType.START_REQ, 'START_REQ', self.config.ack_timeout_s):
             self._fail_start_resume_transaction(
@@ -194,6 +196,7 @@ class MainController:
                 failure_stage='ft300_start',
                 failure_reason='FT300S START_REQ failed',
                 acked_start_sensors=acked_start_sensors,
+                rollback_target_sensors=rollback_target_sensors or acked_start_sensors,
             )
             return
         acked_start_sensors.append(('ft300', self.ft_client))
@@ -204,9 +207,12 @@ class MainController:
                 failure_stage='xense_start',
                 failure_reason='Xense START_REQ failed',
                 acked_start_sensors=acked_start_sensors,
+                rollback_target_sensors=rollback_target_sensors or acked_start_sensors,
             )
             return
         acked_start_sensors.append(('xense', self.xense_client))
+        if new_demo:
+            rollback_target_sensors = list(acked_start_sensors)
 
         rosbag_action: str | None = None
         try:
@@ -224,6 +230,7 @@ class MainController:
                         failure_stage='realsense_image_readiness',
                         failure_reason='required RealSense image topics are not ready',
                         acked_start_sensors=acked_start_sensors,
+                        rollback_target_sensors=rollback_target_sensors,
                         rosbag_state={'image_readiness': self.realsense_readiness_manifest},
                     )
                     return
@@ -241,6 +248,7 @@ class MainController:
                 failure_stage=f'rosbag_{rosbag_action or "start"}',
                 failure_reason=str(exc),
                 acked_start_sensors=acked_start_sensors,
+                rollback_target_sensors=rollback_target_sensors,
                 rosbag_state={'failed_action': rosbag_action},
             )
             return
@@ -621,12 +629,16 @@ class MainController:
         failure_stage: str,
         failure_reason: str,
         acked_start_sensors: list[tuple[str, UdsClient]],
+        rollback_target_sensors: list[tuple[str, UdsClient]],
         rosbag_state: dict[str, Any] | None = None,
     ) -> None:
         rollback_results: dict[str, dict[str, Any]] = {}
-        for sensor, client in acked_start_sensors:
-            payload = self._sensor_command(client, MsgType.DEMO_DISCARD_REQ, 'DEMO_DISCARD_REQ', self.config.ack_timeout_s)
-            rollback_results[sensor] = {'ok': payload is not None, 'payload': payload}
+        rollback_unconfirmed_sensors: list[str] = []
+        for sensor, client in rollback_target_sensors:
+            result = self._sensor_command_result(client, MsgType.DEMO_DISCARD_REQ, 'DEMO_DISCARD_REQ', self.config.ack_timeout_s)
+            rollback_results[sensor] = result
+            if not result['ok']:
+                rollback_unconfirmed_sensors.append(sensor)
 
         rosbag_stop: dict[str, Any] | None = None
         if self.rosbag is not None and self.rosbag_record_started:
@@ -637,11 +649,14 @@ class MainController:
                 rosbag_stop = {'ok': False, 'error': str(exc)}
                 self.log('rosbag_stop_failed', error=str(exc))
 
+        cleanup_unconfirmed = bool(rollback_unconfirmed_sensors) or (rosbag_stop is not None and not rosbag_stop.get('ok', False))
         failed_details = {
             'failure_stage': failure_stage,
             'failure_reason': failure_reason,
             'new_demo': new_demo,
             'acked_start_sensors': [sensor for sensor, _client in acked_start_sensors],
+            'rollback_target_sensors': [sensor for sensor, _client in rollback_target_sensors],
+            'rollback_unconfirmed_sensors': rollback_unconfirmed_sensors,
             'rollback_action': 'DEMO_DISCARD_REQ',
             'rollback_results': rollback_results,
             'rosbag_record_resume': {
@@ -660,6 +675,10 @@ class MainController:
         self.sensor_saved_files = {}
         self.realsense_readiness_manifest = None
         self.realsense_postcheck_manifest = None
+        if cleanup_unconfirmed:
+            self.set_state(ControllerState.ERROR)
+            self.stop_all()
+            return
         self.set_state(ControllerState.WAIT_START)
 
     def _save_current_demo(self, status: str, extra: dict[str, Any] | None = None) -> None:

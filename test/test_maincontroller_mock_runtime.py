@@ -741,6 +741,8 @@ def test_start_transaction_rolls_back_acked_sensor_on_later_sensor_error(tmp_pat
         assert manifest['status'] == 'failed'
         assert manifest['failure_stage'] == 'xense_start'
         assert manifest['acked_start_sensors'] == ['ft300']
+        assert manifest['rollback_target_sensors'] == ['ft300']
+        assert manifest['rollback_unconfirmed_sensors'] == []
         assert manifest['rollback_action'] == 'DEMO_DISCARD_REQ'
         assert manifest['rollback_results']['ft300']['ok'] is True
         assert manifest['npz'] == {}
@@ -760,13 +762,65 @@ def test_resume_transaction_failure_invalidates_paused_demo(tmp_path, monkeypatc
         assert controller.get_state() == ControllerState.WAIT_START
         assert controller.demo_store is None
         assert runtime.ft300.commands == ['START_REQ', 'PAUSE_REQ', 'START_REQ', 'DEMO_DISCARD_REQ']
-        assert runtime.xense.commands == ['START_REQ', 'PAUSE_REQ', 'START_REQ']
+        assert runtime.xense.commands == ['START_REQ', 'PAUSE_REQ', 'START_REQ', 'DEMO_DISCARD_REQ']
         manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'failed'
         assert manifest['failure_stage'] == 'xense_start'
         assert manifest['new_demo'] is False
         assert manifest['acked_start_sensors'] == ['ft300']
+        assert manifest['rollback_target_sensors'] == ['ft300', 'xense']
+        assert manifest['rollback_unconfirmed_sensors'] == []
+        assert manifest['rollback_results']['ft300']['ok'] is True
+        assert manifest['rollback_results']['xense']['ok'] is True
         assert manifest['npz'] == {}
+
+
+def test_resume_transaction_failure_discards_all_paused_sensors_before_later_start(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+        assert controller.pause_demo(reason='test')
+        runtime.ft300.error_commands.add('START_REQ')
+
+        controller.start_or_resume_demo()
+
+        assert controller.get_state() == ControllerState.WAIT_START
+        assert controller.demo_store is None
+        assert runtime.ft300.commands == ['START_REQ', 'PAUSE_REQ', 'START_REQ', 'DEMO_DISCARD_REQ']
+        assert runtime.xense.commands == ['START_REQ', 'PAUSE_REQ', 'DEMO_DISCARD_REQ']
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'failed'
+        assert manifest['failure_stage'] == 'ft300_start'
+        assert manifest['new_demo'] is False
+        assert manifest['acked_start_sensors'] == []
+        assert manifest['rollback_target_sensors'] == ['ft300', 'xense']
+        assert manifest['rollback_unconfirmed_sensors'] == []
+        assert manifest['rollback_results']['ft300']['ok'] is True
+        assert manifest['rollback_results']['xense']['ok'] is True
+
+
+def test_resume_transaction_unconfirmed_discard_stops_controller(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+        assert controller.pause_demo(reason='test')
+        runtime.xense.error_commands.update({'START_REQ', 'DEMO_DISCARD_REQ'})
+
+        controller.start_or_resume_demo()
+
+        assert controller.get_state() == ControllerState.STOPPED
+        assert controller.demo_store is None
+        assert 'DEMO_DISCARD_REQ' in runtime.ft300.commands
+        assert 'DEMO_DISCARD_REQ' in runtime.xense.commands
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'failed'
+        assert manifest['failure_stage'] == 'xense_start'
+        assert manifest['rollback_target_sensors'] == ['ft300', 'xense']
+        assert manifest['rollback_unconfirmed_sensors'] == ['xense']
+        assert manifest['rollback_results']['xense']['ok'] is False
+        assert manifest['rollback_results']['xense']['error']['reason'] == 'injected DEMO_DISCARD_REQ error'
 
 
 def test_rosbag_resume_failure_rolls_back_started_sensors_and_writes_failed_manifest(tmp_path, monkeypatch):
@@ -787,6 +841,8 @@ def test_rosbag_resume_failure_rolls_back_started_sensors_and_writes_failed_mani
         assert manifest['status'] == 'failed'
         assert manifest['failure_stage'] == 'rosbag_resume'
         assert manifest['acked_start_sensors'] == ['ft300', 'xense']
+        assert manifest['rollback_target_sensors'] == ['ft300', 'xense']
+        assert manifest['rollback_unconfirmed_sensors'] == []
         assert manifest['rosbag_record_resume']['record_started'] is True
         assert manifest['rosbag_record_resume']['failed_action'] == 'resume'
         assert manifest['rosbag_record_resume']['stop']['ok'] is True
