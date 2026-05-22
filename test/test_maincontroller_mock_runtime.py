@@ -311,11 +311,23 @@ class FakeSensorClient:
 
 class FakeProcess:
     def __init__(self):
+        self.start_count = 0
         self.restart_count = 0
         self.stop_count = 0
 
+    def start(self) -> None:
+        self.start_count += 1
+
     def restart(self) -> None:
         self.restart_count += 1
+
+    def stop(self) -> None:
+        self.stop_count += 1
+
+
+class FakeReceiver:
+    def __init__(self):
+        self.stop_count = 0
 
     def stop(self) -> None:
         self.stop_count += 1
@@ -542,6 +554,92 @@ def test_uds_error_response_wakes_ack_waiter(tmp_path, monkeypatch):
 
         assert result is None
         assert runtime.xense.commands == ['DEMO_DONE_REQ']
+
+
+def test_startup_failure_cleans_started_resources_and_reraises(tmp_path, monkeypatch):
+    controller = MainController(RuntimeConfig(output_dir=tmp_path / 'sessions', ack_timeout_s=0.01, rosbag_timeout_s=0.01))
+    fake_process = FakeProcess()
+    fake_receiver = FakeReceiver()
+    fake_monitor = FakeRealSenseMetadataMonitor((), lambda _event: None)
+    fake_rosbag = FakeRosbagControl()
+
+    def start_processes() -> None:
+        controller.processes['ft300'] = fake_process
+
+    def start_receivers() -> None:
+        controller.zmq_receiver = fake_receiver
+        controller.realsense_monitor = fake_monitor
+        controller.rosbag = fake_rosbag
+
+    def wait_startup_ready() -> None:
+        raise RuntimeError('injected startup failure')
+
+    monkeypatch.setattr(controller, '_start_processes', start_processes)
+    monkeypatch.setattr(controller, '_start_receivers', start_receivers)
+    monkeypatch.setattr(controller, '_wait_startup_ready', wait_startup_ready)
+
+    with pytest.raises(RuntimeError, match='injected startup failure'):
+        controller.startup()
+
+    assert controller.get_state() == ControllerState.STOPPED
+    assert fake_process.stop_count == 1
+    assert fake_receiver.stop_count == 1
+    assert fake_monitor.stopped
+    assert ('stop', None) in fake_rosbag.calls
+    assert ('close', None) in fake_rosbag.calls
+
+    events = [
+        json.loads(line)
+        for line in controller.logger.path.read_text(encoding='utf-8').splitlines()
+    ]
+    assert any(event['event'] == 'startup_failed' for event in events)
+    transitions = [event for event in events if event['event'] == 'state_transition']
+    assert any(event.get('current') == 'ERROR' for event in transitions)
+    assert any(event.get('current') == 'STOPPED' for event in transitions)
+
+
+def test_start_processes_stops_earlier_processes_on_later_failure(tmp_path, monkeypatch):
+    from MainController import main as main_module
+
+    instances: list[Any] = []
+
+    class FakeManagedProcess:
+        def __init__(
+            self,
+            name,
+            cmd,
+            cwd,
+            log_path,
+            fatal_patterns=(),
+            on_fatal=None,
+            on_exit=None,
+        ):
+            self.name = name
+            self.cmd = cmd
+            self.stop_count = 0
+            self.started = False
+            instances.append(self)
+
+        def start(self) -> None:
+            if self.name == 'xense':
+                raise RuntimeError('xense start failed')
+            self.started = True
+
+        def stop(self) -> None:
+            self.stop_count += 1
+
+    monkeypatch.setattr(main_module, 'ManagedProcess', FakeManagedProcess)
+    controller = MainController(RuntimeConfig(output_dir=tmp_path / 'sessions'))
+
+    with pytest.raises(RuntimeError, match='xense start failed'):
+        controller._start_processes()
+
+    by_name = {process.name: process for process in instances}
+    assert by_name['ft300'].started
+    assert by_name['ft300'].stop_count == 1
+    assert by_name['xense'].stop_count == 0
+    assert by_name['realsense_camera'].stop_count == 0
+    assert by_name['rosbag_recorder'].stop_count == 0
 
 
 def test_mock_runtime_start_done_start_done_keeps_zmq_drain_between_demos(tmp_path, monkeypatch):

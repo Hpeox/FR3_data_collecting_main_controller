@@ -124,14 +124,21 @@ class MainController:
 
     def startup(self) -> None:
         """Start services, connect streams, and initialize sensors."""
-        self.set_state(ControllerState.STARTING_SERVICES)
-        self._start_processes()
-        self._start_receivers()
-        self.set_state(ControllerState.INIT)
-        self._wait_startup_ready()
-        self.set_state(ControllerState.WAIT_START)
-        self.log('ready')
-        print('MainController ready.')
+        try:
+            self.set_state(ControllerState.STARTING_SERVICES)
+            self._start_processes()
+            self._start_receivers()
+            self.set_state(ControllerState.INIT)
+            self._wait_startup_ready()
+            self.set_state(ControllerState.WAIT_START)
+            self.log('ready')
+            print('MainController ready.')
+        except Exception as exc:
+            self.log('startup_failed', error=str(exc), stage=self.get_state().name)
+            if self.get_state() != ControllerState.ERROR:
+                self.set_state(ControllerState.ERROR)
+            self.stop_all()
+            raise
 
     def handle_command(self, command: Command) -> None:
         """Dispatch one command according to current state."""
@@ -344,9 +351,17 @@ class MainController:
             logs / 'rosbag_recorder.log',
             on_exit=self._on_process_exit,
         )
-        for process in self.processes.values():
-            process.start()
-            self.log('process_started', name=process.name, cmd=process.cmd)
+        started: list[ManagedProcess] = []
+        try:
+            for process in self.processes.values():
+                process.start()
+                started.append(process)
+                self.log('process_started', name=process.name, cmd=process.cmd)
+        except Exception as exc:
+            self.log('process_start_failed', name=process.name, error=str(exc))
+            for process in reversed(started):
+                process.stop()
+            raise
 
     def _start_receivers(self) -> None:
         self.zmq_receiver = ZmqTelemetryReceiver(self.config.zmq_connect, self._on_zmq_frame, self._on_zmq_error)
