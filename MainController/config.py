@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .realsense_image_guard import ImageTopicRequirement, formal_image_requirements, select_image_requirements
+
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -39,6 +41,10 @@ class RuntimeConfig:
     progress_log_period_s: float = 5.0
     zmq_first_frame_timeout_s: float = 5.0
     rosbag_timeout_s: float = 15.0
+    realsense_image_ready_timeout_s: float = 5.0
+    realsense_capture_mode: str = 'formal'
+    realsense_debug_image_topics: tuple[str, ...] = ()
+    realsense_rosbag_count_skew_limit: int = 3
     rate: RateConfig = field(default_factory=RateConfig)
     cameras: tuple[str, ...] = ('cam1', 'cam2', 'cam3', 'cam4')
     fatal_realsense_patterns: tuple[str, ...] = (
@@ -54,6 +60,20 @@ class RuntimeConfig:
             topics.append(f'/{camera}/camera/color/metadata')
             topics.append(f'/{camera}/camera/depth/metadata')
         return tuple(topics)
+
+    @property
+    def formal_realsense_image_requirements(self) -> tuple[ImageTopicRequirement, ...]:
+        """Return the formal RealSense image recording requirements."""
+        return formal_image_requirements(self.cameras)
+
+    @property
+    def realsense_image_requirements(self) -> tuple[ImageTopicRequirement, ...]:
+        """Return image topics required for this run's capture mode."""
+        return select_image_requirements(
+            mode=self.realsense_capture_mode,
+            formal_requirements=self.formal_realsense_image_requirements,
+            debug_topics=self.realsense_debug_image_topics,
+        )
 
 
 def ns_from_hz(rate_hz: float, factor: float = 1.0) -> int:

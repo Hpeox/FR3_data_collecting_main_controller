@@ -20,6 +20,7 @@ import FT300S.protocol.messages as ft300_protocol
 from MainController.buffers import DemoStore
 from MainController.config import RuntimeConfig
 from MainController.main import Command, ControllerState, MainController
+from MainController.realsense_image_guard import ImageReadinessResult, ImageTopicBaseline, validate_rosbag_image_metadata
 from MainController.realsense_metadata import RealSenseMetadataEvent
 from MainController.uds_client import MsgType
 from MainController.zmq_telemetry import FRAME_STRUCT, MAGIC, VERSION
@@ -280,6 +281,10 @@ class FakeRosbagControl:
     def __init__(self):
         self.calls: list[tuple[str, str | None]] = []
         self.fail_methods: set[str] = set()
+        self.readiness_missing_topics: tuple[str, ...] = ()
+        self.postcheck_topic_metadata: dict[str, dict[str, Any]] | None = None
+        self.readiness_requirements: tuple[Any, ...] = ()
+        self.postcheck_requirements: tuple[Any, ...] = ()
 
     def wait_ready(self, _timeout_s: float) -> bool:
         return True
@@ -303,6 +308,46 @@ class FakeRosbagControl:
         if 'stop' in self.fail_methods:
             raise RuntimeError('injected rosbag stop failure')
         self.calls.append(('stop', None))
+
+    def check_image_readiness(self, requirements, timeout_s: float, mode: str):
+        self.readiness_requirements = requirements
+        missing = set(self.readiness_missing_topics)
+        baselines = [
+            ImageTopicBaseline(
+                topic=requirement.topic,
+                message_type=requirement.message_type,
+                width=requirement.width,
+                height=requirement.height,
+                encoding=requirement.encoding,
+                step=requirement.step,
+                stream_role=requirement.stream_role,
+            )
+            for requirement in requirements
+            if requirement.topic not in missing
+        ]
+        return ImageReadinessResult(
+            ok=not missing,
+            mode=mode,
+            required_topics=tuple(requirement.topic for requirement in requirements),
+            baselines=tuple(baselines),
+            missing_topics=tuple(self.readiness_missing_topics),
+        )
+
+    def validate_recorded_images(self, rosbag_uri: Path, requirements, count_skew_limit: int, mode: str):
+        self.postcheck_requirements = requirements
+        metadata = self.postcheck_topic_metadata
+        if metadata is None:
+            metadata = {
+                requirement.topic: {'message_type': requirement.message_type, 'count': 10}
+                for requirement in requirements
+            }
+        return validate_rosbag_image_metadata(
+            mode=mode,
+            rosbag_uri=rosbag_uri,
+            requirements=requirements,
+            topic_metadata=metadata,
+            count_skew_limit=count_skew_limit,
+        )
 
     def close(self) -> None:
         self.calls.append(('close', None))
@@ -347,7 +392,7 @@ class FakeReceiver:
 
 
 class MockRuntime:
-    def __init__(self, tmp_path: Path, monkeypatch):
+    def __init__(self, tmp_path: Path, monkeypatch, **config_overrides):
         from MainController import main as main_module
 
         self.tmp_path = tmp_path
@@ -355,6 +400,7 @@ class MockRuntime:
         self.xense = MockUdsSensor('xense', tmp_path / 'xense.sock', hz=30.0, protocol=xense_protocol)
         self.zmq_pub = LocalZmqTelemetryPublisher(hz=80.0)
         self.rosbag = FakeRosbagControl()
+        self.config_overrides = config_overrides
 
         monkeypatch.setattr(main_module, 'RealSenseMetadataMonitor', FakeRealSenseMetadataMonitor)
         monkeypatch.setattr(main_module, 'RosbagControl', lambda: self.rosbag)
@@ -377,6 +423,7 @@ class MockRuntime:
             ack_timeout_s=1.0,
             zmq_first_frame_timeout_s=3.0,
             rosbag_timeout_s=1.0,
+            **self.config_overrides,
         )
         self.controller = MainController(config)
         self._monkeypatch.setattr(self.controller, '_start_processes', lambda: None)
@@ -727,6 +774,76 @@ def test_rosbag_resume_failure_rolls_back_started_sensors_and_writes_failed_mani
             ('record', str(demo_dirs[0] / 'rosbag')),
             ('stop', None),
         ]
+
+
+def test_realsense_readiness_failure_blocks_formal_recording(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        missing_topic = controller.config.realsense_image_requirements[-1].topic
+        runtime.rosbag.readiness_missing_topics = (missing_topic,)
+
+        controller.start_or_resume_demo()
+
+        assert controller.get_state() == ControllerState.WAIT_START
+        assert controller.demo_store is None
+        assert runtime.ft300.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+        assert runtime.xense.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+        demo_dirs = sorted((controller.session_dir / 'demos').iterdir())
+        manifest = json.loads((demo_dirs[0] / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'failed'
+        assert manifest['failure_stage'] == 'realsense_image_readiness'
+        readiness = manifest['rosbag_record_resume']['image_readiness']
+        assert readiness['ok'] is False
+        assert readiness['mode'] == 'formal'
+        assert readiness['missing_topics'] == [missing_topic]
+        assert runtime.rosbag.calls == []
+
+
+def test_realsense_rosbag_postcheck_failure_marks_demo_failed(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+        requirements = controller.config.realsense_image_requirements
+        runtime.rosbag.postcheck_topic_metadata = {
+            requirement.topic: {'message_type': requirement.message_type, 'count': 10}
+            for requirement in requirements[:-1]
+        }
+
+        controller.finish_demo()
+
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'failed'
+        assert manifest['realsense_image_readiness']['ok'] is True
+        assert manifest['realsense_rosbag_postcheck']['ok'] is False
+        assert manifest['realsense_rosbag_postcheck']['missing_topics'] == [requirements[-1].topic]
+        assert manifest['npz']
+
+
+def test_realsense_debug_degraded_mode_uses_configured_subset(tmp_path, monkeypatch):
+    subset = (
+        '/cam3/camera/color/image_raw',
+        '/cam3/camera/aligned_depth_to_color/image_raw',
+    )
+    with MockRuntime(
+        tmp_path,
+        monkeypatch,
+        realsense_capture_mode='debug_degraded',
+        realsense_debug_image_topics=subset,
+    ) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+        controller.finish_demo()
+
+        assert [requirement.topic for requirement in runtime.rosbag.readiness_requirements] == list(subset)
+        assert [requirement.topic for requirement in runtime.rosbag.postcheck_requirements] == list(subset)
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'done'
+        assert manifest['realsense_image_readiness']['mode'] == 'debug_degraded'
+        assert manifest['realsense_image_readiness']['required_topics'] == list(subset)
+        assert manifest['realsense_rosbag_postcheck']['required_topics'] == list(subset)
 
 
 def test_zmq_warning_does_not_stop_controller(tmp_path):

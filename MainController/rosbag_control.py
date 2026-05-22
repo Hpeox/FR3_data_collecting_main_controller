@@ -4,6 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .realsense_image_guard import (
+    ImageReadinessResult,
+    ImageTopicRequirement,
+    RosbagImagePostcheckResult,
+    check_ros_image_topic_readiness,
+    read_rosbag_topic_metadata,
+    validate_rosbag_image_metadata,
+)
+
 
 class RosbagControl:
     """Synchronous rosbag2 service client wrapper."""
@@ -50,6 +59,31 @@ class RosbagControl:
     def stop(self, timeout_s: float = 15.0) -> None:
         """Call /stop."""
         self._call(self.stop_client, self._Stop.Request(), timeout_s)
+
+    def check_image_readiness(
+        self,
+        requirements: tuple[ImageTopicRequirement, ...],
+        timeout_s: float,
+        mode: str,
+    ) -> ImageReadinessResult:
+        """Validate that required RealSense image topics are alive before recording."""
+        return check_ros_image_topic_readiness(self.node, self._rclpy, requirements, timeout_s, mode)
+
+    def validate_recorded_images(
+        self,
+        rosbag_uri: Path,
+        requirements: tuple[ImageTopicRequirement, ...],
+        count_skew_limit: int,
+        mode: str,
+    ) -> RosbagImagePostcheckResult:
+        """Validate required RealSense image topics in the recorded rosbag metadata."""
+        return validate_rosbag_image_metadata(
+            mode=mode,
+            rosbag_uri=rosbag_uri,
+            requirements=requirements,
+            topic_metadata=read_rosbag_topic_metadata(rosbag_uri),
+            count_skew_limit=count_skew_limit,
+        )
 
     def close(self) -> None:
         """Destroy the ROS node."""

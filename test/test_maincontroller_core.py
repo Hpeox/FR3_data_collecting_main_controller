@@ -11,6 +11,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from MainController.drop_monitor import DropMonitor
+from MainController.config import RuntimeConfig
+from MainController.realsense_image_guard import validate_rosbag_image_metadata
 from MainController.realsense_metadata import metadata_int, metadata_ms_to_ns
 from MainController.zmq_telemetry import FRAME_SIZE, FRAME_STRUCT, MAGIC, VERSION, ZmqTelemetryReceiver, unpack_frame
 
@@ -136,3 +138,59 @@ def test_realsense_metadata_helpers():
     assert metadata_int(data, "frame_number") == 7
     assert metadata_ms_to_ns(data, "frame_timestamp") == 1_500_000
     assert metadata_ms_to_ns(data, "hw_timestamp") == 2_250_000
+
+
+def test_realsense_formal_image_requirements_are_four_cameras_eight_topics():
+    config = RuntimeConfig()
+    requirements = config.realsense_image_requirements
+
+    assert config.realsense_capture_mode == "formal"
+    assert len(requirements) == 8
+    assert [requirement.topic for requirement in requirements] == [
+        "/cam1/camera/color/image_raw",
+        "/cam1/camera/aligned_depth_to_color/image_raw",
+        "/cam2/camera/color/image_raw",
+        "/cam2/camera/aligned_depth_to_color/image_raw",
+        "/cam3/camera/color/image_raw",
+        "/cam3/camera/aligned_depth_to_color/image_raw",
+        "/cam4/camera/color/image_raw",
+        "/cam4/camera/aligned_depth_to_color/image_raw",
+    ]
+    assert {requirement.message_type for requirement in requirements} == {"sensor_msgs/msg/Image"}
+
+
+def test_realsense_debug_degraded_image_requirements_use_configured_subset():
+    config = RuntimeConfig(
+        realsense_capture_mode="debug_degraded",
+        realsense_debug_image_topics=(
+            "/cam3/camera/color/image_raw",
+            "/cam3/camera/aligned_depth_to_color/image_raw",
+        ),
+    )
+
+    assert [requirement.topic for requirement in config.realsense_image_requirements] == [
+        "/cam3/camera/color/image_raw",
+        "/cam3/camera/aligned_depth_to_color/image_raw",
+    ]
+
+
+def test_realsense_rosbag_postcheck_detects_missing_and_skew(tmp_path):
+    config = RuntimeConfig()
+    requirements = config.realsense_image_requirements
+    metadata = {
+        requirement.topic: {"message_type": requirement.message_type, "count": 10}
+        for requirement in requirements[:-1]
+    }
+    metadata[requirements[0].topic]["count"] = 100
+
+    result = validate_rosbag_image_metadata(
+        mode=config.realsense_capture_mode,
+        rosbag_uri=tmp_path / "demo" / "rosbag",
+        requirements=requirements,
+        topic_metadata=metadata,
+        count_skew_limit=config.realsense_rosbag_count_skew_limit,
+    )
+
+    assert not result.ok
+    assert result.missing_topics == (requirements[-1].topic,)
+    assert result.count_skew == 90

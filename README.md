@@ -62,13 +62,13 @@ demo context。`status: "discarded"` 只表示用户 `x` 命令成功完成。
 - `process_logs/`：FT300S、Xense、RealSense、rosbag2 子进程日志。
 - `demos/demo_YYYYmmdd_HHMMSS/`：单次 demo 的数据。
 - `*.npz`：主控侧缓存的结构化数据，如 ZMQ、RealSense metadata、UDS frame 记录。
-- `manifest.json`：demo 保存摘要、rosbag 路径、传感器保存文件、丢帧统计和 RealSense 重启记录。
+- `manifest.json`：demo 保存摘要、rosbag 路径、传感器保存文件、丢帧统计、RealSense image readiness / rosbag post-check 和 RealSense 重启记录。
 
 ## 监控与故障处理
 
 主控会持续读取 ZMQ，即使当前处于暂停状态也不会停止 drain，避免远端队列溢出。采集时会监控 FT300S、Xense、ZMQ 和 RealSense metadata 的 frame id / seq 连续性与帧间隔；发现不连续或间隔显著变大时，会同时打印到终端并写入 log。
 
-RealSense 只订阅 metadata topic 进行时间戳和丢帧监控，不在主控中订阅 `image_raw`。如果 RealSense launch 输出中出现 `Hardware Error` 或 `Depth stream start failure`，主控会在 collecting 状态下先切换到暂停，再重启 RealSense launch。
+RealSense metadata topic 负责实时 timestamp 和丢帧监控。开始或恢复 rosbag recording 前，主控会短暂检查 required image topics 的 readiness baseline；formal 模式默认要求 `cam1` 到 `cam4` 的 color `image_raw` 和 `aligned_depth_to_color/image_raw` 共 8 个 topic，`debug_degraded` 模式必须显式配置子集。demo 完成后，主控使用当前 demo 的实际 rosbag URI 做 required image topic metadata post-check；缺失 topic、类型错误、零帧或 count skew 超阈值会把 manifest 写成 `status: "failed"`。如果 RealSense launch 输出中出现 `Hardware Error` 或 `Depth stream start failure`，主控会在 collecting 状态下先切换到暂停，再重启 RealSense launch。
 
 ## 测试
 

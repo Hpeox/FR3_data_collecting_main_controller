@@ -96,6 +96,8 @@ class MainController:
         self.sensor_saved_files: dict[str, str | None] = {}
         self.realsense_restart_count = 0
         self.realsense_restart_events: list[dict[str, Any]] = []
+        self.realsense_readiness_manifest: dict[str, Any] | None = None
+        self.realsense_postcheck_manifest: dict[str, Any] | None = None
 
         self.drop_monitors: dict[str, DropMonitor] = {}
         self.processes: dict[str, ManagedProcess] = {}
@@ -181,6 +183,8 @@ class MainController:
             self.rosbag_record_started = False
             self.rosbag_uri = demo_dir / 'rosbag'
             self.sensor_saved_files = {}
+            self.realsense_readiness_manifest = None
+            self.realsense_postcheck_manifest = None
             self.log('demo_created', demo_dir=str(demo_dir))
 
         acked_start_sensors: list[tuple[str, UdsClient]] = []
@@ -207,6 +211,22 @@ class MainController:
         rosbag_action: str | None = None
         try:
             if self.rosbag is not None and self.rosbag_uri is not None:
+                readiness = self.rosbag.check_image_readiness(
+                    self.config.realsense_image_requirements,
+                    timeout_s=self.config.realsense_image_ready_timeout_s,
+                    mode=self.config.realsense_capture_mode,
+                )
+                self.realsense_readiness_manifest = readiness.to_manifest()
+                self.log('realsense_image_readiness', **self.realsense_readiness_manifest)
+                if not readiness.ok:
+                    self._fail_start_resume_transaction(
+                        new_demo=new_demo,
+                        failure_stage='realsense_image_readiness',
+                        failure_reason='required RealSense image topics are not ready',
+                        acked_start_sensors=acked_start_sensors,
+                        rosbag_state={'image_readiness': self.realsense_readiness_manifest},
+                    )
+                    return
                 if not self.rosbag_record_started:
                     rosbag_action = 'record'
                     self.rosbag.record(self.rosbag_uri, timeout_s=self.config.rosbag_timeout_s)
@@ -268,7 +288,11 @@ class MainController:
         except Exception as exc:
             self.log('rosbag_stop_failed', error=str(exc))
 
-        self._save_current_demo(status='done')
+        self.realsense_postcheck_manifest = self._run_realsense_rosbag_postcheck()
+        status = 'done'
+        if self.realsense_postcheck_manifest is not None and not self.realsense_postcheck_manifest.get('ok', False):
+            status = 'failed'
+        self._save_current_demo(status=status)
         self.demo_store = None
         self.rosbag_record_started = False
         self.rosbag_uri = None
@@ -539,6 +563,8 @@ class MainController:
         self.rosbag_record_started = False
         self.rosbag_uri = None
         self.sensor_saved_files = {}
+        self.realsense_readiness_manifest = None
+        self.realsense_postcheck_manifest = None
         self.set_state(ControllerState.WAIT_START)
 
     def _save_current_demo(self, status: str) -> None:
@@ -565,12 +591,38 @@ class MainController:
             'drop_monitors': {name: monitor.summary() for name, monitor in self.drop_monitors.items()},
             'realsense_restart_count': self.realsense_restart_count,
             'realsense_restart_events': self.realsense_restart_events,
+            'realsense_image_readiness': self.realsense_readiness_manifest,
+            'realsense_rosbag_postcheck': self.realsense_postcheck_manifest,
         }
         if extra is not None:
             manifest.update(extra)
         manifest_path = self.demo_store.write_manifest(manifest)
         self.log('demo_saved', status=status, manifest=str(manifest_path), npz=npz_paths)
         return manifest_path
+
+    def _run_realsense_rosbag_postcheck(self) -> dict[str, Any] | None:
+        if self.rosbag is None or self.rosbag_uri is None:
+            return None
+        try:
+            result = self.rosbag.validate_recorded_images(
+                self.rosbag_uri,
+                self.config.realsense_image_requirements,
+                count_skew_limit=self.config.realsense_rosbag_count_skew_limit,
+                mode=self.config.realsense_capture_mode,
+            )
+            manifest = result.to_manifest()
+            self.log('realsense_rosbag_postcheck', **manifest)
+            return manifest
+        except Exception as exc:
+            manifest = {
+                'ok': False,
+                'mode': self.config.realsense_capture_mode,
+                'rosbag_uri': str(self.rosbag_uri),
+                'required_topics': [requirement.topic for requirement in self.config.realsense_image_requirements],
+                'error': str(exc),
+            }
+            self.log('realsense_rosbag_postcheck_failed', **manifest)
+            return manifest
 
     def _new_demo_dir(self) -> Path:
         """Return a unique demo directory path for rapid repeated captures."""
