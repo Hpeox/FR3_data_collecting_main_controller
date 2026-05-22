@@ -69,7 +69,7 @@ demo context。`status: "discarded"` 只表示用户 `x` 命令成功完成。
 - `process_logs/`：FT300S、Xense、RealSense、rosbag2 子进程日志。
 - `demos/demo_YYYYmmdd_HHMMSS/`：单次 demo 的数据。
 - `*.npz`：主控侧缓存的结构化数据，如 ZMQ、RealSense metadata、UDS frame 记录。
-- `manifest.json`：demo 保存摘要、rosbag 路径、传感器保存文件、丢帧统计、RealSense image readiness / rosbag post-check 和 RealSense 重启记录。
+- `manifest.json`：demo 保存摘要、rosbag 路径、传感器保存文件、`frame_counts`、丢帧统计、RealSense image readiness / rosbag post-check 和 RealSense 重启记录。用户成功 discard 会写 lightweight manifest，`status: "discarded"` 且 `npz` 为空，不保存高频 `.npz`。
 
 ## 监控与故障处理
 

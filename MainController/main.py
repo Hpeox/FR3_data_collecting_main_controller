@@ -355,6 +355,11 @@ class MainController:
                 stop_system=True,
             )
             return
+        self._write_current_demo_manifest(
+            status='discarded',
+            npz_paths={},
+            extra={'discard_reason': 'user'},
+        )
         self.demo_store = None
         self.rosbag_record_started = False
         self.rosbag_uri = None
@@ -678,6 +683,7 @@ class MainController:
             'rosbag_uri': None if self.rosbag_uri is None else str(self.rosbag_uri),
             'sensor_saved_files': self.sensor_saved_files,
             'npz': npz_paths,
+            'frame_counts': self.demo_store.frame_counts(),
             'drop_monitors': {name: monitor.summary() for name, monitor in self.drop_monitors.items()},
             'realsense_restart_count': self.realsense_restart_count,
             'realsense_restart_events': self.realsense_restart_events,

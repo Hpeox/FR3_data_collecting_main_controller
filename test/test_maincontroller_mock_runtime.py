@@ -561,6 +561,12 @@ def test_mock_runtime_start_pause_resume_done(tmp_path, monkeypatch):
         xense_npz = np.load(demo_dir / 'xense_timestamps.npz', allow_pickle=True)
         realsense_npz = np.load(demo_dir / 'realsense_metadata.npz', allow_pickle=True)
         zmq_npz = np.load(demo_dir / 'zmq_telemetry.npz', allow_pickle=True)
+        assert manifest['frame_counts'] == {
+            'ft300': len(ft_npz['frame_id']),
+            'xense': len(xense_npz['frame_id']),
+            'realsense': len(realsense_npz['topic']),
+            'zmq': len(zmq_npz['seq']),
+        }
         assert len(ft_npz['frame_id']) >= 4
         assert len(xense_npz['frame_id']) >= 1
         assert len(realsense_npz['topic']) == 16
@@ -986,7 +992,16 @@ def test_mock_runtime_start_discard_start_done_keeps_zmq_drain_after_discard(tmp
 
         assert controller.get_state() == ControllerState.WAIT_START
         assert controller.demo_store is None
-        assert not (discarded_demo_dir / 'manifest.json').exists()
+        discard_manifest = json.loads((discarded_demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert discard_manifest['status'] == 'discarded'
+        assert discard_manifest['npz'] == {}
+        assert discard_manifest['frame_counts']['ft300'] >= 4
+        assert discard_manifest['frame_counts']['xense'] >= 1
+        assert discard_manifest['frame_counts']['zmq'] >= 4
+        assert not (discarded_demo_dir / 'ft300_timestamps.npz').exists()
+        assert not (discarded_demo_dir / 'xense_timestamps.npz').exists()
+        assert not (discarded_demo_dir / 'realsense_metadata.npz').exists()
+        assert not (discarded_demo_dir / 'zmq_telemetry.npz').exists()
         runtime.wait_for_zmq_drain_outside_demo(monitor_key_before_discard)
 
         saved_demo_dir = runtime.start_and_wait_for_frames()

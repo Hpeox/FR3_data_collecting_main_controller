@@ -92,6 +92,15 @@ class DemoStore:
         }
         return {name: str(path) for name, path in paths.items()}
 
+    def frame_counts(self) -> dict[str, int]:
+        """Return primary row counts for each stream buffer."""
+        return {
+            'ft300': len(self.ft300),
+            'xense': len(self.xense),
+            'realsense': len(self.realsense),
+            'zmq': len(self.zmq),
+        }
+
     def write_manifest(self, payload: dict[str, Any]) -> Path:
         """Write the demo manifest."""
         path = self.demo_dir / 'manifest.json'
