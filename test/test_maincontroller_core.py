@@ -175,7 +175,13 @@ def test_sensor_path_from_payload_allows_missing_saved_file(tmp_path):
 
     assert controller._sensor_path_from_payload({}) is None
     assert controller._sensor_path_from_payload({"saved_file": None}) is None
-    assert controller._sensor_path_from_payload({"saved_file": "/tmp/data_FT_demo.npy"}) == "runtime_frames/data_FT_demo.npy"
+    assert controller._sensor_path_from_payload({"saved_file": "data_FT_demo.npy"}) == (
+        "runtime_frames/data_FT_demo.npy"
+    )
+    assert controller._sensor_path_from_payload({"saved_file": ""}) is None
+    assert controller._sensor_path_from_payload({"saved_file": "/tmp/data_FT_demo.npy"}) is None
+    assert controller._sensor_path_from_payload({"saved_file": "nested/data_FT_demo.npy"}) is None
+    assert controller._sensor_path_from_payload({"saved_file": r"nested\data_FT_demo.npy"}) is None
 
 
 def test_realsense_metadata_helpers():

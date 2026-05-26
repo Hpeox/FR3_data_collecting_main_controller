@@ -57,7 +57,10 @@ class MockUdsSensor:
         self.socket_path = socket_path
         self.hz = hz
         self.protocol = protocol
-        self.saved_file = str(socket_path.with_suffix('.npy'))
+        self.saved_file = {
+            'ft300': 'data_FT_mock.npy',
+            'xense': 'data_TAC_mock.npy',
+        }.get(name, f'data_{name}_mock.npy')
         self.commands: list[str] = []
         self.error_commands: set[str] = set()
         self.no_ack_commands: set[str] = set()
@@ -630,10 +633,10 @@ def test_mock_runtime_start_pause_resume_done(tmp_path, monkeypatch):
         )
         assert 'sensor_saved_files' not in manifest
         assert manifest['sensor_paths']['ft300'] == (
-            f'runtime_frames/{Path(runtime.ft300.saved_file).name}'
+            f'runtime_frames/{runtime.ft300.saved_file}'
         )
         assert manifest['sensor_paths']['xense'] == (
-            f'runtime_frames/{Path(runtime.xense.saved_file).name}'
+            f'runtime_frames/{runtime.xense.saved_file}'
         )
         assert manifest['rosbag_uri'] == 'rosbag'
         assert manifest['npz'] == {
@@ -696,7 +699,7 @@ def test_mock_runtime_auto_alignment_success_with_short_trim(tmp_path, monkeypat
         assert aligned_manifest['sources']['npz']['ft300'] == 'ft300_timestamps.npz'
         assert aligned_manifest['sources']['rosbag_uri'] == 'rosbag'
         assert aligned_manifest['sources']['ft300s_saved_file'] == (
-            f'runtime_frames/{Path(runtime.ft300.saved_file).name}'
+            f'runtime_frames/{runtime.ft300.saved_file}'
         )
 
 
@@ -1158,7 +1161,7 @@ def test_finish_partial_failure_writes_failed_manifest_and_stops(tmp_path, monke
         assert manifest['failure_stage'] == 'finish_command'
         assert 'sensor_saved_files' not in manifest
         assert manifest['sensor_paths']['ft300'] == (
-            f'runtime_frames/{Path(runtime.ft300.saved_file).name}'
+            f'runtime_frames/{runtime.ft300.saved_file}'
         )
         assert manifest['sensor_paths']['xense'] is None
         assert manifest['command_results']['ft300']['ok'] is True
@@ -1181,10 +1184,10 @@ def test_finish_rosbag_stop_failure_writes_failed_manifest_and_skips_postcheck(t
         assert manifest['failure_stage'] == 'rosbag_stop'
         assert 'sensor_saved_files' not in manifest
         assert manifest['sensor_paths']['ft300'] == (
-            f'runtime_frames/{Path(runtime.ft300.saved_file).name}'
+            f'runtime_frames/{runtime.ft300.saved_file}'
         )
         assert manifest['sensor_paths']['xense'] == (
-            f'runtime_frames/{Path(runtime.xense.saved_file).name}'
+            f'runtime_frames/{runtime.xense.saved_file}'
         )
         assert manifest['command_results']['ft300']['ok'] is True
         assert manifest['command_results']['xense']['ok'] is True
@@ -1276,10 +1279,10 @@ def test_active_quit_writes_failed_manifest_saves_partial_npz_and_stops(tmp_path
         assert manifest['command_results']['xense']['ok'] is True
         assert manifest['command_results']['rosbag_stop']['ok'] is True
         assert manifest['sensor_paths']['ft300'] == (
-            f'runtime_frames/{Path(runtime.ft300.saved_file).name}'
+            f'runtime_frames/{runtime.ft300.saved_file}'
         )
         assert manifest['sensor_paths']['xense'] == (
-            f'runtime_frames/{Path(runtime.xense.saved_file).name}'
+            f'runtime_frames/{runtime.xense.saved_file}'
         )
         assert manifest['npz']['ft300'] == 'ft300_timestamps.npz'
         assert (demo_dir / 'ft300_timestamps.npz').exists()

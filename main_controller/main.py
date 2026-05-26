@@ -1050,13 +1050,16 @@ class MainController:
 
     @staticmethod
     def _sensor_path_from_payload(payload: dict[str, Any] | None) -> str | None:
-        """Convert a sensor ACK payload into a repo-relative runtime_frames path."""
+        """Convert an ACK saved_file basename into a repo-relative runtime_frames path."""
         if payload is None:
             return None
         saved_file = payload.get('saved_file')
-        if saved_file is None:
+        if not isinstance(saved_file, str) or not saved_file:
             return None
-        return (Path('runtime_frames') / Path(saved_file).name).as_posix()
+        path = Path(saved_file)
+        if path.is_absolute() or path.name != saved_file or '\\' in saved_file:
+            return None
+        return (Path('runtime_frames') / path).as_posix()
 
     def reset_drop_baselines(self) -> None:
         """Reset every monitor baseline after pause/resume boundaries."""

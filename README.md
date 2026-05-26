@@ -76,7 +76,9 @@ disconnect 或 required subprocess unexpected exit 会写 `status: "failed"` man
 保存已有主控侧 `.npz`，但不发送 `DEMO_DONE_REQ` / `DEMO_DISCARD_REQ`，也不运行自动
 timestamp alignment；异步 fatal 随后进入 `ERROR -> STOPPING -> STOPPED`。
 `STOP_REQ` ACK 中的 `saved_file` 是 optional diagnostic output，缺失时对应
-`sensor_paths` 为 `None`。UDS peer disconnect 会唤醒 pending ACK wait 并把对应
+`sensor_paths` 为 `None`。该字段按正式协议只表示 basename / filename；MainController
+runtime 内部解析为仓库根目录下的 `runtime_frames/<saved_file>`，manifest 中只写
+repo-root 相对 `sensor_paths`。UDS peer disconnect 会唤醒 pending ACK wait 并把对应
 command 标记为 `uds_disconnected`；有限 flush timeout 会记录 `ack_timeout` 和 timeout 秒数。
 当 `sensor_flush_timeout_s` 显式配置为 `none` / `unbounded` 时，不产生
 `ack_timeout`，等待只会被 ACK、对应 sensor `ERROR`、UDS disconnect 或进程停止唤醒。
@@ -104,7 +106,7 @@ rosbag record/resume 失败，MainController 会写入 `status: "failed"` 的轻
 - `*.npz`：主控侧缓存的结构化数据，如 ZMQ、RealSense metadata、UDS frame 记录。
   `realsense_metadata.npz` 包含 metadata JSON 中的 `clock_domain`；如果单帧 metadata
   缺少该字段，会保存为空值并在 log/report 中告警，不会导致采集失败。
-- `manifest.json`：demo 保存摘要、`run_id`、相对 demo 目录的 `.npz` / `rosbag_uri` 路径、相对仓库根的 `sensor_paths`、`frame_counts`、本 demo 丢帧统计、RealSense image readiness / rosbag post-check 和本 demo RealSense 重启记录。用户成功 discard 会写 lightweight manifest，`status: "discarded"` 且 `npz` 为空，不保存高频 `.npz`。active-demo abort 会写 `status: "failed"` 并保存已有 `.npz`。
+- `manifest.json`：demo 保存摘要、`run_id`、相对 demo 目录的 `.npz` / `rosbag_uri` 路径、相对仓库根的 `sensor_paths`（例如 `runtime_frames/<saved_file>`）、`frame_counts`、本 demo 丢帧统计、RealSense image readiness / rosbag post-check 和本 demo RealSense 重启记录。用户成功 discard 会写 lightweight manifest，`status: "discarded"` 且 `npz` 为空，不保存高频 `.npz`。active-demo abort 会写 `status: "failed"` 并保存已有 `.npz`。
 - `demos/demo_YYYYmmdd_HHMMSS/aligned/`：主控自动对齐输出目录，默认包含 `alignment_config.json`、`aligned_index.npz`、`aligned_manifest.json` 和 `alignment_report.md`。自动对齐不生成 `aligned_numeric.npz` 等实际训练数据文件。
 
 需要独立重跑或调参时，可在仓库根目录使用 `tools/align_demo_timestamps.py`：
