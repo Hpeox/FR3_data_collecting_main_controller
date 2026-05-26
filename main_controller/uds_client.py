@@ -88,10 +88,12 @@ class UdsClient:
         magic: bytes = MAGIC,
         retry_interval_s: float = 0.5,
         recv_timeout_s: float = 0.2,
+        on_disconnect: Callable[[str, list[str]], None] | None = None,
     ):
         self.name = name
         self.socket_path = socket_path
         self.on_event = on_event
+        self.on_disconnect = on_disconnect
         self.protocol_version = protocol_version
         self.magic = magic
         self.retry_interval_s = retry_interval_s
@@ -295,14 +297,18 @@ class UdsClient:
             return event
 
     def _mark_disconnected(self) -> None:
+        was_connected = self._connected.is_set()
         self._connected.clear()
         with self._ack_lock:
-            for pending_cmd in list(self._pending_ack_cmds):
+            pending_cmds = list(self._pending_ack_cmds)
+            for pending_cmd in pending_cmds:
                 self._ack_errors[pending_cmd] = {'error': 'uds_disconnected', 'cmd': pending_cmd}
                 event = self._ack_events.get(pending_cmd)
                 if event is not None:
                     event.set()
         self._close_socket()
+        if was_connected and not self._stop.is_set() and self.on_disconnect is not None:
+            self.on_disconnect(self.name, pending_cmds)
 
     def _close_socket(self) -> None:
         with self._state_lock:

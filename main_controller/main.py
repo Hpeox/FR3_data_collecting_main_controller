@@ -101,17 +101,21 @@ class MainController:
         self.sensor_paths: dict[str, str | None] = {}
         self.realsense_restart_count = 0
         self.realsense_restart_events: list[dict[str, Any]] = []
+        self.demo_realsense_restart_count = 0
+        self.demo_realsense_restart_events: list[dict[str, Any]] = []
         self.realsense_readiness_manifest: dict[str, Any] | None = None
         self.realsense_postcheck_manifest: dict[str, Any] | None = None
         self.realsense_clock_domain_missing_topics: set[str] = set()
 
         self.drop_monitors: dict[str, DropMonitor] = {}
+        self.demo_drop_monitors: dict[str, DropMonitor] = {}
         self.processes: dict[str, ManagedProcess] = {}
+        self.expected_process_exits: set[str] = set()
         self.rosbag: RosbagControl | None = None
         self.realsense_monitor: RealSenseMetadataMonitor | None = None
         self.zmq_receiver: ZmqTelemetryReceiver | None = None
-        self.ft_client = UdsClient('ft300', config.ft_uds_path, self._on_uds_event, magic=FT300_MAGIC)
-        self.xense_client = UdsClient('xense', config.xense_uds_path, self._on_uds_event, magic=b'XS')
+        self.ft_client = UdsClient('ft300', config.ft_uds_path, self._on_uds_event, magic=FT300_MAGIC, on_disconnect=self._on_uds_disconnect)
+        self.xense_client = UdsClient('xense', config.xense_uds_path, self._on_uds_event, magic=b'XS', on_disconnect=self._on_uds_disconnect)
 
     def run(self) -> None:
         """Start the controller and process commands until shutdown."""
@@ -126,7 +130,15 @@ class MainController:
                 self.handle_command(command)
         except KeyboardInterrupt:
             self.log('keyboard_interrupt')
-            self.stop_all()
+            state = self.get_state()
+            if self._active_demo_needs_abort(state):
+                self._abort_active_demo(
+                    failure_stage='keyboard_interrupt',
+                    failure_reason='KeyboardInterrupt during active demo',
+                    abort_context={'signal': 'KeyboardInterrupt'},
+                )
+            else:
+                self.stop_all()
         finally:
             self.logger.close()
 
@@ -164,6 +176,12 @@ class MainController:
             if state == ControllerState.FINALIZING:
                 self.queued_stop_after_finalizing = True
                 self.log('stop_queued_after_finalizing')
+            elif self._active_demo_needs_abort(state):
+                self._abort_active_demo(
+                    failure_stage='user_quit',
+                    failure_reason='user requested quit during active demo',
+                    abort_context={'command': 'q'},
+                )
             else:
                 self.stop_all()
         elif name == 'realsense_fatal':
@@ -172,6 +190,10 @@ class MainController:
             self.handle_realsense_metadata_fatal(command.payload or {})
         elif name == 'zmq_fatal':
             self.handle_zmq_fatal(command.payload or {})
+        elif name == 'uds_disconnect':
+            self.handle_uds_disconnect(command.payload or {})
+        elif name == 'process_exit':
+            self.handle_process_exit(command.payload or {})
         else:
             self.log('unknown_command', command=name)
 
@@ -194,6 +216,9 @@ class MainController:
             self.realsense_readiness_manifest = None
             self.realsense_postcheck_manifest = None
             self.realsense_clock_domain_missing_topics = set()
+            self.demo_drop_monitors = {}
+            self.demo_realsense_restart_count = 0
+            self.demo_realsense_restart_events = []
             self.log('demo_created', demo_dir=str(demo_dir))
 
         required_sensors = [('ft300', self.ft_client), ('xense', self.xense_client)]
@@ -433,17 +458,22 @@ class MainController:
 
     def stop_all(self) -> None:
         """Stop sensors, receivers, ROS helpers, and subprocesses."""
+        self._stop_runtime_resources(stop_rosbag=True, send_sensor_stop=True)
+
+    def _stop_runtime_resources(self, *, stop_rosbag: bool, send_sensor_stop: bool) -> None:
+        """Stop runtime resources without writing demo manifests."""
         if self.get_state() == ControllerState.STOPPED:
             return
         self.set_state(ControllerState.STOPPING)
         self.log('stopping')
         try:
-            if self.rosbag is not None:
+            if stop_rosbag and self.rosbag is not None:
                 self.rosbag.stop(timeout_s=self.config.rosbag_timeout_s)
         except Exception as exc:
             self.log('rosbag_stop_failed', error=str(exc))
-        self._sensor_command(self.ft_client, MsgType.STOP_REQ, 'STOP_REQ', self.config.ack_timeout_s)
-        self._sensor_command(self.xense_client, MsgType.STOP_REQ, 'STOP_REQ', self.config.ack_timeout_s)
+        if send_sensor_stop:
+            self._sensor_command(self.ft_client, MsgType.STOP_REQ, 'STOP_REQ', self.config.ack_timeout_s)
+            self._sensor_command(self.xense_client, MsgType.STOP_REQ, 'STOP_REQ', self.config.ack_timeout_s)
         self.ft_client.stop()
         self.xense_client.stop()
         if self.zmq_receiver is not None:
@@ -455,17 +485,73 @@ class MainController:
                 self.rosbag.close()
             except Exception:
                 pass
+        self.expected_process_exits.update(self.processes)
         for process in reversed(list(self.processes.values())):
             process.stop()
         self.set_state(ControllerState.STOPPED)
         self.log('stopped')
+
+    def _abort_active_demo(
+        self,
+        *,
+        failure_stage: str,
+        failure_reason: str,
+        abort_context: dict[str, Any] | None = None,
+    ) -> None:
+        """Stop an active demo, save partial controller data, and stop the system."""
+        self.log('active_demo_abort_started', failure_stage=failure_stage, failure_reason=failure_reason)
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix='DemoAbort') as executor:
+            ft_future = executor.submit(
+                self._sensor_command_result,
+                self.ft_client,
+                MsgType.STOP_REQ,
+                'STOP_REQ',
+                self.config.ack_timeout_s,
+            )
+            xense_future = executor.submit(
+                self._sensor_command_result,
+                self.xense_client,
+                MsgType.STOP_REQ,
+                'STOP_REQ',
+                self.config.ack_timeout_s,
+            )
+            rosbag_stop_future = executor.submit(self._rosbag_stop_result)
+            ft_result = ft_future.result()
+            xense_result = xense_future.result()
+            rosbag_stop_result = rosbag_stop_future.result()
+
+        self.sensor_paths = {
+            'ft300': self._sensor_path_from_payload(ft_result['payload']),
+            'xense': self._sensor_path_from_payload(xense_result['payload']),
+        }
+        extra = {
+            'failure_stage': failure_stage,
+            'failure_reason': failure_reason,
+            'command_results': {'ft300': ft_result, 'xense': xense_result, 'rosbag_stop': rosbag_stop_result},
+            'abort_context': abort_context or {},
+        }
+        self._save_current_demo(status='failed', extra=extra)
+        self.log('active_demo_abort_done', failure_stage=failure_stage, failure_reason=failure_reason)
+        self.demo_store = None
+        self.demo_started_ns = None
+        self.rosbag_record_started = False
+        self.rosbag_uri = None
+        self._stop_runtime_resources(stop_rosbag=False, send_sensor_stop=False)
 
     def handle_realsense_fatal(self, payload: dict[str, Any]) -> None:
         """Pause if needed and restart the RealSense camera launch."""
         self.log('realsense_fatal_detected', **payload)
         print(f"[WARN] RealSense fatal output: {payload.get('line')}")
         if self.get_state() == ControllerState.COLLECTING:
-            self.pause_demo(reason='realsense_fatal')
+            if not self.pause_demo(reason='realsense_fatal'):
+                self.log('realsense_restart_skipped', reason='auto_pause_failed')
+                return
+        if self.get_state() in {ControllerState.ERROR, ControllerState.STOPPING, ControllerState.STOPPED}:
+            self.log('realsense_restart_skipped', reason='controller_stopping_or_error')
+            return
+        if self.get_state() not in {ControllerState.PAUSED, ControllerState.WAIT_START}:
+            self.log('realsense_restart_skipped', reason='invalid_state_for_restart')
+            return
         process = self.processes.get('realsense_camera')
         if process is None:
             self.log('realsense_restart_skipped', reason='process_not_found')
@@ -473,7 +559,11 @@ class MainController:
         self.realsense_restart_count += 1
         event = {'time_ns': time.time_ns(), **payload}
         self.realsense_restart_events.append(event)
+        if self.demo_store is not None:
+            self.demo_realsense_restart_count += 1
+            self.demo_realsense_restart_events.append(event)
         self.log('realsense_restart_started', count=self.realsense_restart_count)
+        self.expected_process_exits.add('realsense_camera')
         process.restart()
         self.reset_realsense_drop_baselines()
         self.log('realsense_restart_done', count=self.realsense_restart_count)
@@ -482,17 +572,69 @@ class MainController:
         """Treat metadata receiver termination as an unrecoverable error."""
         self.log('realsense_metadata_fatal_detected', **payload)
         print(f"[ERROR] RealSense metadata monitor fatal: {payload.get('message')}")
-        if self.get_state() != ControllerState.ERROR:
-            self.set_state(ControllerState.ERROR)
-        self.stop_all()
+        self._handle_unrecoverable_fatal(
+            failure_stage='realsense_metadata_fatal',
+            failure_reason=str(payload.get('message') or 'RealSense metadata monitor fatal'),
+            abort_context=payload,
+        )
 
     def handle_zmq_fatal(self, payload: dict[str, Any]) -> None:
         """Treat receiver-loop termination as an unrecoverable controller error."""
         self.log('zmq_fatal_detected', **payload)
         print(f"[ERROR] ZMQ receiver fatal: {payload.get('message')}")
+        self._handle_unrecoverable_fatal(
+            failure_stage='zmq_fatal',
+            failure_reason=str(payload.get('message') or 'ZMQ receiver fatal'),
+            abort_context=payload,
+        )
+
+    def handle_uds_disconnect(self, payload: dict[str, Any]) -> None:
+        """Treat required sensor UDS peer disconnect as a fatal runtime error."""
+        sensor = str(payload.get('sensor') or 'unknown')
+        if sensor not in {'ft300', 'xense'}:
+            self.log('uds_disconnect_ignored', **payload)
+            return
+        self.log('uds_disconnect_detected', **payload)
+        self._handle_unrecoverable_fatal(
+            failure_stage=f'{sensor}_uds_disconnect',
+            failure_reason=f'{sensor} UDS peer disconnected',
+            abort_context=payload,
+        )
+
+    def handle_process_exit(self, payload: dict[str, Any]) -> None:
+        """Treat unexpected required subprocess exit as a fatal runtime error."""
+        name = str(payload.get('process') or 'unknown')
+        if name not in {'ft300', 'xense', 'rosbag_recorder', 'realsense_camera'}:
+            self.log('process_exit_ignored', **payload)
+            return
+        state = self.get_state()
+        if state not in {ControllerState.WAIT_START, ControllerState.COLLECTING, ControllerState.PAUSED}:
+            self.log('process_exit_ignored', reason='inactive_state', **payload)
+            return
+        self._handle_unrecoverable_fatal(
+            failure_stage=f'{name}_process_exit',
+            failure_reason=f'{name} process exited unexpectedly',
+            abort_context=payload,
+        )
+
+    def _handle_unrecoverable_fatal(
+        self,
+        *,
+        failure_stage: str,
+        failure_reason: str,
+        abort_context: dict[str, Any],
+    ) -> None:
+        active_demo = self._active_demo_needs_abort(self.get_state())
         if self.get_state() != ControllerState.ERROR:
             self.set_state(ControllerState.ERROR)
-        self.stop_all()
+        if active_demo:
+            self._abort_active_demo(
+                failure_stage=failure_stage,
+                failure_reason=failure_reason,
+                abort_context=abort_context,
+            )
+        else:
+            self.stop_all()
 
     def _start_processes(self) -> None:
         logs = self.output_dir / 'process_logs' / self.run_id
@@ -613,6 +755,9 @@ class MainController:
     def _on_realsense_metadata_fatal(self, message: str) -> None:
         self.commands.put(Command('realsense_metadata_fatal', {'message': message, 'time_ns': time.time_ns()}))
 
+    def _on_uds_disconnect(self, name: str, pending_cmds: list[str]) -> None:
+        self.commands.put(Command('uds_disconnect', {'sensor': name, 'pending_cmds': pending_cmds, 'time_ns': time.time_ns()}))
+
     def _on_realsense_metadata(self, event) -> None:
         assert isinstance(event, RealSenseMetadataEvent)
         if event.clock_domain is None and event.topic not in self.realsense_clock_domain_missing_topics:
@@ -632,6 +777,12 @@ class MainController:
             self.drop_monitors[stream] = monitor
         for warning_event in monitor.observe(key, stamp_ns):
             self._emit_drop_warning(warning_event)
+        if self.get_state() == ControllerState.COLLECTING and self.demo_store is not None:
+            demo_monitor = self.demo_drop_monitors.get(stream)
+            if demo_monitor is None:
+                demo_monitor = DropMonitor(stream, expected, warning)
+                self.demo_drop_monitors[stream] = demo_monitor
+            demo_monitor.observe(key, stamp_ns)
 
     def _emit_drop_warning(self, warning: DropWarning) -> None:
         payload = warning.__dict__
@@ -804,9 +955,11 @@ class MainController:
             'sensor_paths': self.sensor_paths,
             'npz': npz_paths,
             'frame_counts': self.demo_store.frame_counts(),
-            'drop_monitors': {name: monitor.summary() for name, monitor in self.drop_monitors.items()},
-            'realsense_restart_count': self.realsense_restart_count,
-            'realsense_restart_events': self.realsense_restart_events,
+            'drop_monitors': {name: monitor.summary() for name, monitor in self.demo_drop_monitors.items()},
+            'realsense_restart_count': self.demo_realsense_restart_count,
+            'realsense_restart_events': self.demo_realsense_restart_events,
+            'run_realsense_restart_count': self.realsense_restart_count,
+            'run_realsense_restart_events': self.realsense_restart_events,
             'realsense_image_readiness': self.realsense_readiness_manifest,
             'realsense_rosbag_postcheck': self.realsense_postcheck_manifest,
         }
@@ -909,12 +1062,20 @@ class MainController:
         """Reset every monitor baseline after pause/resume boundaries."""
         for monitor in self.drop_monitors.values():
             monitor.reset_baseline()
+        for monitor in self.demo_drop_monitors.values():
+            monitor.reset_baseline()
 
     def reset_realsense_drop_baselines(self) -> None:
         """Reset only RealSense monitor baselines after camera restart."""
         for name, monitor in self.drop_monitors.items():
             if name.startswith('realsense:'):
                 monitor.reset_baseline()
+        for name, monitor in self.demo_drop_monitors.items():
+            if name.startswith('realsense:'):
+                monitor.reset_baseline()
+
+    def _active_demo_needs_abort(self, state: ControllerState) -> bool:
+        return self.demo_store is not None and state in {ControllerState.COLLECTING, ControllerState.PAUSED}
 
     def reject_command(self, command: str, state: ControllerState) -> None:
         """Log and print an invalid command for the current state."""
@@ -943,7 +1104,12 @@ class MainController:
         self.commands.put(Command('realsense_fatal', {'process': name, 'line': line, 'time_ns': time.time_ns()}))
 
     def _on_process_exit(self, name: str, returncode: int) -> None:
+        if name in self.expected_process_exits:
+            self.expected_process_exits.discard(name)
+            self.log('process_exited_expected', process=name, returncode=returncode)
+            return
         self.log('process_exited', process=name, returncode=returncode)
+        self.commands.put(Command('process_exit', {'process': name, 'returncode': returncode, 'time_ns': time.time_ns()}))
 
 
 def _int_or_none(value: Any) -> int | None:

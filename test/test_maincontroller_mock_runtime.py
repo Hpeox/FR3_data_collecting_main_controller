@@ -66,6 +66,7 @@ class MockUdsSensor:
         self.ack_sent_times: dict[str, float] = {}
         self.received_magics: list[bytes] = []
         self.frames_sent = 0
+        self.has_demo_data = False
         self._stop = threading.Event()
         self._collecting = threading.Event()
         self._ready = threading.Event()
@@ -163,6 +164,7 @@ class MockUdsSensor:
                 self._collecting.clear()
                 return
             self._collecting.clear()
+            self.has_demo_data = False
             self._send_ack('DEMO_DONE_REQ', saved_file=self.saved_file)
             return
         if msg_type == protocol_msg.DEMO_DISCARD_REQ:
@@ -170,6 +172,7 @@ class MockUdsSensor:
             if self._send_error_for('DEMO_DISCARD_REQ'):
                 return
             self._collecting.clear()
+            self.has_demo_data = False
             self._send_ack('DEMO_DISCARD_REQ')
             return
         if msg_type == protocol_msg.STOP_REQ:
@@ -177,7 +180,11 @@ class MockUdsSensor:
             if self._send_error_for('STOP_REQ'):
                 return
             self._collecting.clear()
-            self._send_ack('STOP_REQ')
+            if self.has_demo_data:
+                self.has_demo_data = False
+                self._send_ack('STOP_REQ', saved_file=self.saved_file)
+            else:
+                self._send_ack('STOP_REQ')
 
     def _run_frames(self) -> None:
         period_s = 1.0 / self.hz
@@ -198,6 +205,7 @@ class MockUdsSensor:
             else:
                 payload = {'timestamp_ns': stamp_ns}
             self._send(self.protocol.MsgType.FRAME_READY, frame_id=self.frames_sent, payload=payload)
+            self.has_demo_data = True
             next_time += period_s
 
     def _send_ack(self, cmd: str, **extra: Any) -> None:
@@ -1252,6 +1260,88 @@ def test_discard_partial_failure_writes_failed_manifest_and_stops(tmp_path, monk
         assert manifest['npz'] == {}
 
 
+def test_active_quit_writes_failed_manifest_saves_partial_npz_and_stops(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+
+        controller.handle_command(Command('q'))
+
+        assert controller.get_state() == ControllerState.STOPPED
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'failed'
+        assert manifest['failure_stage'] == 'user_quit'
+        assert manifest['command_results']['ft300']['ok'] is True
+        assert manifest['command_results']['xense']['ok'] is True
+        assert manifest['command_results']['rosbag_stop']['ok'] is True
+        assert manifest['sensor_paths']['ft300'] == (
+            f'runtime_frames/{Path(runtime.ft300.saved_file).name}'
+        )
+        assert manifest['sensor_paths']['xense'] == (
+            f'runtime_frames/{Path(runtime.xense.saved_file).name}'
+        )
+        assert manifest['npz']['ft300'] == 'ft300_timestamps.npz'
+        assert (demo_dir / 'ft300_timestamps.npz').exists()
+        assert not (demo_dir / 'aligned').exists()
+        assert runtime.ft300.commands[-1] == 'STOP_REQ'
+        assert runtime.xense.commands[-1] == 'STOP_REQ'
+
+
+def test_active_abort_allows_missing_stop_saved_file(tmp_path):
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    demo_dir = tmp_path / 'demo'
+    controller.demo_store = DemoStore(demo_dir)
+    controller.demo_store.ft300.append(frame_id=1, timestamp_ns=1, recv_time_ns=1, recv_monotonic_ns=1)
+    controller.demo_started_ns = time.time_ns()
+    controller.rosbag_uri = demo_dir / 'rosbag'
+    controller.rosbag = FakeRosbagControl()
+    controller.ft_client = FakeSensorClient('ft300')
+    controller.xense_client = FakeSensorClient('xense')
+    controller.set_state(ControllerState.COLLECTING)
+
+    controller.handle_command(Command('q'))
+
+    manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+    assert manifest['status'] == 'failed'
+    assert manifest['sensor_paths'] == {'ft300': None, 'xense': None}
+    assert manifest['command_results']['ft300']['payload'] == {'cmd': 'STOP_REQ'}
+    assert manifest['command_results']['xense']['payload'] == {'cmd': 'STOP_REQ'}
+    assert manifest['npz']['ft300'] == 'ft300_timestamps.npz'
+
+
+@pytest.mark.parametrize(
+    ('command', 'payload', 'failure_stage'),
+    [
+        ('zmq_fatal', {'message': 'injected receiver failure'}, 'zmq_fatal'),
+        ('realsense_metadata_fatal', {'message': 'injected metadata failure'}, 'realsense_metadata_fatal'),
+        ('uds_disconnect', {'sensor': 'ft300', 'pending_cmds': []}, 'ft300_uds_disconnect'),
+        ('process_exit', {'process': 'ft300', 'returncode': 1}, 'ft300_process_exit'),
+    ],
+)
+def test_active_async_fatal_writes_failed_manifest_and_stops(tmp_path, command, payload, failure_stage):
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    demo_dir = tmp_path / 'demo'
+    controller.demo_store = DemoStore(demo_dir)
+    controller.demo_store.zmq.append(source=1, seq=1, stamp_s=1.0, valid_mask=1, floats_58=tuple([0.0] * 58), gripper_gPO=0, gripper_gCU=0, recv_time_ns=1, recv_monotonic_ns=1)
+    controller.demo_started_ns = time.time_ns()
+    controller.rosbag_uri = demo_dir / 'rosbag'
+    controller.rosbag = FakeRosbagControl()
+    controller.ft_client = FakeSensorClient('ft300')
+    controller.xense_client = FakeSensorClient('xense')
+    controller.set_state(ControllerState.COLLECTING)
+
+    controller.handle_command(Command(command, payload))
+
+    assert controller.get_state() == ControllerState.STOPPED
+    manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+    assert manifest['status'] == 'failed'
+    assert manifest['failure_stage'] == failure_stage
+    assert manifest['npz']['zmq'] == 'zmq_telemetry.npz'
+    assert manifest['command_results']['ft300']['ok'] is True
+    assert manifest['command_results']['xense']['ok'] is True
+
+
 def test_zmq_warning_does_not_stop_controller(tmp_path):
     controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
     controller.set_state(ControllerState.COLLECTING)
@@ -1351,6 +1441,30 @@ def test_mock_runtime_start_done_start_done_keeps_zmq_drain_between_demos(tmp_pa
         ]
 
 
+def test_demo_manifest_uses_per_demo_drop_monitor_stats(tmp_path):
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    first_demo = tmp_path / 'demo1'
+    controller.demo_store = DemoStore(first_demo)
+    controller.demo_started_ns = 1
+    controller.set_state(ControllerState.COLLECTING)
+    controller._observe_drop('stream', 1, 1, 10.0)
+    controller._observe_drop('stream', 3, 300_000_000, 10.0)
+    controller._write_current_demo_manifest(status='failed', npz_paths={})
+
+    controller.demo_store = DemoStore(tmp_path / 'demo2')
+    controller.demo_started_ns = 2
+    controller.demo_drop_monitors = {}
+    controller._observe_drop('stream', 4, 400_000_000, 10.0)
+    controller._observe_drop('stream', 5, 500_000_000, 10.0)
+    controller._write_current_demo_manifest(status='failed', npz_paths={})
+
+    first_manifest = json.loads((first_demo / 'manifest.json').read_text(encoding='utf-8'))
+    second_manifest = json.loads((tmp_path / 'demo2' / 'manifest.json').read_text(encoding='utf-8'))
+    assert first_manifest['drop_monitors']['stream']['warning_count'] > 0
+    assert second_manifest['drop_monitors']['stream']['warning_count'] == 0
+    assert controller.drop_monitors['stream'].summary()['warning_count'] > 0
+
+
 def test_mock_runtime_start_discard_start_done_keeps_zmq_drain_after_discard(tmp_path, monkeypatch):
     with MockRuntime(tmp_path, monkeypatch) as runtime:
         controller = runtime.controller
@@ -1411,3 +1525,38 @@ def test_realsense_fatal_pauses_collecting_and_restarts(tmp_path):
     assert ('pause', None) in fake_rosbag.calls
     assert fake_process.restart_count == 1
     assert controller.realsense_restart_count == 1
+
+
+def test_realsense_fatal_does_not_restart_when_auto_pause_fails(tmp_path):
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    demo_dir = tmp_path / 'demo'
+    fake_rosbag = FakeRosbagControl()
+    fake_rosbag.fail_methods.add('pause')
+    fake_process = FakeProcess()
+    controller.ft_client = FakeSensorClient('ft300')
+    controller.xense_client = FakeSensorClient('xense')
+    controller.rosbag = fake_rosbag
+    controller.processes['realsense_camera'] = fake_process
+    controller.demo_store = DemoStore(demo_dir)
+    controller.demo_started_ns = time.time_ns()
+    controller.rosbag_uri = demo_dir / 'rosbag'
+    controller.set_state(ControllerState.COLLECTING)
+
+    controller.handle_realsense_fatal({'line': 'Hardware Error', 'process': 'realsense_camera'})
+
+    assert controller.get_state() == ControllerState.STOPPED
+    assert fake_process.restart_count == 0
+    manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+    assert manifest['status'] == 'failed'
+    assert manifest['failure_stage'] == 'rosbag_pause'
+
+
+def test_expected_process_exit_is_not_fatal(tmp_path):
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    controller.expected_process_exits.add('realsense_camera')
+    controller.set_state(ControllerState.WAIT_START)
+
+    controller._on_process_exit('realsense_camera', 0)
+
+    assert controller.get_state() == ControllerState.WAIT_START
+    assert controller.commands.empty()

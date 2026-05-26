@@ -17,10 +17,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from main_controller.drop_monitor import DropMonitor
 import main_controller.config as config_module
 from main_controller.config import RuntimeConfig, validate_repo_root
-from main_controller.main import build_config
+from main_controller.main import MainController, build_config
 from main_controller.realsense_image_guard import validate_rosbag_image_metadata
 from main_controller.realsense_metadata import RealSenseMetadataMonitor, metadata_int, metadata_ms_to_ns, metadata_str
 from main_controller.timestamp_alignment import AlignmentOptions, align_demo_timestamps
+from main_controller.uds_client import UdsClient
 from main_controller.zmq_telemetry import (
     FRAME_SIZE,
     FRAME_STRUCT,
@@ -147,6 +148,34 @@ def test_drop_monitor_reset_baseline():
     monitor.reset_baseline()
 
     assert monitor.observe(30, 1_000_000) == []
+
+
+def test_uds_client_disconnect_callback_wakes_pending_ack():
+    disconnects: list[tuple[str, list[str]]] = []
+    client = UdsClient(
+        "ft300",
+        "/tmp/nonexistent-ft300.sock",
+        lambda _event: None,
+        on_disconnect=lambda name, pending_cmds: disconnects.append((name, pending_cmds)),
+    )
+    ack_event = client._ack_event("STOP_REQ")
+    client._connected.set()
+    with client._ack_lock:
+        client._pending_ack_cmds.add("STOP_REQ")
+
+    client._mark_disconnected()
+
+    assert disconnects == [("ft300", ["STOP_REQ"])]
+    assert ack_event.is_set()
+    assert client.last_error_for("STOP_REQ") == {"error": "uds_disconnected", "cmd": "STOP_REQ"}
+
+
+def test_sensor_path_from_payload_allows_missing_saved_file(tmp_path):
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / "sessions"))
+
+    assert controller._sensor_path_from_payload({}) is None
+    assert controller._sensor_path_from_payload({"saved_file": None}) is None
+    assert controller._sensor_path_from_payload({"saved_file": "/tmp/data_FT_demo.npy"}) == "runtime_frames/data_FT_demo.npy"
 
 
 def test_realsense_metadata_helpers():
