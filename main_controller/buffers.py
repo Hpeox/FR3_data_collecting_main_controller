@@ -79,7 +79,7 @@ class DemoStore:
     demo_dir: Path
     ft300: TableBuffer = field(default_factory=lambda: TableBuffer(('frame_id', 'timestamp_ns', 'recv_time_ns', 'recv_monotonic_ns')))
     xense: TableBuffer = field(default_factory=lambda: TableBuffer(('frame_id', 'timestamp_ns_0', 'timestamp_ns_1', 'recv_time_ns', 'recv_monotonic_ns')))
-    realsense: TableBuffer = field(default_factory=lambda: TableBuffer(('topic', 'frame_number', 'header_stamp_ns', 'frame_timestamp_ns', 'hw_timestamp_ns', 'recv_time_ns', 'recv_monotonic_ns')))
+    realsense: TableBuffer = field(default_factory=lambda: TableBuffer(('topic', 'frame_number', 'header_stamp_ns', 'frame_timestamp_ns', 'hw_timestamp_ns', 'clock_domain', 'recv_time_ns', 'recv_monotonic_ns')))
     zmq: TableBuffer = field(default_factory=lambda: TableBuffer(('source', 'seq', 'stamp_s', 'valid_mask', 'floats_58', 'gripper_gPO', 'gripper_gCU', 'recv_time_ns', 'recv_monotonic_ns')))
 
     def save_all(self) -> dict[str, str]:

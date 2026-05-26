@@ -18,6 +18,7 @@ class RealSenseMetadataEvent:
     header_stamp_ns: int
     frame_timestamp_ns: int | None
     hw_timestamp_ns: int | None
+    clock_domain: str | None
     recv_time_ns: int
     recv_monotonic_ns: int
 
@@ -50,6 +51,15 @@ def metadata_ms_to_ns(data: dict, key: str) -> int | None:
         return int(round(float(value) * 1_000_000.0))
     except Exception:
         return None
+
+
+def metadata_str(data: dict, key: str) -> str | None:
+    """Extract a non-empty string metadata field."""
+    value = data.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 class RealSenseMetadataMonitor:
@@ -111,6 +121,7 @@ class RealSenseMetadataMonitor:
             header_stamp_ns=stamp_to_ns(msg.header.stamp),
             frame_timestamp_ns=metadata_ms_to_ns(data, 'frame_timestamp'),
             hw_timestamp_ns=metadata_ms_to_ns(data, 'hw_timestamp'),
+            clock_domain=metadata_str(data, 'clock_domain'),
             recv_time_ns=time.time_ns(),
             recv_monotonic_ns=time.monotonic_ns(),
         )

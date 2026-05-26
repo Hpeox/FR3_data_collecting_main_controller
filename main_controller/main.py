@@ -6,6 +6,7 @@ import argparse
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
@@ -17,6 +18,7 @@ from .drop_monitor import DropMonitor, DropWarning
 from .processes import ManagedProcess, bash_cmd
 from .realsense_metadata import RealSenseMetadataEvent, RealSenseMetadataMonitor
 from .rosbag_control import RosbagControl
+from .timestamp_alignment import AlignmentOptions, align_demo_timestamps, failure_manifest_entry, update_manifest_alignment
 from .uds_client import MAGIC as FT300_MAGIC
 from .uds_client import MsgType, UdsClient, UdsEvent
 from .zmq_telemetry import TelemetryFrame, ZmqTelemetryReceiver
@@ -98,6 +100,7 @@ class MainController:
         self.realsense_restart_events: list[dict[str, Any]] = []
         self.realsense_readiness_manifest: dict[str, Any] | None = None
         self.realsense_postcheck_manifest: dict[str, Any] | None = None
+        self.realsense_clock_domain_missing_topics: set[str] = set()
 
         self.drop_monitors: dict[str, DropMonitor] = {}
         self.processes: dict[str, ManagedProcess] = {}
@@ -185,6 +188,7 @@ class MainController:
             self.sensor_saved_files = {}
             self.realsense_readiness_manifest = None
             self.realsense_postcheck_manifest = None
+            self.realsense_clock_domain_missing_topics = set()
             self.log('demo_created', demo_dir=str(demo_dir))
 
         required_sensors = [('ft300', self.ft_client), ('xense', self.xense_client)]
@@ -303,30 +307,29 @@ class MainController:
         self.set_state(ControllerState.FINALIZING)
         self.log('finalizing_started')
 
-        ft_result = self._sensor_command_result_with_progress(
-            self.ft_client,
-            MsgType.DEMO_DONE_REQ,
-            'DEMO_DONE_REQ',
-            self.config.sensor_flush_timeout_s,
-        )
-        xense_result = self._sensor_command_result_with_progress(
-            self.xense_client,
-            MsgType.DEMO_DONE_REQ,
-            'DEMO_DONE_REQ',
-            self.config.sensor_flush_timeout_s,
-        )
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix='DemoFinalize') as executor:
+            ft_future = executor.submit(
+                self._sensor_command_result_with_progress,
+                self.ft_client,
+                MsgType.DEMO_DONE_REQ,
+                'DEMO_DONE_REQ',
+                self.config.sensor_flush_timeout_s,
+            )
+            xense_future = executor.submit(
+                self._sensor_command_result_with_progress,
+                self.xense_client,
+                MsgType.DEMO_DONE_REQ,
+                'DEMO_DONE_REQ',
+                self.config.sensor_flush_timeout_s,
+            )
+            rosbag_stop_future = executor.submit(self._rosbag_stop_result)
+            ft_result = ft_future.result()
+            xense_result = xense_future.result()
+            rosbag_stop_result = rosbag_stop_future.result()
         self.sensor_saved_files = {
             'ft300': None if ft_result['payload'] is None else ft_result['payload'].get('saved_file'),
             'xense': None if xense_result['payload'] is None else xense_result['payload'].get('saved_file'),
         }
-
-        rosbag_stop_result: dict[str, Any] = {'ok': True, 'action': 'stop'}
-        try:
-            if self.rosbag is not None:
-                self.rosbag.stop(timeout_s=self.config.rosbag_timeout_s)
-        except Exception as exc:
-            rosbag_stop_result = {'ok': False, 'action': 'stop', 'error': str(exc)}
-            self.log('rosbag_stop_failed', error=str(exc))
 
         command_failed = not ft_result['ok'] or not xense_result['ok'] or not rosbag_stop_result['ok']
         if command_failed:
@@ -350,7 +353,9 @@ class MainController:
                 'failure_reason': failure_reason,
                 'command_results': {'ft300': ft_result, 'xense': xense_result, 'rosbag_stop': rosbag_stop_result},
             }
-        self._save_current_demo(status=status, extra=extra)
+        manifest_path = self._save_current_demo(status=status, extra=extra)
+        if status == 'done' and manifest_path is not None:
+            self._run_timestamp_alignment(manifest_path)
         if command_failed:
             self.demo_store = None
             self.demo_started_ns = None
@@ -366,6 +371,16 @@ class MainController:
         self.log('finalizing_done')
         if self.queued_stop_after_finalizing:
             self.stop_all()
+
+    def _rosbag_stop_result(self) -> dict[str, Any]:
+        """Stop rosbag recording and return a manifest-friendly result."""
+        try:
+            if self.rosbag is not None:
+                self.rosbag.stop(timeout_s=self.config.rosbag_timeout_s)
+            return {'ok': True, 'action': 'stop'}
+        except Exception as exc:
+            self.log('rosbag_stop_failed', error=str(exc))
+            return {'ok': False, 'action': 'stop', 'error': str(exc)}
 
     def discard_demo(self) -> None:
         """Discard current demo buffers and stop current recording."""
@@ -567,10 +582,13 @@ class MainController:
 
     def _on_realsense_metadata(self, event) -> None:
         assert isinstance(event, RealSenseMetadataEvent)
+        if event.clock_domain is None and event.topic not in self.realsense_clock_domain_missing_topics:
+            self.realsense_clock_domain_missing_topics.add(event.topic)
+            self.log('realsense_clock_domain_missing', topic=event.topic, frame_number=event.frame_number)
         stamp_ns = event.frame_timestamp_ns or event.header_stamp_ns
         self._observe_drop(f'realsense:{event.topic}', event.frame_number, stamp_ns, self.config.rate.realsense_hz)
         if self.get_state() == ControllerState.COLLECTING and self.demo_store is not None:
-            self.demo_store.realsense.append(topic=event.topic, frame_number=event.frame_number, header_stamp_ns=event.header_stamp_ns, frame_timestamp_ns=event.frame_timestamp_ns, hw_timestamp_ns=event.hw_timestamp_ns, recv_time_ns=event.recv_time_ns, recv_monotonic_ns=event.recv_monotonic_ns)
+            self.demo_store.realsense.append(topic=event.topic, frame_number=event.frame_number, header_stamp_ns=event.header_stamp_ns, frame_timestamp_ns=event.frame_timestamp_ns, hw_timestamp_ns=event.hw_timestamp_ns, clock_domain=event.clock_domain, recv_time_ns=event.recv_time_ns, recv_monotonic_ns=event.recv_monotonic_ns)
 
     def _observe_drop(self, stream: str, key: int | None, stamp_ns: int | None, rate_hz: float) -> None:
         expected = ns_from_hz(rate_hz)
@@ -722,11 +740,11 @@ class MainController:
             return
         self.set_state(ControllerState.WAIT_START)
 
-    def _save_current_demo(self, status: str, extra: dict[str, Any] | None = None) -> None:
+    def _save_current_demo(self, status: str, extra: dict[str, Any] | None = None) -> Path | None:
         if self.demo_store is None:
-            return
+            return None
         npz_paths = self.demo_store.save_all()
-        self._write_current_demo_manifest(status=status, npz_paths=npz_paths, extra=extra)
+        return self._write_current_demo_manifest(status=status, npz_paths=npz_paths, extra=extra)
 
     def _write_current_demo_manifest(
         self,
@@ -755,6 +773,30 @@ class MainController:
         manifest_path = self.demo_store.write_manifest(manifest)
         self.log('demo_saved', status=status, manifest=str(manifest_path), npz=npz_paths)
         return manifest_path
+
+    def _run_timestamp_alignment(self, manifest_path: Path) -> None:
+        """Run automatic timestamp alignment and update the demo manifest."""
+        if self.demo_store is None:
+            return
+        started_ns = time.time_ns()
+        demo_dir = self.demo_store.demo_dir
+        options = AlignmentOptions(
+            base='auto',
+            alignment_base_source=self.config.alignment_base_source,
+            mode=self.config.alignment_mode,
+            hz=self.config.alignment_hz,
+            start_trim_s=self.config.alignment_start_trim_s,
+        )
+        try:
+            result = align_demo_timestamps(demo_dir, options)
+            entry = result.to_manifest_entry(started_ns=started_ns, finished_ns=time.time_ns())
+            update_manifest_alignment(manifest_path, entry)
+            self.log('timestamp_alignment_done', **entry)
+        except Exception as exc:
+            entry = failure_manifest_entry(started_ns, exc)
+            update_manifest_alignment(manifest_path, entry)
+            self.log('timestamp_alignment_failed', **entry)
+            print(f'[WARN] timestamp alignment failed: {exc}')
 
     def _run_realsense_rosbag_postcheck(self) -> dict[str, Any] | None:
         if self.rosbag is None or self.rosbag_uri is None:
@@ -860,6 +902,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--ack-timeout-s', type=float, default=2.0)
     parser.add_argument('--sensor-flush-timeout-s', type=_float_or_none, default=300.0)
     parser.add_argument('--progress-log-period-s', type=float, default=5.0)
+    parser.add_argument('--alignment-base-source', choices=['realsense', 'xense'], default='realsense')
+    parser.add_argument('--alignment-mode', choices=['causal', 'nearest'], default='causal')
+    parser.add_argument('--alignment-hz', type=float, default=30.0)
+    parser.add_argument('--alignment-start-trim-s', type=float, default=2.0)
     return parser.parse_args()
 
 
@@ -873,6 +919,10 @@ def build_config(args: argparse.Namespace) -> RuntimeConfig:
         ack_timeout_s=args.ack_timeout_s,
         sensor_flush_timeout_s=args.sensor_flush_timeout_s,
         progress_log_period_s=args.progress_log_period_s,
+        alignment_base_source=args.alignment_base_source,
+        alignment_mode=args.alignment_mode,
+        alignment_hz=args.alignment_hz,
+        alignment_start_trim_s=args.alignment_start_trim_s,
     )
 
 

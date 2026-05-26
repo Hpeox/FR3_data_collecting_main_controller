@@ -9,6 +9,8 @@
 
   <depend>rclpy</depend>
   <depend>rosbag2_interfaces</depend>
+  <depend>rosidl_runtime_py</depend>
+  <depend>sensor_msgs</depend>
   <depend>realsense2_camera_msgs</depend>
   <exec_depend>python3-zmq</exec_depend>
   <exec_depend>python3-numpy</exec_depend>

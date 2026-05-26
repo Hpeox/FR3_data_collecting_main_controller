@@ -59,6 +59,8 @@ class MockUdsSensor:
         self.error_commands: set[str] = set()
         self.no_ack_commands: set[str] = set()
         self.close_commands: set[str] = set()
+        self.ack_delay_s: dict[str, float] = {}
+        self.ack_sent_times: dict[str, float] = {}
         self.received_magics: list[bytes] = []
         self.frames_sent = 0
         self._stop = threading.Event()
@@ -196,8 +198,12 @@ class MockUdsSensor:
             next_time += period_s
 
     def _send_ack(self, cmd: str, **extra: Any) -> None:
+        delay_s = self.ack_delay_s.get(cmd, 0.0)
+        if delay_s > 0:
+            time.sleep(delay_s)
         payload = {'cmd': cmd, **extra}
         self._send(self.protocol.MsgType.ACK, payload=payload)
+        self.ack_sent_times[cmd] = time.monotonic()
 
     def _send_error_for(self, cmd: str) -> bool:
         if cmd not in self.error_commands:
@@ -308,6 +314,7 @@ class FakeRosbagControl:
         self.postcheck_topic_metadata: dict[str, dict[str, Any]] | None = None
         self.readiness_requirements: tuple[Any, ...] = ()
         self.postcheck_requirements: tuple[Any, ...] = ()
+        self.stop_time: float | None = None
 
     def wait_ready(self, _timeout_s: float) -> bool:
         return True
@@ -328,6 +335,7 @@ class FakeRosbagControl:
         self.calls.append(('pause', None))
 
     def stop(self, timeout_s: float) -> None:
+        self.stop_time = time.monotonic()
         if 'stop' in self.fail_methods:
             raise RuntimeError('injected rosbag stop failure')
         self.calls.append(('stop', None))
@@ -494,6 +502,7 @@ def emit_realsense_metadata(controller: MainController, frame_number: int) -> No
                 header_stamp_ns=stamp_ns,
                 frame_timestamp_ns=stamp_ns // 1_000_000 * 1_000_000,
                 hw_timestamp_ns=stamp_ns // 1_000_000 * 1_000_000,
+                clock_domain='SYSTEM_TIME',
                 recv_time_ns=time.time_ns(),
                 recv_monotonic_ns=time.monotonic_ns(),
             )
@@ -606,6 +615,30 @@ def test_mock_runtime_start_pause_resume_done(tmp_path, monkeypatch):
         assert xense_rows >= 1
         assert realsense_rows == 16
         assert zmq_rows >= 4
+        assert 'clock_domain' in realsense_npz.files
+        assert set(realsense_npz['clock_domain'].astype(str)) == {'SYSTEM_TIME'}
+
+
+def test_mock_runtime_auto_alignment_success_with_short_trim(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch, alignment_start_trim_s=0.0) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+
+        emit_realsense_metadata(controller, frame_number=1)
+        time.sleep(0.05)
+        emit_realsense_metadata(controller, frame_number=2)
+        time.sleep(0.1)
+        controller.finish_demo()
+
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'done'
+        assert manifest['alignment']['status'] == 'done'
+        assert manifest['alignment']['base'].startswith('realsense:')
+        assert (demo_dir / 'aligned' / 'alignment_config.json').exists()
+        assert (demo_dir / 'aligned' / 'aligned_index.npz').exists()
+        assert (demo_dir / 'aligned' / 'aligned_manifest.json').exists()
+        assert (demo_dir / 'aligned' / 'alignment_report.md').exists()
 
 
 def test_mock_runtime_paused_finish_returns_to_wait_start(tmp_path, monkeypatch):
@@ -622,6 +655,21 @@ def test_mock_runtime_paused_finish_returns_to_wait_start(tmp_path, monkeypatch)
         assert controller.get_state() == ControllerState.WAIT_START
         assert runtime.ft300.commands == ['START_REQ', 'PAUSE_REQ', 'DEMO_DONE_REQ']
         assert runtime.xense.commands == ['START_REQ', 'PAUSE_REQ', 'DEMO_DONE_REQ']
+
+
+def test_finish_sends_rosbag_stop_without_waiting_for_sensor_flush(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        runtime.ft300.ack_delay_s['DEMO_DONE_REQ'] = 0.2
+        runtime.xense.ack_delay_s['DEMO_DONE_REQ'] = 0.2
+        runtime.start_and_wait_for_frames()
+
+        controller.finish_demo()
+
+        assert runtime.rosbag.stop_time is not None
+        assert runtime.rosbag.stop_time < runtime.ft300.ack_sent_times['DEMO_DONE_REQ']
+        assert runtime.rosbag.stop_time < runtime.xense.ack_sent_times['DEMO_DONE_REQ']
 
 
 def test_mock_runtime_paused_discard_returns_to_wait_start(tmp_path, monkeypatch):

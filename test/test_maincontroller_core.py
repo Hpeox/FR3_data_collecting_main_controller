@@ -4,8 +4,10 @@ import struct
 import sys
 import time
 import uuid
+import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -13,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from main_controller.drop_monitor import DropMonitor
 from main_controller.config import RuntimeConfig
 from main_controller.realsense_image_guard import validate_rosbag_image_metadata
-from main_controller.realsense_metadata import metadata_int, metadata_ms_to_ns
+from main_controller.realsense_metadata import metadata_int, metadata_ms_to_ns, metadata_str
+from main_controller.timestamp_alignment import AlignmentOptions, align_demo_timestamps
 from main_controller.zmq_telemetry import FRAME_SIZE, FRAME_STRUCT, MAGIC, VERSION, ZmqTelemetryReceiver, unpack_frame
 
 
@@ -133,11 +136,13 @@ def test_drop_monitor_reset_baseline():
 
 
 def test_realsense_metadata_helpers():
-    data = {"frame_number": "7", "frame_timestamp": "1.5", "hw_timestamp": 2.25}
+    data = {"frame_number": "7", "frame_timestamp": "1.5", "hw_timestamp": 2.25, "clock_domain": "SYSTEM_TIME"}
 
     assert metadata_int(data, "frame_number") == 7
     assert metadata_ms_to_ns(data, "frame_timestamp") == 1_500_000
     assert metadata_ms_to_ns(data, "hw_timestamp") == 2_250_000
+    assert metadata_str(data, "clock_domain") == "SYSTEM_TIME"
+    assert metadata_str({}, "clock_domain") is None
 
 
 def test_realsense_formal_image_requirements_are_four_cameras_eight_topics():
@@ -194,3 +199,58 @@ def test_realsense_rosbag_postcheck_detects_missing_and_skew(tmp_path):
     assert not result.ok
     assert result.missing_topics == (requirements[-1].topic,)
     assert result.count_skew == 90
+
+
+def test_timestamp_alignment_xense_base_uses_timestamp_ns_0(tmp_path):
+    demo_dir = tmp_path / "demo"
+    demo_dir.mkdir()
+    t = np.asarray([1_000_000_000, 1_033_000_000, 1_066_000_000], dtype=np.int64)
+    np.savez(demo_dir / "ft300_timestamps.npz", frame_id=np.arange(3), timestamp_ns=t - 1_000_000, recv_time_ns=t, recv_monotonic_ns=t)
+    np.savez(demo_dir / "xense_timestamps.npz", frame_id=np.arange(3), timestamp_ns_0=t, timestamp_ns_1=t + 6_000_000, recv_time_ns=t, recv_monotonic_ns=t)
+    np.savez(
+        demo_dir / "realsense_metadata.npz",
+        topic=np.asarray(["/cam1/camera/color/metadata"] * 3),
+        frame_number=np.arange(3),
+        header_stamp_ns=t,
+        frame_timestamp_ns=t,
+        hw_timestamp_ns=t,
+        clock_domain=np.asarray(["SYSTEM_TIME"] * 3),
+        recv_time_ns=t,
+        recv_monotonic_ns=t,
+    )
+    np.savez(
+        demo_dir / "zmq_telemetry.npz",
+        source=np.asarray([2, 2, 2]),
+        seq=np.arange(3),
+        stamp_s=t.astype(float) / 1_000_000_000.0,
+        valid_mask=np.ones(3, dtype=np.uint64),
+        floats_58=np.zeros((3, 58)),
+        gripper_gPO=np.zeros(3, dtype=np.uint8),
+        gripper_gCU=np.zeros(3, dtype=np.uint8),
+        recv_time_ns=t,
+        recv_monotonic_ns=t,
+    )
+    manifest = {
+        "status": "done",
+        "rosbag_uri": str(demo_dir / "rosbag"),
+        "sensor_saved_files": {"ft300": None, "xense": None},
+        "npz": {
+            "ft300": str(demo_dir / "ft300_timestamps.npz"),
+            "xense": str(demo_dir / "xense_timestamps.npz"),
+            "realsense": str(demo_dir / "realsense_metadata.npz"),
+            "zmq": str(demo_dir / "zmq_telemetry.npz"),
+        },
+        "realsense_image_readiness": {"required_topics": ["/cam1/camera/color/image_raw"]},
+        "realsense_rosbag_postcheck": {"required_topics": ["/cam1/camera/color/image_raw"]},
+    }
+    (demo_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = align_demo_timestamps(
+        demo_dir,
+        AlignmentOptions(alignment_base_source="xense", start_trim_s=0.0),
+    )
+
+    index = np.load(result.index_path, allow_pickle=True)
+    np.testing.assert_array_equal(index["t_ns"], np.asarray([t[1]], dtype=np.int64))
+    assert result.base == "xense:0"
+    assert np.all(index["ft300s_delta_ns"] <= 0)
