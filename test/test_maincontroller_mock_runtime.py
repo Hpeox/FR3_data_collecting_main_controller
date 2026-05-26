@@ -692,6 +692,9 @@ def test_mock_runtime_auto_alignment_success_with_short_trim(tmp_path, monkeypat
         assert (demo_dir / 'aligned' / 'aligned_index.npz').exists()
         assert (demo_dir / 'aligned' / 'aligned_manifest.json').exists()
         assert (demo_dir / 'aligned' / 'alignment_report.md').exists()
+        alignment_config = json.loads(
+            (demo_dir / 'aligned' / 'alignment_config.json').read_text(encoding='utf-8')
+        )
         aligned_manifest = json.loads(
             (demo_dir / 'aligned' / 'aligned_manifest.json').read_text(encoding='utf-8')
         )
@@ -701,6 +704,44 @@ def test_mock_runtime_auto_alignment_success_with_short_trim(tmp_path, monkeypat
         assert aligned_manifest['sources']['ft300s_saved_file'] == (
             f'runtime_frames/{runtime.ft300.saved_file}'
         )
+        assert aligned_manifest['sources']['xense_saved_file'] == (
+            f'runtime_frames/{runtime.xense.saved_file}'
+        )
+
+        aligned_index = np.load(demo_dir / 'aligned' / 'aligned_index.npz', allow_pickle=True)
+        for field in ('t_ns', 'segment_id', 'sample_valid'):
+            assert field in aligned_index.files
+        t_ns = aligned_index['t_ns']
+        assert len(t_ns) > 0
+        assert len(aligned_index['segment_id']) == len(t_ns)
+        assert len(aligned_index['sample_valid']) == len(t_ns)
+        assert aligned_manifest['sample_count'] == len(t_ns)
+        assert int(aligned_index['sample_valid'].sum()) == aligned_manifest['valid_count']
+        assert aligned_manifest['valid_count'] == manifest['alignment']['valid_count']
+
+        streams = alignment_config['streams']
+        assert {'ft300s', 'xense_0', 'xense_1', 'zmq_source_1'}.issubset(streams)
+        realsense_streams = [name for name in streams if name.startswith('realsense_')]
+        assert realsense_streams
+        base_topic = manifest['alignment']['base'].split(':', 1)[1]
+        base_stream = next(
+            name for name, stream in streams.items() if stream.get('topic') == base_topic
+        )
+        assert base_stream in realsense_streams
+
+        for stream in streams:
+            for suffix in ('index', 'time_ns', 'delta_ns', 'valid'):
+                field = f'{stream}_{suffix}'
+                assert field in aligned_index.files
+                assert len(aligned_index[field]) == len(t_ns)
+            assert aligned_manifest['streams'][stream]['used_count'] == int(
+                aligned_index[f'{stream}_valid'].sum()
+            )
+
+        assert f'{base_stream}_topic' in aligned_index.files
+        assert f'{base_stream}_frame_number' in aligned_index.files
+        assert len(aligned_index[f'{base_stream}_topic']) == len(t_ns)
+        assert len(aligned_index[f'{base_stream}_frame_number']) == len(t_ns)
 
 
 def test_mock_runtime_paused_finish_returns_to_wait_start(tmp_path, monkeypatch):
