@@ -296,14 +296,28 @@ class LocalZmqTelemetryPublisher:
 
 
 class FakeRealSenseMetadataMonitor:
-    def __init__(self, topics, on_event):
+    def __init__(self, topics, on_event, on_fatal=None):
         self.topics = topics
         self.on_event = on_event
+        self.on_fatal = on_fatal
         self.started = False
         self.stopped = False
+        self.ready = True
+        self.error: str | None = None
 
     def start(self) -> None:
         self.started = True
+
+    def wait_ready(self, _timeout_s: float) -> bool:
+        return self.ready and self.error is None
+
+    def fatal_error(self) -> str | None:
+        return self.error
+
+    def emit_fatal(self, message: str) -> None:
+        self.error = message
+        if self.on_fatal is not None:
+            self.on_fatal(message)
 
     def stop(self) -> None:
         self.stopped = True
@@ -794,6 +808,38 @@ def test_startup_failure_cleans_started_resources_and_reraises(tmp_path, monkeyp
     assert any(event.get('current') == 'STOPPED' for event in transitions)
 
 
+def test_startup_ready_requires_realsense_metadata_monitor(tmp_path):
+    class ReadyReceiver:
+        def wait_first_frame(self, _timeout_s: float) -> bool:
+            return True
+
+    class ReadySensor:
+        def wait_connected(self, _timeout_s: float) -> bool:
+            return True
+
+        def wait_init_ready(self, _timeout_s: float) -> bool:
+            return True
+
+    controller = MainController(
+        RuntimeConfig(
+            repo_root=REPO_ROOT,
+            output_dir=tmp_path / 'sessions',
+            startup_timeout_s=0.01,
+        )
+    )
+    fake_monitor = FakeRealSenseMetadataMonitor((), lambda _event: None)
+    fake_monitor.ready = False
+    fake_monitor.error = 'injected metadata startup failure'
+    controller.zmq_receiver = ReadyReceiver()
+    controller.ft_client = ReadySensor()
+    controller.xense_client = ReadySensor()
+    controller.realsense_monitor = fake_monitor
+    controller.rosbag = FakeRosbagControl()
+
+    with pytest.raises(RuntimeError, match='injected metadata startup failure'):
+        controller._wait_startup_ready()
+
+
 def test_start_processes_stops_earlier_processes_on_later_failure(tmp_path, monkeypatch):
     from main_controller import main as main_module
 
@@ -998,7 +1044,7 @@ def test_realsense_readiness_failure_blocks_formal_recording(tmp_path, monkeypat
         assert runtime.rosbag.calls == []
 
 
-def test_realsense_rosbag_postcheck_failure_marks_demo_failed(tmp_path, monkeypatch):
+def test_realsense_rosbag_postcheck_failure_stops_controller(tmp_path, monkeypatch):
     with MockRuntime(tmp_path, monkeypatch) as runtime:
         controller = runtime.controller
         assert controller is not None
@@ -1011,12 +1057,19 @@ def test_realsense_rosbag_postcheck_failure_marks_demo_failed(tmp_path, monkeypa
 
         controller.finish_demo()
 
+        assert controller.get_state() == ControllerState.STOPPED
         manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'failed'
+        assert manifest['failure_stage'] == 'realsense_rosbag_postcheck'
+        assert requirements[-1].topic in manifest['failure_reason']
+        assert manifest['command_results']['ft300']['ok'] is True
+        assert manifest['command_results']['xense']['ok'] is True
+        assert manifest['command_results']['rosbag_stop']['ok'] is True
         assert manifest['realsense_image_readiness']['ok'] is True
         assert manifest['realsense_rosbag_postcheck']['ok'] is False
         assert manifest['realsense_rosbag_postcheck']['missing_topics'] == [requirements[-1].topic]
         assert manifest['npz']
+        assert 'alignment' not in manifest
 
 
 def test_realsense_debug_degraded_mode_uses_configured_subset(tmp_path, monkeypatch):
@@ -1223,6 +1276,32 @@ def test_zmq_fatal_stops_controller_and_cleans_resources(tmp_path):
     controller.set_state(ControllerState.COLLECTING)
 
     controller.handle_command(Command('zmq_fatal', {'message': 'injected receiver failure'}))
+
+    assert controller.get_state() == ControllerState.STOPPED
+    assert controller.ft_client.commands == ['STOP_REQ']
+    assert controller.xense_client.commands == ['STOP_REQ']
+    assert ('stop', None) in fake_rosbag.calls
+    assert ('close', None) in fake_rosbag.calls
+    assert fake_receiver.stop_count == 1
+    assert fake_monitor.stopped
+    assert fake_process.stop_count == 1
+
+
+def test_realsense_metadata_fatal_stops_controller_and_cleans_resources(tmp_path):
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions', ack_timeout_s=0.01, rosbag_timeout_s=0.01))
+    fake_rosbag = FakeRosbagControl()
+    fake_receiver = FakeReceiver()
+    fake_monitor = FakeRealSenseMetadataMonitor((), lambda _event: None)
+    fake_process = FakeProcess()
+    controller.ft_client = FakeSensorClient('ft300')
+    controller.xense_client = FakeSensorClient('xense')
+    controller.rosbag = fake_rosbag
+    controller.zmq_receiver = fake_receiver
+    controller.realsense_monitor = fake_monitor
+    controller.processes['ft300'] = fake_process
+    controller.set_state(ControllerState.COLLECTING)
+
+    controller.handle_command(Command('realsense_metadata_fatal', {'message': 'injected metadata failure'}))
 
     assert controller.get_state() == ControllerState.STOPPED
     assert controller.ft_client.commands == ['STOP_REQ']

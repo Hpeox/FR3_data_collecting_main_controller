@@ -6,6 +6,7 @@ import time
 import uuid
 import json
 import argparse
+import types
 from pathlib import Path
 
 import numpy as np
@@ -18,7 +19,7 @@ import main_controller.config as config_module
 from main_controller.config import RuntimeConfig, validate_repo_root
 from main_controller.main import build_config
 from main_controller.realsense_image_guard import validate_rosbag_image_metadata
-from main_controller.realsense_metadata import metadata_int, metadata_ms_to_ns, metadata_str
+from main_controller.realsense_metadata import RealSenseMetadataMonitor, metadata_int, metadata_ms_to_ns, metadata_str
 from main_controller.timestamp_alignment import AlignmentOptions, align_demo_timestamps
 from main_controller.zmq_telemetry import (
     FRAME_SIZE,
@@ -161,6 +162,91 @@ def test_realsense_metadata_helpers():
     assert metadata_ms_to_ns(data, "hw_timestamp") == 2_250_000
     assert metadata_str(data, "clock_domain") == "SYSTEM_TIME"
     assert metadata_str({}, "clock_domain") is None
+
+
+def test_realsense_metadata_monitor_reports_dependency_failure(monkeypatch):
+    failures: list[str] = []
+    monkeypatch.setitem(sys.modules, "rclpy", types.SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "realsense2_camera_msgs", types.ModuleType("realsense2_camera_msgs"))
+    monkeypatch.setitem(sys.modules, "realsense2_camera_msgs.msg", None)
+    monitor = RealSenseMetadataMonitor(("/cam1/camera/color/metadata",), lambda _event: None, failures.append)
+
+    monitor.start()
+
+    assert monitor.wait_ready(1.0) is False
+    assert monitor.fatal_error() is not None
+    assert "RealSense metadata monitor failed" in monitor.fatal_error()
+    assert failures == [monitor.fatal_error()]
+    monitor.stop()
+
+
+def test_realsense_metadata_monitor_ready_after_subscriptions(monkeypatch):
+    subscriptions: list[str] = []
+
+    class FakeNode:
+        def create_subscription(self, _message_type, topic, _callback, _qos):
+            subscriptions.append(topic)
+
+        def destroy_node(self):
+            pass
+
+    fake_rclpy = types.SimpleNamespace(
+        ok=lambda: True,
+        init=lambda args=None: None,
+        create_node=lambda _name: FakeNode(),
+        spin_once=lambda _node, timeout_sec=0.1: time.sleep(0.01),
+    )
+    message_module = types.ModuleType("realsense2_camera_msgs.msg")
+    message_module.Metadata = object
+    monkeypatch.setitem(sys.modules, "rclpy", fake_rclpy)
+    monkeypatch.setitem(sys.modules, "realsense2_camera_msgs", types.ModuleType("realsense2_camera_msgs"))
+    monkeypatch.setitem(sys.modules, "realsense2_camera_msgs.msg", message_module)
+    monitor = RealSenseMetadataMonitor(("/cam1/camera/color/metadata",), lambda _event: None)
+
+    monitor.start()
+
+    assert monitor.wait_ready(1.0) is True
+    assert subscriptions == ["/cam1/camera/color/metadata"]
+    assert monitor.fatal_error() is None
+    monitor.stop()
+
+
+def test_realsense_metadata_monitor_reports_spin_failure(monkeypatch):
+    failures: list[str] = []
+
+    class FakeNode:
+        def create_subscription(self, _message_type, _topic, _callback, _qos):
+            pass
+
+        def destroy_node(self):
+            pass
+
+    def spin_once(_node, timeout_sec=0.1):
+        raise RuntimeError("injected spin failure")
+
+    fake_rclpy = types.SimpleNamespace(
+        ok=lambda: True,
+        init=lambda args=None: None,
+        create_node=lambda _name: FakeNode(),
+        spin_once=spin_once,
+    )
+    message_module = types.ModuleType("realsense2_camera_msgs.msg")
+    message_module.Metadata = object
+    monkeypatch.setitem(sys.modules, "rclpy", fake_rclpy)
+    monkeypatch.setitem(sys.modules, "realsense2_camera_msgs", types.ModuleType("realsense2_camera_msgs"))
+    monkeypatch.setitem(sys.modules, "realsense2_camera_msgs.msg", message_module)
+    monitor = RealSenseMetadataMonitor(("/cam1/camera/color/metadata",), lambda _event: None, failures.append)
+
+    monitor.start()
+
+    assert monitor.wait_ready(1.0) is True
+    deadline = time.monotonic() + 1.0
+    while not monitor.fatal_event.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert monitor.fatal_error() is not None
+    assert "injected spin failure" in monitor.fatal_error()
+    assert failures == [monitor.fatal_error()]
+    monitor.stop()
 
 
 def test_repo_root_validation_finds_integrated_modules():

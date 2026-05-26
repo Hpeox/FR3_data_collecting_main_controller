@@ -65,11 +65,21 @@ def metadata_str(data: dict, key: str) -> str | None:
 class RealSenseMetadataMonitor:
     """Small rclpy node runner for RealSense metadata topics."""
 
-    def __init__(self, topics: tuple[str, ...], on_event: Callable[[RealSenseMetadataEvent], None]):
+    def __init__(
+        self,
+        topics: tuple[str, ...],
+        on_event: Callable[[RealSenseMetadataEvent], None],
+        on_fatal: Callable[[str], None] | None = None,
+    ):
         self.topics = topics
         self.on_event = on_event
+        self.on_fatal = on_fatal
+        self.ready_event = threading.Event()
+        self.fatal_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._error_lock = threading.Lock()
+        self._fatal_error: str | None = None
         self._node = None
         self._rclpy = None
 
@@ -78,8 +88,29 @@ class RealSenseMetadataMonitor:
         if self._thread is not None:
             return
         self._stop.clear()
+        self.ready_event.clear()
+        self.fatal_event.clear()
+        with self._error_lock:
+            self._fatal_error = None
         self._thread = threading.Thread(target=self._run, name='RealSenseMetadataMonitor', daemon=True)
         self._thread.start()
+
+    def wait_ready(self, timeout_s: float) -> bool:
+        """Wait until subscriptions are created or the monitor fails."""
+        deadline = time.monotonic() + timeout_s
+        while not self.ready_event.is_set():
+            if self.fatal_event.is_set():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self.ready_event.wait(timeout=min(0.05, remaining))
+        return True
+
+    def fatal_error(self) -> str | None:
+        """Return the fatal monitor error, if any."""
+        with self._error_lock:
+            return self._fatal_error
 
     def stop(self, timeout_s: float = 2.0) -> None:
         """Stop the metadata subscriber."""
@@ -97,18 +128,27 @@ class RealSenseMetadataMonitor:
         try:
             import rclpy
             from realsense2_camera_msgs.msg import Metadata
-        except Exception as exc:  # pragma: no cover - depends on ROS environment.
-            raise RuntimeError(f'RealSense metadata dependencies are unavailable: {exc}') from exc
 
-        self._rclpy = rclpy
-        if not rclpy.ok():
-            rclpy.init(args=None)
-        node = rclpy.create_node('main_controller_realsense_metadata')
-        self._node = node
-        for topic in self.topics:
-            node.create_subscription(Metadata, topic, lambda msg, topic=topic: self._on_metadata(topic, msg), 10)
-        while not self._stop.is_set():
-            rclpy.spin_once(node, timeout_sec=0.1)
+            self._rclpy = rclpy
+            if not rclpy.ok():
+                rclpy.init(args=None)
+            node = rclpy.create_node('main_controller_realsense_metadata')
+            self._node = node
+            for topic in self.topics:
+                node.create_subscription(Metadata, topic, lambda msg, topic=topic: self._on_metadata(topic, msg), 10)
+            self.ready_event.set()
+            while not self._stop.is_set():
+                rclpy.spin_once(node, timeout_sec=0.1)
+        except Exception as exc:  # pragma: no cover - ROS import/runtime depends on host.
+            if not self._stop.is_set():
+                self._set_fatal(f'RealSense metadata monitor failed: {exc}')
+
+    def _set_fatal(self, message: str) -> None:
+        with self._error_lock:
+            self._fatal_error = message
+        self.fatal_event.set()
+        if self.on_fatal is not None:
+            self.on_fatal(message)
 
     def _on_metadata(self, topic: str, msg) -> None:
         try:

@@ -168,6 +168,8 @@ class MainController:
                 self.stop_all()
         elif name == 'realsense_fatal':
             self.handle_realsense_fatal(command.payload or {})
+        elif name == 'realsense_metadata_fatal':
+            self.handle_realsense_metadata_fatal(command.payload or {})
         elif name == 'zmq_fatal':
             self.handle_zmq_fatal(command.payload or {})
         else:
@@ -335,6 +337,7 @@ class MainController:
         }
 
         command_failed = not ft_result['ok'] or not xense_result['ok'] or not rosbag_stop_result['ok']
+        postcheck_failed = False
         if command_failed:
             self.realsense_postcheck_manifest = None
             status = 'failed'
@@ -342,6 +345,7 @@ class MainController:
             self.realsense_postcheck_manifest = self._run_realsense_rosbag_postcheck()
             status = 'done'
         if not command_failed and self.realsense_postcheck_manifest is not None and not self.realsense_postcheck_manifest.get('ok', False):
+            postcheck_failed = True
             status = 'failed'
         extra = None
         if command_failed:
@@ -356,10 +360,16 @@ class MainController:
                 'failure_reason': failure_reason,
                 'command_results': {'ft300': ft_result, 'xense': xense_result, 'rosbag_stop': rosbag_stop_result},
             }
+        elif postcheck_failed:
+            extra = {
+                'failure_stage': 'realsense_rosbag_postcheck',
+                'failure_reason': self._realsense_postcheck_failure_reason(),
+                'command_results': {'ft300': ft_result, 'xense': xense_result, 'rosbag_stop': rosbag_stop_result},
+            }
         manifest_path = self._save_current_demo(status=status, extra=extra)
         if status == 'done' and manifest_path is not None:
             self._run_timestamp_alignment(manifest_path)
-        if command_failed:
+        if command_failed or postcheck_failed:
             self.demo_store = None
             self.demo_started_ns = None
             self.rosbag_record_started = False
@@ -468,6 +478,14 @@ class MainController:
         self.reset_realsense_drop_baselines()
         self.log('realsense_restart_done', count=self.realsense_restart_count)
 
+    def handle_realsense_metadata_fatal(self, payload: dict[str, Any]) -> None:
+        """Treat metadata receiver termination as an unrecoverable error."""
+        self.log('realsense_metadata_fatal_detected', **payload)
+        print(f"[ERROR] RealSense metadata monitor fatal: {payload.get('message')}")
+        if self.get_state() != ControllerState.ERROR:
+            self.set_state(ControllerState.ERROR)
+        self.stop_all()
+
     def handle_zmq_fatal(self, payload: dict[str, Any]) -> None:
         """Treat receiver-loop termination as an unrecoverable controller error."""
         self.log('zmq_fatal_detected', **payload)
@@ -531,7 +549,11 @@ class MainController:
         self.zmq_receiver.start()
         self.ft_client.start()
         self.xense_client.start()
-        self.realsense_monitor = RealSenseMetadataMonitor(self.config.realsense_metadata_topics, self._on_realsense_metadata)
+        self.realsense_monitor = RealSenseMetadataMonitor(
+            self.config.realsense_metadata_topics,
+            self._on_realsense_metadata,
+            self._on_realsense_metadata_fatal,
+        )
         self.realsense_monitor.start()
         self.rosbag = RosbagControl()
 
@@ -546,6 +568,11 @@ class MainController:
             raise RuntimeError('FT300S did not send INIT_READY')
         if not self.xense_client.wait_init_ready(self.config.init_timeout_s):
             raise RuntimeError('Xense did not send INIT_READY')
+        if self.realsense_monitor is None or not self.realsense_monitor.wait_ready(self.config.startup_timeout_s):
+            error = None if self.realsense_monitor is None else self.realsense_monitor.fatal_error()
+            if error is None:
+                error = 'RealSense metadata monitor did not become ready'
+            raise RuntimeError(error)
         if self.rosbag is not None and not self.rosbag.wait_ready(self.config.startup_timeout_s):
             raise RuntimeError('rosbag2 recorder services did not become ready')
 
@@ -582,6 +609,9 @@ class MainController:
 
     def _on_zmq_fatal(self, message: str) -> None:
         self.commands.put(Command('zmq_fatal', {'message': message, 'time_ns': time.time_ns()}))
+
+    def _on_realsense_metadata_fatal(self, message: str) -> None:
+        self.commands.put(Command('realsense_metadata_fatal', {'message': message, 'time_ns': time.time_ns()}))
 
     def _on_realsense_metadata(self, event) -> None:
         assert isinstance(event, RealSenseMetadataEvent)
@@ -835,6 +865,15 @@ class MainController:
             }
             self.log('realsense_rosbag_postcheck_failed', **manifest)
             return manifest
+
+    def _realsense_postcheck_failure_reason(self) -> str:
+        manifest = self.realsense_postcheck_manifest or {}
+        if manifest.get('error'):
+            return str(manifest['error'])
+        missing_topics = manifest.get('missing_topics') or []
+        if missing_topics:
+            return f"missing required RealSense image topics: {', '.join(str(topic) for topic in missing_topics)}"
+        return 'RealSense rosbag post-check failed'
 
     def _new_demo_dir(self) -> Path:
         """Return a unique demo directory path for rapid repeated captures."""
