@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -11,8 +12,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
-from .config import REPO_ROOT
 
 
 NSEC_PER_SEC = 1_000_000_000
@@ -22,6 +21,7 @@ NSEC_PER_SEC = 1_000_000_000
 class AlignmentOptions:
     """Configuration for timestamp-index generation."""
 
+    repo_root: Path | None = None
     output_dir: Path | None = None
     base: str = 'auto'
     alignment_base_source: str = 'realsense'
@@ -36,6 +36,7 @@ class AlignmentOptions:
 class AlignmentResult:
     """Paths and summary produced by one alignment run."""
 
+    demo_dir: Path
     status: str
     config_path: Path
     index_path: Path
@@ -50,10 +51,10 @@ class AlignmentResult:
         """Return the manifest.alignment entry for this result."""
         return {
             'status': self.status,
-            'config_path': str(self.config_path),
-            'index_path': str(self.index_path),
-            'manifest_path': str(self.manifest_path),
-            'report_path': str(self.report_path),
+            'config_path': _relative_to(self.config_path, self.demo_dir),
+            'index_path': _relative_to(self.index_path, self.demo_dir),
+            'manifest_path': _relative_to(self.manifest_path, self.demo_dir),
+            'report_path': _relative_to(self.report_path, self.demo_dir),
             'started_ns': started_ns,
             'finished_ns': finished_ns,
             'sample_count': self.sample_count,
@@ -149,10 +150,10 @@ def align_demo_timestamps(demo_dir: Path, options: AlignmentOptions | None = Non
     index_path = output_dir / 'aligned_index.npz'
     np.savez(index_path, **index_arrays)
 
-    sources = _source_paths(demo_dir, manifest, npz_paths)
+    sources = _source_paths(manifest)
     alignment_config = {
-        'demo_dir': str(demo_dir),
-        'output_dir': str(output_dir),
+        'demo_dir': '.',
+        'output_dir': _relative_to(output_dir, demo_dir),
         'base': resolved_base,
         'requested_base': options.base,
         'alignment_base_source': options.alignment_base_source,
@@ -168,7 +169,7 @@ def align_demo_timestamps(demo_dir: Path, options: AlignmentOptions | None = Non
 
     aligned_manifest = {
         'status': 'done',
-        'demo_dir': str(demo_dir),
+        'demo_dir': '.',
         'sample_count': int(len(t_ns)),
         'valid_count': int(sample_valid.sum()),
         'base': resolved_base,
@@ -187,6 +188,7 @@ def align_demo_timestamps(demo_dir: Path, options: AlignmentOptions | None = Non
     report_path.write_text(_render_report(aligned_manifest), encoding='utf-8')
 
     return AlignmentResult(
+        demo_dir=demo_dir,
         status='done',
         config_path=config_path,
         index_path=index_path,
@@ -500,13 +502,13 @@ def _render_report(aligned_manifest: dict[str, Any]) -> str:
     return '\n'.join(lines) + '\n'
 
 
-def _source_paths(demo_dir: Path, manifest: dict[str, Any], npz_paths: dict[str, Path]) -> dict[str, Any]:
-    saved = manifest.get('sensor_saved_files') or {}
+def _source_paths(manifest: dict[str, Any]) -> dict[str, Any]:
+    sensor_paths = manifest.get('sensor_paths') or {}
     return {
-        'npz': {name: str(path) for name, path in npz_paths.items()},
-        'ft300s_saved_file': None if saved.get('ft300') is None else str(_resolve_sensor_file(saved['ft300'])),
-        'xense_saved_file': None if saved.get('xense') is None else str(_resolve_sensor_file(saved['xense'])),
-        'rosbag_uri': None if _resolve_rosbag_uri(demo_dir, manifest) is None else str(_resolve_rosbag_uri(demo_dir, manifest)),
+        'npz': dict(manifest.get('npz') or {}),
+        'ft300s_saved_file': sensor_paths.get('ft300'),
+        'xense_saved_file': sensor_paths.get('xense'),
+        'rosbag_uri': manifest.get('rosbag_uri'),
     }
 
 
@@ -521,19 +523,16 @@ def _resolve_npz_paths(demo_dir: Path, manifest: dict[str, Any]) -> dict[str, Pa
     return result
 
 
-def _resolve_sensor_file(saved_file: str) -> Path:
-    path = Path(saved_file)
-    if path.is_absolute():
-        return path
-    return REPO_ROOT / 'runtime_frames' / saved_file
-
-
 def _resolve_rosbag_uri(demo_dir: Path, manifest: dict[str, Any]) -> Path | None:
     value = manifest.get('rosbag_uri')
     if not value:
         return None
     path = Path(value)
     return path if path.is_absolute() else demo_dir / path
+
+
+def _relative_to(path: Path, base: Path) -> str:
+    return Path(os.path.relpath(path.resolve(), base.resolve())).as_posix()
 
 
 def _required_image_topics(manifest: dict[str, Any]) -> list[str]:

@@ -83,14 +83,14 @@ class DemoStore:
     zmq: TableBuffer = field(default_factory=lambda: TableBuffer(('source', 'seq', 'stamp_s', 'valid_mask', 'floats_58', 'gripper_gPO', 'gripper_gCU', 'recv_time_ns', 'recv_monotonic_ns')))
 
     def save_all(self) -> dict[str, str]:
-        """Save every high-rate buffer and return file paths."""
+        """Save every high-rate buffer and return demo-relative file paths."""
         paths = {
             'ft300': self.ft300.save_npz(self.demo_dir / 'ft300_timestamps.npz'),
             'xense': self.xense.save_npz(self.demo_dir / 'xense_timestamps.npz'),
             'realsense': self.realsense.save_npz(self.demo_dir / 'realsense_metadata.npz'),
             'zmq': self.zmq.save_npz(self.demo_dir / 'zmq_telemetry.npz'),
         }
-        return {name: str(path) for name, path in paths.items()}
+        return {name: path.relative_to(self.demo_dir).as_posix() for name, path in paths.items()}
 
     def frame_counts(self) -> dict[str, int]:
         """Return primary row counts for each stream buffer."""

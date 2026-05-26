@@ -27,6 +27,9 @@ from main_controller.zmq_telemetry import FRAME_STRUCT, MAGIC, VERSION
 import XenseTacSensor.protocol.messages as xense_protocol
 
 
+REPO_ROOT = Path(__file__).resolve().parents[4]
+
+
 def wait_for(predicate, timeout_s: float = 2.0) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -448,6 +451,7 @@ class MockRuntime:
         self.zmq_pub.start()
 
         config = RuntimeConfig(
+            repo_root=REPO_ROOT,
             output_dir=self.tmp_path / 'sessions',
             zmq_connect=self.zmq_pub.endpoint,
             ft_uds_path=str(self.tmp_path / 'ft300.sock'),
@@ -537,7 +541,7 @@ def assert_npz_fields_same_length(npz) -> int:
 
 
 def test_default_realsense_topics_are_four_cameras_eight_streams():
-    topics = RuntimeConfig().realsense_metadata_topics
+    topics = RuntimeConfig(repo_root=REPO_ROOT).realsense_metadata_topics
 
     assert len(topics) == 8
     assert topics == (
@@ -594,8 +598,28 @@ def test_mock_runtime_start_pause_resume_done(tmp_path, monkeypatch):
 
         manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'done'
-        assert manifest['sensor_saved_files']['ft300'] == runtime.ft300.saved_file
-        assert manifest['sensor_saved_files']['xense'] == runtime.xense.saved_file
+        assert manifest['run_id'] == controller.run_id
+        assert controller.logger.path == (
+            controller.output_dir / f'controller_events_{controller.run_id}.jsonl'
+        )
+        assert controller.logger.path.exists()
+        assert not any(
+            path.name.startswith('session_') for path in controller.output_dir.iterdir()
+        )
+        assert 'sensor_saved_files' not in manifest
+        assert manifest['sensor_paths']['ft300'] == (
+            f'runtime_frames/{Path(runtime.ft300.saved_file).name}'
+        )
+        assert manifest['sensor_paths']['xense'] == (
+            f'runtime_frames/{Path(runtime.xense.saved_file).name}'
+        )
+        assert manifest['rosbag_uri'] == 'rosbag'
+        assert manifest['npz'] == {
+            'ft300': 'ft300_timestamps.npz',
+            'xense': 'xense_timestamps.npz',
+            'realsense': 'realsense_metadata.npz',
+            'zmq': 'zmq_telemetry.npz',
+        }
 
         ft_npz = np.load(demo_dir / 'ft300_timestamps.npz', allow_pickle=True)
         xense_npz = np.load(demo_dir / 'xense_timestamps.npz', allow_pickle=True)
@@ -635,10 +659,23 @@ def test_mock_runtime_auto_alignment_success_with_short_trim(tmp_path, monkeypat
         assert manifest['status'] == 'done'
         assert manifest['alignment']['status'] == 'done'
         assert manifest['alignment']['base'].startswith('realsense:')
+        assert manifest['alignment']['config_path'] == 'aligned/alignment_config.json'
+        assert manifest['alignment']['index_path'] == 'aligned/aligned_index.npz'
+        assert manifest['alignment']['manifest_path'] == 'aligned/aligned_manifest.json'
+        assert manifest['alignment']['report_path'] == 'aligned/alignment_report.md'
         assert (demo_dir / 'aligned' / 'alignment_config.json').exists()
         assert (demo_dir / 'aligned' / 'aligned_index.npz').exists()
         assert (demo_dir / 'aligned' / 'aligned_manifest.json').exists()
         assert (demo_dir / 'aligned' / 'alignment_report.md').exists()
+        aligned_manifest = json.loads(
+            (demo_dir / 'aligned' / 'aligned_manifest.json').read_text(encoding='utf-8')
+        )
+        assert aligned_manifest['demo_dir'] == '.'
+        assert aligned_manifest['sources']['npz']['ft300'] == 'ft300_timestamps.npz'
+        assert aligned_manifest['sources']['rosbag_uri'] == 'rosbag'
+        assert aligned_manifest['sources']['ft300s_saved_file'] == (
+            f'runtime_frames/{Path(runtime.ft300.saved_file).name}'
+        )
 
 
 def test_mock_runtime_paused_finish_returns_to_wait_start(tmp_path, monkeypatch):
@@ -709,7 +746,14 @@ def test_uds_error_response_wakes_ack_waiter(tmp_path, monkeypatch):
 
 
 def test_startup_failure_cleans_started_resources_and_reraises(tmp_path, monkeypatch):
-    controller = MainController(RuntimeConfig(output_dir=tmp_path / 'sessions', ack_timeout_s=0.01, rosbag_timeout_s=0.01))
+    controller = MainController(
+        RuntimeConfig(
+            repo_root=REPO_ROOT,
+            output_dir=tmp_path / 'sessions',
+            ack_timeout_s=0.01,
+            rosbag_timeout_s=0.01,
+        )
+    )
     fake_process = FakeProcess()
     fake_receiver = FakeReceiver()
     fake_monitor = FakeRealSenseMetadataMonitor((), lambda _event: None)
@@ -768,6 +812,8 @@ def test_start_processes_stops_earlier_processes_on_later_failure(tmp_path, monk
         ):
             self.name = name
             self.cmd = cmd
+            self.cwd = cwd
+            self.log_path = log_path
             self.stop_count = 0
             self.started = False
             instances.append(self)
@@ -781,13 +827,17 @@ def test_start_processes_stops_earlier_processes_on_later_failure(tmp_path, monk
             self.stop_count += 1
 
     monkeypatch.setattr(main_module, 'ManagedProcess', FakeManagedProcess)
-    controller = MainController(RuntimeConfig(output_dir=tmp_path / 'sessions'))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
 
     with pytest.raises(RuntimeError, match='xense start failed'):
         controller._start_processes()
 
     by_name = {process.name: process for process in instances}
     assert by_name['ft300'].started
+    assert by_name['ft300'].cwd == REPO_ROOT
+    assert by_name['ft300'].log_path == (
+        controller.output_dir / 'process_logs' / controller.run_id / 'ft300.log'
+    )
     assert by_name['ft300'].stop_count == 1
     assert by_name['xense'].stop_count == 0
     assert by_name['realsense_camera'].stop_count == 0
@@ -806,7 +856,7 @@ def test_start_transaction_rolls_back_acked_sensor_on_later_sensor_error(tmp_pat
         assert controller.demo_store is None
         assert runtime.ft300.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
         assert runtime.xense.commands == ['START_REQ']
-        demo_dirs = sorted((controller.session_dir / 'demos').iterdir())
+        demo_dirs = sorted((controller.output_dir / 'demos').iterdir())
         assert len(demo_dirs) == 1
         manifest = json.loads((demo_dirs[0] / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'failed'
@@ -906,7 +956,7 @@ def test_rosbag_resume_failure_rolls_back_started_sensors_and_writes_failed_mani
         assert controller.demo_store is None
         assert runtime.ft300.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
         assert runtime.xense.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
-        demo_dirs = sorted((controller.session_dir / 'demos').iterdir())
+        demo_dirs = sorted((controller.output_dir / 'demos').iterdir())
         assert len(demo_dirs) == 1
         manifest = json.loads((demo_dirs[0] / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'failed'
@@ -937,7 +987,7 @@ def test_realsense_readiness_failure_blocks_formal_recording(tmp_path, monkeypat
         assert controller.demo_store is None
         assert runtime.ft300.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
         assert runtime.xense.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
-        demo_dirs = sorted((controller.session_dir / 'demos').iterdir())
+        demo_dirs = sorted((controller.output_dir / 'demos').iterdir())
         manifest = json.loads((demo_dirs[0] / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'failed'
         assert manifest['failure_stage'] == 'realsense_image_readiness'
@@ -1045,8 +1095,11 @@ def test_finish_partial_failure_writes_failed_manifest_and_stops(tmp_path, monke
         manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'failed'
         assert manifest['failure_stage'] == 'finish_command'
-        assert manifest['sensor_saved_files']['ft300'] == runtime.ft300.saved_file
-        assert manifest['sensor_saved_files']['xense'] is None
+        assert 'sensor_saved_files' not in manifest
+        assert manifest['sensor_paths']['ft300'] == (
+            f'runtime_frames/{Path(runtime.ft300.saved_file).name}'
+        )
+        assert manifest['sensor_paths']['xense'] is None
         assert manifest['command_results']['ft300']['ok'] is True
         assert manifest['command_results']['xense']['ok'] is False
         assert manifest['npz']
@@ -1065,8 +1118,13 @@ def test_finish_rosbag_stop_failure_writes_failed_manifest_and_skips_postcheck(t
         manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'failed'
         assert manifest['failure_stage'] == 'rosbag_stop'
-        assert manifest['sensor_saved_files']['ft300'] == runtime.ft300.saved_file
-        assert manifest['sensor_saved_files']['xense'] == runtime.xense.saved_file
+        assert 'sensor_saved_files' not in manifest
+        assert manifest['sensor_paths']['ft300'] == (
+            f'runtime_frames/{Path(runtime.ft300.saved_file).name}'
+        )
+        assert manifest['sensor_paths']['xense'] == (
+            f'runtime_frames/{Path(runtime.xense.saved_file).name}'
+        )
         assert manifest['command_results']['ft300']['ok'] is True
         assert manifest['command_results']['xense']['ok'] is True
         assert manifest['command_results']['rosbag_stop']['ok'] is False
@@ -1142,7 +1200,7 @@ def test_discard_partial_failure_writes_failed_manifest_and_stops(tmp_path, monk
 
 
 def test_zmq_warning_does_not_stop_controller(tmp_path):
-    controller = MainController(RuntimeConfig(output_dir=tmp_path / 'sessions'))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
     controller.set_state(ControllerState.COLLECTING)
 
     controller._on_zmq_error('invalid ZMQ frame: injected')
@@ -1151,7 +1209,7 @@ def test_zmq_warning_does_not_stop_controller(tmp_path):
 
 
 def test_zmq_fatal_stops_controller_and_cleans_resources(tmp_path):
-    controller = MainController(RuntimeConfig(output_dir=tmp_path / 'sessions', ack_timeout_s=0.01, rosbag_timeout_s=0.01))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions', ack_timeout_s=0.01, rosbag_timeout_s=0.01))
     fake_rosbag = FakeRosbagControl()
     fake_receiver = FakeReceiver()
     fake_monitor = FakeRealSenseMetadataMonitor((), lambda _event: None)
@@ -1256,7 +1314,7 @@ def test_mock_runtime_start_discard_start_done_keeps_zmq_drain_after_discard(tmp
 
 
 def test_realsense_fatal_pauses_collecting_and_restarts(tmp_path):
-    controller = MainController(RuntimeConfig(output_dir=tmp_path / 'sessions'))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
     fake_rosbag = FakeRosbagControl()
     fake_process = FakeProcess()
     controller.ft_client = FakeSensorClient('ft300')

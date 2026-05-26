@@ -5,6 +5,7 @@ import sys
 import time
 import uuid
 import json
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -13,11 +14,23 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from main_controller.drop_monitor import DropMonitor
-from main_controller.config import RuntimeConfig
+import main_controller.config as config_module
+from main_controller.config import RuntimeConfig, validate_repo_root
+from main_controller.main import build_config
 from main_controller.realsense_image_guard import validate_rosbag_image_metadata
 from main_controller.realsense_metadata import metadata_int, metadata_ms_to_ns, metadata_str
 from main_controller.timestamp_alignment import AlignmentOptions, align_demo_timestamps
-from main_controller.zmq_telemetry import FRAME_SIZE, FRAME_STRUCT, MAGIC, VERSION, ZmqTelemetryReceiver, unpack_frame
+from main_controller.zmq_telemetry import (
+    FRAME_SIZE,
+    FRAME_STRUCT,
+    MAGIC,
+    VERSION,
+    ZmqTelemetryReceiver,
+    unpack_frame,
+)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 def test_zmq_unpack_frame_minimal():
@@ -136,7 +149,12 @@ def test_drop_monitor_reset_baseline():
 
 
 def test_realsense_metadata_helpers():
-    data = {"frame_number": "7", "frame_timestamp": "1.5", "hw_timestamp": 2.25, "clock_domain": "SYSTEM_TIME"}
+    data = {
+        "frame_number": "7",
+        "frame_timestamp": "1.5",
+        "hw_timestamp": 2.25,
+        "clock_domain": "SYSTEM_TIME",
+    }
 
     assert metadata_int(data, "frame_number") == 7
     assert metadata_ms_to_ns(data, "frame_timestamp") == 1_500_000
@@ -145,8 +163,55 @@ def test_realsense_metadata_helpers():
     assert metadata_str({}, "clock_domain") is None
 
 
+def test_repo_root_validation_finds_integrated_modules():
+    root = validate_repo_root(REPO_ROOT)
+
+    assert (root / "FT300S").is_dir()
+    assert (root / "XenseTacSensor").is_dir()
+    assert (root / "RealSense" / "launch").is_dir()
+
+
+def test_repo_root_validation_rejects_missing_modules(tmp_path):
+    with pytest.raises(RuntimeError, match="FT300S"):
+        validate_repo_root(tmp_path)
+
+
+def _config_args(**overrides):
+    values = {
+        "repo_root": None,
+        "output_dir": None,
+        "zmq_connect": "tcp://127.0.0.1:6000",
+        "startup_timeout_s": 60.0,
+        "ack_timeout_s": 2.0,
+        "sensor_flush_timeout_s": 300.0,
+        "progress_log_period_s": 5.0,
+        "alignment_base_source": "realsense",
+        "alignment_mode": "causal",
+        "alignment_hz": 30.0,
+        "alignment_start_trim_s": 2.0,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def test_build_config_uses_explicit_repo_root(tmp_path):
+    config = build_config(_config_args(repo_root=str(REPO_ROOT), output_dir=str(tmp_path / "out")))
+
+    assert config.repo_root == REPO_ROOT
+    assert config.output_dir == (tmp_path / "out").resolve()
+
+
+def test_build_config_uses_build_time_hint(monkeypatch):
+    monkeypatch.setattr(config_module, "build_time_repo_root_hint", lambda: REPO_ROOT)
+
+    config = build_config(_config_args())
+
+    assert config.repo_root == REPO_ROOT
+    assert config.output_dir == REPO_ROOT / "runtime_sessions"
+
+
 def test_realsense_formal_image_requirements_are_four_cameras_eight_topics():
-    config = RuntimeConfig()
+    config = RuntimeConfig(repo_root=REPO_ROOT)
     requirements = config.realsense_image_requirements
 
     assert config.realsense_capture_mode == "formal"
@@ -166,6 +231,7 @@ def test_realsense_formal_image_requirements_are_four_cameras_eight_topics():
 
 def test_realsense_debug_degraded_image_requirements_use_configured_subset():
     config = RuntimeConfig(
+        repo_root=REPO_ROOT,
         realsense_capture_mode="debug_degraded",
         realsense_debug_image_topics=(
             "/cam3/camera/color/image_raw",
@@ -180,7 +246,7 @@ def test_realsense_debug_degraded_image_requirements_use_configured_subset():
 
 
 def test_realsense_rosbag_postcheck_detects_missing_and_skew(tmp_path):
-    config = RuntimeConfig()
+    config = RuntimeConfig(repo_root=REPO_ROOT)
     requirements = config.realsense_image_requirements
     metadata = {
         requirement.topic: {"message_type": requirement.message_type, "count": 10}
@@ -232,13 +298,13 @@ def test_timestamp_alignment_xense_base_uses_timestamp_ns_0(tmp_path):
     )
     manifest = {
         "status": "done",
-        "rosbag_uri": str(demo_dir / "rosbag"),
-        "sensor_saved_files": {"ft300": None, "xense": None},
+        "rosbag_uri": "rosbag",
+        "sensor_paths": {"ft300": None, "xense": None},
         "npz": {
-            "ft300": str(demo_dir / "ft300_timestamps.npz"),
-            "xense": str(demo_dir / "xense_timestamps.npz"),
-            "realsense": str(demo_dir / "realsense_metadata.npz"),
-            "zmq": str(demo_dir / "zmq_telemetry.npz"),
+            "ft300": "ft300_timestamps.npz",
+            "xense": "xense_timestamps.npz",
+            "realsense": "realsense_metadata.npz",
+            "zmq": "zmq_telemetry.npz",
         },
         "realsense_image_readiness": {"required_topics": ["/cam1/camera/color/image_raw"]},
         "realsense_rosbag_postcheck": {"required_topics": ["/cam1/camera/color/image_raw"]},
@@ -247,7 +313,7 @@ def test_timestamp_alignment_xense_base_uses_timestamp_ns_0(tmp_path):
 
     result = align_demo_timestamps(
         demo_dir,
-        AlignmentOptions(alignment_base_source="xense", start_trim_s=0.0),
+        AlignmentOptions(repo_root=REPO_ROOT, alignment_base_source="xense", start_trim_s=0.0),
     )
 
     index = np.load(result.index_path, allow_pickle=True)

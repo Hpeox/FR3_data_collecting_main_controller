@@ -26,6 +26,7 @@ ros2 run main_controller main_controller
 
 ```bash
 ros2 run main_controller main_controller -- \
+  --repo-root .. \
   --zmq-connect tcp://127.0.0.1:6000 \
   --output-dir ../runtime_sessions \
   --sensor-flush-timeout-s 300 \
@@ -37,6 +38,11 @@ ros2 run main_controller main_controller -- \
 ```bash
 ros2 run main_controller main_controller -- --help
 ```
+
+`colcon build` 时会校验并记录当前集成仓库根目录作为 build-time
+repo-root hint。若 install tree 被移动，或在其他路径 / 机器运行，请通过
+`--repo-root PATH` 显式指定仓库根。MainController 作为集成仓库的一部分构建，
+不支持脱离同级 `FT300S`、`XenseTacSensor`、`RealSense` 模块独立 build。
 
 ## 交互命令
 
@@ -83,22 +89,23 @@ rosbag record/resume 失败，MainController 会写入 `status: "failed"` 的轻
 
 ## 输出
 
-默认输出目录为仓库根目录下的 `runtime_sessions/session_YYYYmmdd_HHMMSS/`：
+默认输出目录为仓库根目录下的 `runtime_sessions/`：
 
-- `controller_events.jsonl`：主控状态、命令、告警、错误和保存记录。
-- `process_logs/`：FT300S、Xense、RealSense、rosbag2 子进程日志。
+- `controller_events_run_YYYYmmdd_HHMMSS.jsonl`：主控状态、命令、告警、错误和保存记录。
+- `process_logs/run_YYYYmmdd_HHMMSS/`：FT300S、Xense、RealSense、rosbag2 子进程日志。
 - `demos/demo_YYYYmmdd_HHMMSS/`：单次 demo 的数据。
 - `*.npz`：主控侧缓存的结构化数据，如 ZMQ、RealSense metadata、UDS frame 记录。
   `realsense_metadata.npz` 包含 metadata JSON 中的 `clock_domain`；如果单帧 metadata
   缺少该字段，会保存为空值并在 log/report 中告警，不会导致采集失败。
-- `manifest.json`：demo 保存摘要、rosbag 路径、传感器保存文件、`frame_counts`、丢帧统计、RealSense image readiness / rosbag post-check 和 RealSense 重启记录。用户成功 discard 会写 lightweight manifest，`status: "discarded"` 且 `npz` 为空，不保存高频 `.npz`。
+- `manifest.json`：demo 保存摘要、`run_id`、相对 demo 目录的 `.npz` / `rosbag_uri` 路径、相对仓库根的 `sensor_paths`、`frame_counts`、丢帧统计、RealSense image readiness / rosbag post-check 和 RealSense 重启记录。用户成功 discard 会写 lightweight manifest，`status: "discarded"` 且 `npz` 为空，不保存高频 `.npz`。
 - `demos/demo_YYYYmmdd_HHMMSS/aligned/`：主控自动对齐输出目录，默认包含 `alignment_config.json`、`aligned_index.npz`、`aligned_manifest.json` 和 `alignment_report.md`。自动对齐不生成 `aligned_numeric.npz` 等实际训练数据文件。
 
 需要独立重跑或调参时，可在仓库根目录使用 `tools/align_demo_timestamps.py`：
 
 ```bash
 python tools/align_demo_timestamps.py \
-  --demo-dir runtime_sessions/session_YYYYmmdd_HHMMSS/demos/demo_YYYYmmdd_HHMMSS \
+  --demo-dir runtime_sessions/demos/demo_YYYYmmdd_HHMMSS \
+  --repo-root . \
   --alignment-base-source realsense \
   --mode causal \
   --start-trim-s 1.0

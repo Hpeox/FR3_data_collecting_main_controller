@@ -5,10 +5,53 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .realsense_image_guard import ImageTopicRequirement, formal_image_requirements, select_image_requirements
+from .realsense_image_guard import (
+    ImageTopicRequirement,
+    formal_image_requirements,
+    select_image_requirements,
+)
 
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
+REQUIRED_REPO_DIRS = (
+    Path('FT300S'),
+    Path('XenseTacSensor'),
+    Path('RealSense') / 'launch',
+)
+REQUIRED_REALSENSE_LAUNCHES = (
+    Path('RealSense') / 'launch' / 'four_realsense_640x480_30.launch.py',
+    Path('RealSense') / 'launch' / 'rosbag2_recorder.launch.py',
+)
+
+
+def build_time_repo_root_hint() -> Path | None:
+    """Return the repo root recorded during package build, if present."""
+    try:
+        from ._repo_root_hint import REPO_ROOT_HINT
+    except Exception:
+        return None
+    return Path(REPO_ROOT_HINT)
+
+
+def validate_repo_root(repo_root: Path) -> Path:
+    """Resolve and validate the integrated repository root."""
+    root = repo_root.expanduser().resolve()
+    required = (*REQUIRED_REPO_DIRS, *REQUIRED_REALSENSE_LAUNCHES)
+    missing = [str(path) for path in required if not (root / path).exists()]
+    if missing:
+        joined = ', '.join(missing)
+        raise RuntimeError(f'invalid repo root {root}: missing {joined}')
+    return root
+
+
+def default_repo_root() -> Path:
+    """Return the build-time repo root hint, or raise with an actionable message."""
+    hint = build_time_repo_root_hint()
+    if hint is None:
+        raise RuntimeError(
+            'repo root is not configured; pass --repo-root PATH or rebuild '
+            'MainController with colcon'
+        )
+    return validate_repo_root(hint)
 
 
 @dataclass(frozen=True)
@@ -26,8 +69,8 @@ class RateConfig:
 class RuntimeConfig:
     """Configuration values shared by controller components."""
 
-    repo_root: Path = REPO_ROOT
-    output_dir: Path = REPO_ROOT / 'runtime_sessions'
+    repo_root: Path = field(default_factory=default_repo_root)
+    output_dir: Path | None = None
     zmq_connect: str = 'tcp://127.0.0.1:6000'
     ft_uds_path: str = '/tmp/ft300_sensor.sock'
     xense_uds_path: str = '/tmp/xense_sensor.sock'
@@ -51,7 +94,7 @@ class RuntimeConfig:
     realsense_debug_image_topics: tuple[str, ...] = ()
     realsense_rosbag_count_skew_limit: int = 3
     rate: RateConfig = field(default_factory=RateConfig)
-    
+
     cameras: tuple[str, ...] = ('cam1', 'cam2', 'cam3', 'cam4')
     # Current-site RealSense image baseline from the checked-in launch profile.
     # If RealSense launch parameters change, update these values in the same
@@ -70,6 +113,17 @@ class RuntimeConfig:
         'Hardware Error',
         'Depth stream start failure',
     )
+
+    def __post_init__(self) -> None:
+        """Normalize path settings after dataclass initialization."""
+        repo_root = validate_repo_root(self.repo_root)
+        output_dir = (
+            repo_root / 'runtime_sessions'
+            if self.output_dir is None
+            else Path(self.output_dir).expanduser().resolve()
+        )
+        object.__setattr__(self, 'repo_root', repo_root)
+        object.__setattr__(self, 'output_dir', output_dir)
 
     @property
     def realsense_metadata_topics(self) -> tuple[str, ...]:

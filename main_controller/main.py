@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .buffers import DemoStore, JsonlLogger
-from .config import RuntimeConfig, ns_from_hz
+from .config import RuntimeConfig, ns_from_hz, validate_repo_root
 from .drop_monitor import DropMonitor, DropWarning
 from .processes import ManagedProcess, bash_cmd
 from .realsense_metadata import RealSenseMetadataEvent, RealSenseMetadataMonitor
@@ -84,9 +84,12 @@ class MainController:
 
     def __init__(self, config: RuntimeConfig):
         self.config = config
-        self.session_dir = config.output_dir / time.strftime('session_%Y%m%d_%H%M%S')
-        self.session_dir.mkdir(parents=True, exist_ok=True)
-        self.logger = JsonlLogger(self.session_dir / 'controller_events.jsonl')
+        self.output_dir = config.output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.run_id = time.strftime('run_%Y%m%d_%H%M%S')
+        self.logger = JsonlLogger(
+            self.output_dir / f'controller_events_{self.run_id}.jsonl'
+        )
         self.commands: queue.Queue[Command] = queue.Queue()
         self.state = ControllerState.BOOT
         self.state_lock = threading.RLock()
@@ -95,7 +98,7 @@ class MainController:
         self.queued_stop_after_finalizing = False
         self.rosbag_record_started = False
         self.rosbag_uri: Path | None = None
-        self.sensor_saved_files: dict[str, str | None] = {}
+        self.sensor_paths: dict[str, str | None] = {}
         self.realsense_restart_count = 0
         self.realsense_restart_events: list[dict[str, Any]] = []
         self.realsense_readiness_manifest: dict[str, Any] | None = None
@@ -185,7 +188,7 @@ class MainController:
             self.demo_started_ns = time.time_ns()
             self.rosbag_record_started = False
             self.rosbag_uri = demo_dir / 'rosbag'
-            self.sensor_saved_files = {}
+            self.sensor_paths = {}
             self.realsense_readiness_manifest = None
             self.realsense_postcheck_manifest = None
             self.realsense_clock_domain_missing_topics = set()
@@ -326,9 +329,9 @@ class MainController:
             ft_result = ft_future.result()
             xense_result = xense_future.result()
             rosbag_stop_result = rosbag_stop_future.result()
-        self.sensor_saved_files = {
-            'ft300': None if ft_result['payload'] is None else ft_result['payload'].get('saved_file'),
-            'xense': None if xense_result['payload'] is None else xense_result['payload'].get('saved_file'),
+        self.sensor_paths = {
+            'ft300': self._sensor_path_from_payload(ft_result['payload']),
+            'xense': self._sensor_path_from_payload(xense_result['payload']),
         }
 
         command_failed = not ft_result['ok'] or not xense_result['ok'] or not rosbag_stop_result['ok']
@@ -474,7 +477,7 @@ class MainController:
         self.stop_all()
 
     def _start_processes(self) -> None:
-        logs = self.session_dir / 'process_logs'
+        logs = self.output_dir / 'process_logs' / self.run_id
         root = self.config.repo_root
         self.processes['ft300'] = ManagedProcess(
             'ft300',
@@ -720,7 +723,11 @@ class MainController:
             'rollback_results': rollback_results,
             'rosbag_record_resume': {
                 'record_started': self.rosbag_record_started,
-                'uri': None if self.rosbag_uri is None else str(self.rosbag_uri),
+                'uri': (
+                    None
+                    if self.rosbag_uri is None
+                    else self._demo_relative_str(self.rosbag_uri)
+                ),
                 'stop': rosbag_stop,
                 **(rosbag_state or {}),
             },
@@ -731,7 +738,7 @@ class MainController:
         self.demo_started_ns = None
         self.rosbag_record_started = False
         self.rosbag_uri = None
-        self.sensor_saved_files = {}
+        self.sensor_paths = {}
         self.realsense_readiness_manifest = None
         self.realsense_postcheck_manifest = None
         if cleanup_unconfirmed:
@@ -758,8 +765,13 @@ class MainController:
             'status': status,
             'started_ns': self.demo_started_ns,
             'finished_ns': time.time_ns(),
-            'rosbag_uri': None if self.rosbag_uri is None else str(self.rosbag_uri),
-            'sensor_saved_files': self.sensor_saved_files,
+            'run_id': self.run_id,
+            'rosbag_uri': (
+                None
+                if self.rosbag_uri is None
+                else self._demo_relative_str(self.rosbag_uri)
+            ),
+            'sensor_paths': self.sensor_paths,
             'npz': npz_paths,
             'frame_counts': self.demo_store.frame_counts(),
             'drop_monitors': {name: monitor.summary() for name, monitor in self.drop_monitors.items()},
@@ -781,6 +793,7 @@ class MainController:
         started_ns = time.time_ns()
         demo_dir = self.demo_store.demo_dir
         options = AlignmentOptions(
+            repo_root=self.config.repo_root,
             base='auto',
             alignment_base_source=self.config.alignment_base_source,
             mode=self.config.alignment_mode,
@@ -809,13 +822,14 @@ class MainController:
                 mode=self.config.realsense_capture_mode,
             )
             manifest = result.to_manifest()
+            manifest['rosbag_uri'] = self._demo_relative_str(self.rosbag_uri)
             self.log('realsense_rosbag_postcheck', **manifest)
             return manifest
         except Exception as exc:
             manifest = {
                 'ok': False,
                 'mode': self.config.realsense_capture_mode,
-                'rosbag_uri': str(self.rosbag_uri),
+                'rosbag_uri': self._demo_relative_str(self.rosbag_uri),
                 'required_topics': [requirement.topic for requirement in self.config.realsense_image_requirements],
                 'error': str(exc),
             }
@@ -825,7 +839,7 @@ class MainController:
     def _new_demo_dir(self) -> Path:
         """Return a unique demo directory path for rapid repeated captures."""
         base = time.strftime('demo_%Y%m%d_%H%M%S')
-        demos_dir = self.session_dir / 'demos'
+        demos_dir = self.output_dir / 'demos'
         candidate = demos_dir / base
         if not candidate.exists():
             return candidate
@@ -835,6 +849,22 @@ class MainController:
             if not candidate.exists():
                 return candidate
             suffix += 1
+
+    def _demo_relative_str(self, path: Path) -> str:
+        """Return a path relative to the active demo directory."""
+        if self.demo_store is None:
+            return path.as_posix()
+        return path.resolve().relative_to(self.demo_store.demo_dir.resolve()).as_posix()
+
+    @staticmethod
+    def _sensor_path_from_payload(payload: dict[str, Any] | None) -> str | None:
+        """Convert a sensor ACK payload into a repo-relative runtime_frames path."""
+        if payload is None:
+            return None
+        saved_file = payload.get('saved_file')
+        if saved_file is None:
+            return None
+        return (Path('runtime_frames') / Path(saved_file).name).as_posix()
 
     def reset_drop_baselines(self) -> None:
         """Reset every monitor baseline after pause/resume boundaries."""
@@ -896,6 +926,7 @@ def _float_or_none(value: str) -> float | None:
 def parse_args() -> argparse.Namespace:
     """Parse MainController CLI arguments."""
     parser = argparse.ArgumentParser(description='MainController for multi-sensor data collection')
+    parser.add_argument('--repo-root', default=None)
     parser.add_argument('--zmq-connect', default='tcp://127.0.0.1:6000')
     parser.add_argument('--output-dir', default=None)
     parser.add_argument('--startup-timeout-s', type=float, default=60.0)
@@ -911,7 +942,11 @@ def parse_args() -> argparse.Namespace:
 
 def build_config(args: argparse.Namespace) -> RuntimeConfig:
     """Build RuntimeConfig from CLI arguments."""
-    output_dir = RuntimeConfig.output_dir if args.output_dir is None else Path(args.output_dir)
+    repo_root = validate_repo_root(Path(args.repo_root)) if args.repo_root is not None else None
+    output_dir = None if args.output_dir is None else Path(args.output_dir)
+    kwargs: dict[str, Any] = {}
+    if repo_root is not None:
+        kwargs['repo_root'] = repo_root
     return RuntimeConfig(
         output_dir=output_dir,
         zmq_connect=args.zmq_connect,
@@ -923,6 +958,7 @@ def build_config(args: argparse.Namespace) -> RuntimeConfig:
         alignment_mode=args.alignment_mode,
         alignment_hz=args.alignment_hz,
         alignment_start_trim_s=args.alignment_start_trim_s,
+        **kwargs,
     )
 
 
