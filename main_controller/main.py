@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import queue
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -106,6 +108,7 @@ class MainController:
         self.realsense_readiness_manifest: dict[str, Any] | None = None
         self.realsense_postcheck_manifest: dict[str, Any] | None = None
         self.realsense_clock_domain_missing_topics: set[str] = set()
+        self.realsense_fatal_ignore_until_ns = 0
 
         self.drop_monitors: dict[str, DropMonitor] = {}
         self.demo_drop_monitors: dict[str, DropMonitor] = {}
@@ -140,14 +143,19 @@ class MainController:
             else:
                 self.stop_all()
         finally:
+            if self.get_state() != ControllerState.STOPPED:
+                self.stop_all()
+            else:
+                self._shutdown_ros_context()
             self.logger.close()
 
     def startup(self) -> None:
         """Start services, connect streams, and initialize sensors."""
         try:
             self.set_state(ControllerState.STARTING_SERVICES)
+            self._start_base_receivers()
             self._start_processes()
-            self._start_receivers()
+            self._start_ros_receivers()
             self.set_state(ControllerState.INIT)
             self._wait_startup_ready()
             self.set_state(ControllerState.WAIT_START)
@@ -488,8 +496,21 @@ class MainController:
         self.expected_process_exits.update(self.processes)
         for process in reversed(list(self.processes.values())):
             process.stop()
+        self._shutdown_ros_context()
         self.set_state(ControllerState.STOPPED)
         self.log('stopped')
+
+    def _shutdown_ros_context(self) -> None:
+        """Shut down the shared rclpy context so ros2 run can exit cleanly."""
+        try:
+            import rclpy
+        except Exception:
+            return
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception as exc:
+            self.log('rclpy_shutdown_failed', error=str(exc))
 
     def _abort_active_demo(
         self,
@@ -540,6 +561,10 @@ class MainController:
 
     def handle_realsense_fatal(self, payload: dict[str, Any]) -> None:
         """Pause if needed and restart the RealSense camera launch."""
+        event_time_ns = _int_or_none(payload.get('time_ns')) or time.time_ns()
+        if event_time_ns <= self.realsense_fatal_ignore_until_ns:
+            self.log('realsense_restart_skipped', reason='stale_fatal_after_restart', **payload)
+            return
         self.log('realsense_fatal_detected', **payload)
         print(f"[WARN] RealSense fatal output: {payload.get('line')}")
         if self.get_state() == ControllerState.COLLECTING:
@@ -557,14 +582,27 @@ class MainController:
             self.log('realsense_restart_skipped', reason='process_not_found')
             return
         self.realsense_restart_count += 1
-        event = {'time_ns': time.time_ns(), **payload}
+        event = {'time_ns': event_time_ns, **payload}
         self.realsense_restart_events.append(event)
         if self.demo_store is not None:
             self.demo_realsense_restart_count += 1
             self.demo_realsense_restart_events.append(event)
         self.log('realsense_restart_started', count=self.realsense_restart_count)
-        self.expected_process_exits.add('realsense_camera')
-        process.restart()
+        restart_log_position = self._realsense_log_position(process)
+        try:
+            self.expected_process_exits.add('realsense_camera')
+            process.restart()
+            self._wait_realsense_nodes_up_before_image_readiness(start_position=restart_log_position)
+            self._wait_realsense_images_ready('realsense_restart_image_readiness')
+        except Exception as exc:
+            self.log('realsense_restart_failed', count=self.realsense_restart_count, error=str(exc))
+            self._handle_unrecoverable_fatal(
+                failure_stage='realsense_restart',
+                failure_reason=str(exc),
+                abort_context={**payload, 'restart_count': self.realsense_restart_count},
+            )
+            return
+        self.realsense_fatal_ignore_until_ns = time.time_ns()
         self.reset_realsense_drop_baselines()
         self.log('realsense_restart_done', count=self.realsense_restart_count)
 
@@ -641,7 +679,7 @@ class MainController:
         root = self.config.repo_root
         self.processes['ft300'] = ManagedProcess(
             'ft300',
-            ['conda', 'run', '-n', 'Modbus314', 'python', '-m', 'FT300S.app', '--uds-path', self.config.ft_uds_path, '--shm-name', self.config.ft_shm_name, '--fps', str(self.config.ft_fps)],
+            ['conda', 'run', '-n', 'modbus314', 'python', '-m', 'FT300S.app', '--uds-path', self.config.ft_uds_path, '--shm-name', self.config.ft_shm_name, '--fps', str(self.config.ft_fps)],
             root,
             logs / 'ft300.log',
             on_exit=self._on_process_exit,
@@ -670,27 +708,42 @@ class MainController:
             on_exit=self._on_process_exit,
         )
         started: list[ManagedProcess] = []
+        process: ManagedProcess | None = None
         try:
-            for process in self.processes.values():
+            for name in ('ft300', 'xense'):
+                process = self.processes[name]
+                process.start()
+                started.append(process)
+                self.log('process_started', name=process.name, cmd=process.cmd)
+
+            self._wait_sensor_services_ready_before_realsense()
+
+            for name in ('realsense_camera', 'rosbag_recorder'):
+                process = self.processes[name]
                 process.start()
                 started.append(process)
                 self.log('process_started', name=process.name, cmd=process.cmd)
         except Exception as exc:
-            self.log('process_start_failed', name=process.name, error=str(exc))
+            self.log('process_start_failed', name=None if process is None else process.name, error=str(exc))
             for process in reversed(started):
                 process.stop()
             raise
 
-    def _start_receivers(self) -> None:
+    def _start_base_receivers(self) -> None:
+        """Start non-ROS receiver threads required before sensor processes launch."""
         self.zmq_receiver = ZmqTelemetryReceiver(
             self.config.zmq_connect,
             self._on_zmq_frame,
             self._on_zmq_error,
             self._on_zmq_fatal,
+            destroy_context_on_stop=True,
         )
         self.zmq_receiver.start()
         self.ft_client.start()
         self.xense_client.start()
+
+    def _start_ros_receivers(self) -> None:
+        """Start ROS subscribers and service clients after RealSense/rosbag launch."""
         self.realsense_monitor = RealSenseMetadataMonitor(
             self.config.realsense_metadata_topics,
             self._on_realsense_metadata,
@@ -698,6 +751,28 @@ class MainController:
         )
         self.realsense_monitor.start()
         self.rosbag = RosbagControl()
+
+    def _start_receivers(self) -> None:
+        """Start all receiver resources; kept for tests and direct internal use."""
+        self._start_base_receivers()
+        self._start_ros_receivers()
+
+    def _wait_sensor_services_ready_before_realsense(self) -> None:
+        """Wait for required non-RealSense sensors before V4L camera probing starts."""
+        self.log('sensor_startup_wait_before_realsense')
+        if not self.ft_client.wait_connected(self.config.startup_timeout_s):
+            raise RuntimeError('FT300S UDS did not connect')
+        self.log('sensor_startup_connected', sensor='ft300')
+        if not self.xense_client.wait_connected(self.config.startup_timeout_s):
+            raise RuntimeError('Xense UDS did not connect')
+        self.log('sensor_startup_connected', sensor='xense')
+        if not self.ft_client.wait_init_ready(self.config.init_timeout_s):
+            raise RuntimeError('FT300S did not send INIT_READY')
+        self.log('sensor_startup_init_ready', sensor='ft300')
+        if not self.xense_client.wait_init_ready(self.config.init_timeout_s):
+            raise RuntimeError('Xense did not send INIT_READY')
+        self.log('sensor_startup_init_ready', sensor='xense')
+        self.log('sensor_startup_ready_before_realsense')
 
     def _wait_startup_ready(self) -> None:
         if self.zmq_receiver is None or not self.zmq_receiver.wait_first_frame(self.config.zmq_first_frame_timeout_s):
@@ -717,6 +792,67 @@ class MainController:
             raise RuntimeError(error)
         if self.rosbag is not None and not self.rosbag.wait_ready(self.config.startup_timeout_s):
             raise RuntimeError('rosbag2 recorder services did not become ready')
+        self._wait_realsense_nodes_up_before_image_readiness()
+        self._wait_realsense_images_ready('realsense_startup_image_readiness')
+
+    def _wait_realsense_nodes_up_before_image_readiness(self, *, start_position: int = 0) -> None:
+        """Wait for each RealSense node to report SDK readiness in its launch log."""
+        process = self.processes.get('realsense_camera')
+        if process is None:
+            return
+        expected = set(self.config.cameras)
+        ready: set[str] = set()
+        position = start_position
+        deadline = time.monotonic() + self.config.startup_timeout_s
+        self.log('realsense_nodes_up_wait', required_cameras=sorted(expected))
+        while time.monotonic() < deadline:
+            if process.log_path.exists():
+                with process.log_path.open('r', encoding='utf-8', errors='replace') as log_fp:
+                    log_fp.seek(position)
+                    while True:
+                        line = log_fp.readline()
+                        if not line:
+                            break
+                        if 'RealSense Node Is Up!' not in line:
+                            continue
+                        for camera in expected - ready:
+                            if f'[{camera}.camera]' in line:
+                                ready.add(camera)
+                                self.log('realsense_node_up', camera=camera)
+                    position = log_fp.tell()
+            if expected <= ready:
+                self.log('realsense_nodes_up_ready', cameras=sorted(ready))
+                return
+            time.sleep(0.1)
+        missing = sorted(expected - ready)
+        self.log('realsense_nodes_up_timeout', seen_cameras=sorted(ready), missing_cameras=missing)
+        raise RuntimeError(f'RealSense nodes did not report ready: {missing}')
+
+    @staticmethod
+    def _realsense_log_position(process: ManagedProcess) -> int:
+        """Return the current RealSense launch log size for restart-scoped waits."""
+        try:
+            return process.log_path.stat().st_size
+        except OSError:
+            return 0
+
+    def _wait_realsense_images_ready(self, event_name: str) -> None:
+        """Wait until formal RealSense image topics are publishing before user collection."""
+        if self.rosbag is None:
+            return
+        readiness = self.rosbag.check_image_readiness(
+            self.config.realsense_image_requirements,
+            timeout_s=self.config.realsense_image_ready_timeout_s,
+            mode=self.config.realsense_capture_mode,
+        )
+        manifest = readiness.to_manifest()
+        self.log(event_name, **manifest)
+        if not readiness.ok:
+            raise RuntimeError('required RealSense image topics are not ready')
+
+    def _wait_realsense_startup_images_ready(self) -> None:
+        """Compatibility wrapper for older tests and direct callers."""
+        self._wait_realsense_images_ready('realsense_startup_image_readiness')
 
     def _on_uds_event(self, event: UdsEvent) -> None:
         if event.msg_type == MsgType.ERROR:
@@ -1001,7 +1137,7 @@ class MainController:
             result = self.rosbag.validate_recorded_images(
                 self.rosbag_uri,
                 self.config.realsense_image_requirements,
-                count_skew_limit=self.config.realsense_rosbag_count_skew_limit,
+                count_skew_limit_percent=self.config.realsense_rosbag_count_skew_limit_percent,
                 mode=self.config.realsense_capture_mode,
             )
             manifest = result.to_manifest()
@@ -1026,6 +1162,24 @@ class MainController:
         missing_topics = manifest.get('missing_topics') or []
         if missing_topics:
             return f"missing required RealSense image topics: {', '.join(str(topic) for topic in missing_topics)}"
+        zero_count_topics = manifest.get('zero_count_topics') or []
+        if zero_count_topics:
+            return f"zero-count RealSense image topics: {', '.join(str(topic) for topic in zero_count_topics)}"
+        type_mismatches = manifest.get('type_mismatches') or []
+        if type_mismatches:
+            topics = ', '.join(str(item.get('topic')) for item in type_mismatches)
+            return f"RealSense image topic type mismatch: {topics}"
+        count_skew = manifest.get('count_skew')
+        count_skew_limit = manifest.get('count_skew_limit')
+        if count_skew is not None and count_skew_limit is not None:
+            try:
+                skew_value = int(count_skew)
+                limit_value = float(count_skew_limit)
+            except Exception:
+                pass
+            else:
+                if skew_value > limit_value:
+                    return f'RealSense rosbag count skew {skew_value} exceeds limit {limit_value:.3f}'
         return 'RealSense rosbag post-check failed'
 
     def _new_demo_dir(self) -> Path:
@@ -1145,6 +1299,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--alignment-mode', choices=['causal', 'nearest'], default='causal')
     parser.add_argument('--alignment-hz', type=float, default=30.0)
     parser.add_argument('--alignment-start-trim-s', type=float, default=2.0)
+    parser.add_argument('--realsense-image-ready-timeout-s', type=float, default=30.0)
+    parser.add_argument('--realsense-rosbag-count-skew-limit-percent', type=float, default=0.5)
+    parser.add_argument('--realsense-capture-mode', choices=['formal', 'debug_degraded'], default='formal')
+    parser.add_argument(
+        '--realsense-debug-image-topic',
+        action='append',
+        default=[],
+        help='Required image topic for debug_degraded mode; repeat for multiple topics.',
+    )
     return parser.parse_args()
 
 
@@ -1166,6 +1329,10 @@ def build_config(args: argparse.Namespace) -> RuntimeConfig:
         alignment_mode=args.alignment_mode,
         alignment_hz=args.alignment_hz,
         alignment_start_trim_s=args.alignment_start_trim_s,
+        realsense_image_ready_timeout_s=args.realsense_image_ready_timeout_s,
+        realsense_rosbag_count_skew_limit_percent=args.realsense_rosbag_count_skew_limit_percent,
+        realsense_capture_mode=args.realsense_capture_mode,
+        realsense_debug_image_topics=tuple(args.realsense_debug_image_topic),
         **kwargs,
     )
 
@@ -1175,6 +1342,9 @@ def main() -> None:
     args = parse_args()
     controller = MainController(build_config(args))
     controller.run()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == '__main__':

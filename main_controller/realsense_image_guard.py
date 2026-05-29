@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -91,7 +92,9 @@ class RosbagImagePostcheckResult:
     zero_count_topics: tuple[str, ...] = ()
     type_mismatches: tuple[dict[str, Any], ...] = ()
     count_skew: int | None = None
-    count_skew_limit: int = 0
+    count_skew_limit: float = 0.0
+    count_skew_limit_percent: float = 0.0
+    count_skew_reference_count: int | None = None
 
     def to_manifest(self) -> dict[str, Any]:
         return {
@@ -105,6 +108,8 @@ class RosbagImagePostcheckResult:
             'type_mismatches': list(self.type_mismatches),
             'count_skew': self.count_skew,
             'count_skew_limit': self.count_skew_limit,
+            'count_skew_limit_percent': self.count_skew_limit_percent,
+            'count_skew_reference_count': self.count_skew_reference_count,
         }
 
 
@@ -213,7 +218,7 @@ def validate_rosbag_image_metadata(
     rosbag_uri: Path,
     requirements: tuple[ImageTopicRequirement, ...],
     topic_metadata: dict[str, dict[str, Any]],
-    count_skew_limit: int,
+    count_skew_limit_percent: float,
 ) -> RosbagImagePostcheckResult:
     """Validate required image topics in rosbag metadata."""
     missing: list[str] = []
@@ -239,9 +244,13 @@ def validate_rosbag_image_metadata(
                 }
             )
     count_skew = None
+    count_skew_limit = 0.0
+    count_skew_reference_count = None
     if counts:
         values = list(counts.values())
         count_skew = max(values) - min(values)
+        count_skew_reference_count = min(values)
+        count_skew_limit = count_skew_reference_count * count_skew_limit_percent / 100.0
     ok = (
         not missing
         and not zero_count
@@ -260,18 +269,28 @@ def validate_rosbag_image_metadata(
         type_mismatches=tuple(type_mismatches),
         count_skew=count_skew,
         count_skew_limit=count_skew_limit,
+        count_skew_limit_percent=count_skew_limit_percent,
+        count_skew_reference_count=count_skew_reference_count,
     )
 
 
-def check_ros_image_topic_readiness(node, rclpy, requirements: tuple[ImageTopicRequirement, ...], timeout_s: float, mode: str) -> ImageReadinessResult:
+def check_ros_image_topic_readiness(node, executor, requirements: tuple[ImageTopicRequirement, ...], timeout_s: float, mode: str) -> ImageReadinessResult:
     """Collect one Image message per required topic and compare stable schema."""
     try:
         from sensor_msgs.msg import Image
     except Exception as exc:  # pragma: no cover - depends on ROS environment.
         raise RuntimeError(f'ROS Image message dependency is unavailable: {exc}') from exc
 
+    try:
+        from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+
+        qos = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST, reliability=ReliabilityPolicy.BEST_EFFORT)
+    except Exception:  # pragma: no cover - only used by lightweight unit-test fakes.
+        qos = 1
+
     observed: dict[str, ImageTopicBaseline] = {}
-    subscriptions = []
+    subscriptions: dict[str, Any] = {}
+    active_topics: set[str] = set()
 
     def make_callback(requirement: ImageTopicRequirement):
         def callback(message) -> None:
@@ -288,15 +307,26 @@ def check_ros_image_topic_readiness(node, rclpy, requirements: tuple[ImageTopicR
         return callback
 
     for requirement in requirements:
-        subscriptions.append(node.create_subscription(Image, requirement.topic, make_callback(requirement), 10))
+        subscriptions[requirement.topic] = node.create_subscription(Image, requirement.topic, make_callback(requirement), qos)
+        active_topics.add(requirement.topic)
 
     try:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline and len(observed) < len(requirements):
-            rclpy.spin_once(node, timeout_sec=0.05)
+            executor.spin_once(timeout_sec=0.05)
+            for topic in list(active_topics):
+                if topic not in observed:
+                    continue
+                subscription = subscriptions.pop(topic, None)
+                active_topics.discard(topic)
+                if subscription is not None:
+                    try:
+                        node.destroy_subscription(subscription)
+                    except Exception:
+                        pass
         return evaluate_readiness(mode=mode, requirements=requirements, observed=observed)
     finally:
-        for subscription in subscriptions:
+        for subscription in subscriptions.values():
             try:
                 node.destroy_subscription(subscription)
             except Exception:
@@ -310,7 +340,12 @@ def read_rosbag_topic_metadata(rosbag_uri: Path) -> dict[str, dict[str, Any]]:
     except Exception as exc:  # pragma: no cover - depends on ROS environment.
         raise RuntimeError(f'rosbag2_py dependency is unavailable: {exc}') from exc
 
-    metadata = rosbag2_py.Info().read_metadata(str(rosbag_uri))
+    info = rosbag2_py.Info()
+    storage_id = _detect_rosbag_storage_id(rosbag_uri)
+    try:
+        metadata = info.read_metadata(str(rosbag_uri), storage_id)
+    except TypeError:
+        metadata = info.read_metadata(str(rosbag_uri))
     result: dict[str, dict[str, Any]] = {}
     for item in metadata.topics_with_message_count:
         topic_metadata = item.topic_metadata
@@ -319,3 +354,16 @@ def read_rosbag_topic_metadata(rosbag_uri: Path) -> dict[str, dict[str, Any]]:
             'count': int(item.message_count),
         }
     return result
+
+
+def _detect_rosbag_storage_id(rosbag_uri: Path) -> str:
+    """Detect rosbag2 storage id for rosbag2_py Info API variants."""
+    metadata_file = rosbag_uri / 'metadata.yaml'
+    if metadata_file.exists():
+        content = metadata_file.read_text(encoding='utf-8', errors='ignore')
+        match = re.search(r'storage_identifier:\s*([A-Za-z0-9_\-]+)', content)
+        if match:
+            return match.group(1)
+    if list(rosbag_uri.glob('*.mcap')):
+        return 'mcap'
+    return 'sqlite3'

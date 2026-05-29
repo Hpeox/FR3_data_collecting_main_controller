@@ -392,7 +392,7 @@ class FakeRosbagControl:
             missing_topics=tuple(self.readiness_missing_topics),
         )
 
-    def validate_recorded_images(self, rosbag_uri: Path, requirements, count_skew_limit: int, mode: str):
+    def validate_recorded_images(self, rosbag_uri: Path, requirements, count_skew_limit_percent: float, mode: str):
         self.postcheck_requirements = requirements
         metadata = self.postcheck_topic_metadata
         if metadata is None:
@@ -405,7 +405,7 @@ class FakeRosbagControl:
             rosbag_uri=rosbag_uri,
             requirements=requirements,
             topic_metadata=metadata,
-            count_skew_limit=count_skew_limit,
+            count_skew_limit_percent=count_skew_limit_percent,
         )
 
     def close(self) -> None:
@@ -434,6 +434,7 @@ class FakeProcess:
         self.start_count = 0
         self.restart_count = 0
         self.stop_count = 0
+        self.log_path = Path('/tmp/maincontroller_fake_realsense.log')
 
     def start(self) -> None:
         self.start_count += 1
@@ -828,8 +829,10 @@ def test_startup_failure_cleans_started_resources_and_reraises(tmp_path, monkeyp
     def start_processes() -> None:
         controller.processes['ft300'] = fake_process
 
-    def start_receivers() -> None:
+    def start_base_receivers() -> None:
         controller.zmq_receiver = fake_receiver
+
+    def start_ros_receivers() -> None:
         controller.realsense_monitor = fake_monitor
         controller.rosbag = fake_rosbag
 
@@ -837,7 +840,8 @@ def test_startup_failure_cleans_started_resources_and_reraises(tmp_path, monkeyp
         raise RuntimeError('injected startup failure')
 
     monkeypatch.setattr(controller, '_start_processes', start_processes)
-    monkeypatch.setattr(controller, '_start_receivers', start_receivers)
+    monkeypatch.setattr(controller, '_start_base_receivers', start_base_receivers)
+    monkeypatch.setattr(controller, '_start_ros_receivers', start_ros_receivers)
     monkeypatch.setattr(controller, '_wait_startup_ready', wait_startup_ready)
 
     with pytest.raises(RuntimeError, match='injected startup failure'):
@@ -940,6 +944,94 @@ def test_start_processes_stops_earlier_processes_on_later_failure(tmp_path, monk
     assert by_name['xense'].stop_count == 0
     assert by_name['realsense_camera'].stop_count == 0
     assert by_name['rosbag_recorder'].stop_count == 0
+
+
+def test_start_processes_waits_for_xense_init_before_realsense(tmp_path, monkeypatch):
+    from main_controller import main as main_module
+
+    events: list[str] = []
+
+    class FakeStartedUdsClient:
+        def __init__(self, name: str):
+            self.name = name
+
+        def is_started(self) -> bool:
+            return True
+
+        def wait_connected(self, _timeout_s: float) -> bool:
+            events.append(f'{self.name}:connected')
+            return True
+
+        def wait_init_ready(self, _timeout_s: float) -> bool:
+            events.append(f'{self.name}:init_ready')
+            return True
+
+    class FakeManagedProcess:
+        def __init__(
+            self,
+            name,
+            cmd,
+            cwd,
+            log_path,
+            fatal_patterns=(),
+            on_fatal=None,
+            on_exit=None,
+        ):
+            self.name = name
+            self.cmd = cmd
+            self.cwd = cwd
+            self.log_path = log_path
+
+        def start(self) -> None:
+            events.append(f'{self.name}:start')
+
+        def stop(self) -> None:
+            events.append(f'{self.name}:stop')
+
+    monkeypatch.setattr(main_module, 'ManagedProcess', FakeManagedProcess)
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    controller.ft_client = FakeStartedUdsClient('ft300')
+    controller.xense_client = FakeStartedUdsClient('xense')
+
+    controller._start_processes()
+
+    assert events.index('xense:init_ready') < events.index('realsense_camera:start')
+    assert events.index('realsense_camera:start') < events.index('rosbag_recorder:start')
+
+
+def test_realsense_nodes_up_wait_reads_all_camera_ready_lines(tmp_path):
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    log_path = tmp_path / 'realsense_camera.log'
+    log_path.write_text(
+        '\n'.join(
+            f'[realsense2_camera_node-{index}] [INFO] [0.0] [{camera}.camera]: RealSense Node Is Up!'
+            for index, camera in enumerate(('cam1', 'cam2', 'cam3', 'cam4'), start=1)
+        ),
+        encoding='utf-8',
+    )
+
+    class FakeRealSenseProcess:
+        def __init__(self, path: Path):
+            self.log_path = path
+
+    controller.processes['realsense_camera'] = FakeRealSenseProcess(log_path)
+
+    controller._wait_realsense_nodes_up_before_image_readiness()
+
+    events = [
+        json.loads(line)
+        for line in controller.logger.path.read_text(encoding='utf-8').splitlines()
+        if 'realsense_node' in line
+    ]
+    assert [event['event'] for event in events] == [
+        'realsense_nodes_up_wait',
+        'realsense_node_up',
+        'realsense_node_up',
+        'realsense_node_up',
+        'realsense_node_up',
+        'realsense_nodes_up_ready',
+    ]
+    assert events[-1]['cameras'] == ['cam1', 'cam2', 'cam3', 'cam4']
 
 
 def test_start_transaction_rolls_back_acked_sensor_on_later_sensor_error(tmp_path, monkeypatch):
@@ -1122,6 +1214,31 @@ def test_realsense_rosbag_postcheck_failure_stops_controller(tmp_path, monkeypat
         assert manifest['realsense_rosbag_postcheck']['missing_topics'] == [requirements[-1].topic]
         assert manifest['npz']
         assert 'alignment' not in manifest
+
+
+def test_realsense_rosbag_postcheck_count_skew_reason_is_specific(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+        requirements = controller.config.realsense_image_requirements
+        runtime.rosbag.postcheck_topic_metadata = {
+            requirement.topic: {'message_type': requirement.message_type, 'count': 10}
+            for requirement in requirements
+        }
+        runtime.rosbag.postcheck_topic_metadata[requirements[0].topic]['count'] = 14
+
+        controller.finish_demo()
+
+        assert controller.get_state() == ControllerState.STOPPED
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'failed'
+        assert manifest['failure_stage'] == 'realsense_rosbag_postcheck'
+        assert manifest['failure_reason'] == 'RealSense rosbag count skew 4 exceeds limit 0.050'
+        assert manifest['realsense_rosbag_postcheck']['count_skew'] == 4
+        assert manifest['realsense_rosbag_postcheck']['count_skew_limit'] == 0.05
+        assert manifest['realsense_rosbag_postcheck']['count_skew_limit_percent'] == 0.5
+        assert manifest['realsense_rosbag_postcheck']['count_skew_reference_count'] == 10
 
 
 def test_realsense_debug_degraded_mode_uses_configured_subset(tmp_path, monkeypatch):
@@ -1421,6 +1538,84 @@ def test_zmq_fatal_stops_controller_and_cleans_resources(tmp_path):
     assert fake_process.stop_count == 1
 
 
+def test_stop_all_shuts_down_rclpy_context(tmp_path, monkeypatch):
+    shutdown_calls = []
+
+    class FakeRclpy:
+        @staticmethod
+        def ok() -> bool:
+            return True
+
+        @staticmethod
+        def shutdown() -> None:
+            shutdown_calls.append(True)
+
+    monkeypatch.setitem(sys.modules, 'rclpy', FakeRclpy)
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions', ack_timeout_s=0.01, rosbag_timeout_s=0.01))
+    controller.ft_client = FakeSensorClient('ft300')
+    controller.xense_client = FakeSensorClient('xense')
+    controller.set_state(ControllerState.WAIT_START)
+
+    controller.stop_all()
+
+    assert controller.get_state() == ControllerState.STOPPED
+    assert shutdown_calls == [True]
+
+
+def test_run_shutdowns_rclpy_context_after_stopped_state(tmp_path, monkeypatch):
+    from main_controller import main as main_module
+
+    shutdown_calls = []
+
+    class FakeRclpy:
+        @staticmethod
+        def ok() -> bool:
+            return not shutdown_calls
+
+        @staticmethod
+        def shutdown() -> None:
+            shutdown_calls.append(True)
+
+    class FakeInputThread:
+        def __init__(self, _commands):
+            pass
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setitem(sys.modules, 'rclpy', FakeRclpy)
+    monkeypatch.setattr(main_module, 'InputThread', FakeInputThread)
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    monkeypatch.setattr(controller, 'startup', lambda: controller.set_state(ControllerState.STOPPED))
+
+    controller.run()
+
+    assert controller.get_state() == ControllerState.STOPPED
+    assert shutdown_calls == [True]
+
+
+def test_main_forces_process_exit_after_clean_controller_return(tmp_path, monkeypatch):
+    from main_controller import main as main_module
+
+    exits = []
+
+    class FakeController:
+        def __init__(self, _config):
+            pass
+
+        def run(self) -> None:
+            return
+
+    monkeypatch.setattr(main_module, 'parse_args', lambda: object())
+    monkeypatch.setattr(main_module, 'build_config', lambda _args: RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    monkeypatch.setattr(main_module, 'MainController', FakeController)
+    monkeypatch.setattr(main_module.os, '_exit', lambda code: exits.append(code))
+
+    main_module.main()
+
+    assert exits == [0]
+
+
 def test_realsense_metadata_fatal_stops_controller_and_cleans_resources(tmp_path):
     controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions', ack_timeout_s=0.01, rosbag_timeout_s=0.01))
     fake_rosbag = FakeRosbagControl()
@@ -1550,7 +1745,7 @@ def test_mock_runtime_start_discard_start_done_keeps_zmq_drain_after_discard(tmp
         ]
 
 
-def test_realsense_fatal_pauses_collecting_and_restarts(tmp_path):
+def test_realsense_fatal_pauses_collecting_and_restarts(tmp_path, monkeypatch):
     controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
     fake_rosbag = FakeRosbagControl()
     fake_process = FakeProcess()
@@ -1560,6 +1755,17 @@ def test_realsense_fatal_pauses_collecting_and_restarts(tmp_path):
     controller.processes['realsense_camera'] = fake_process
     controller.demo_store = DemoStore(tmp_path / 'demo')
     controller.set_state(ControllerState.COLLECTING)
+    wait_calls: list[tuple[str, int | None]] = []
+    monkeypatch.setattr(
+        controller,
+        '_wait_realsense_nodes_up_before_image_readiness',
+        lambda *, start_position=0: wait_calls.append(('nodes', start_position)),
+    )
+    monkeypatch.setattr(
+        controller,
+        '_wait_realsense_images_ready',
+        lambda event_name: wait_calls.append((event_name, None)),
+    )
 
     controller.handle_realsense_fatal({'line': 'Hardware Error', 'process': 'realsense_camera'})
 
@@ -1569,6 +1775,32 @@ def test_realsense_fatal_pauses_collecting_and_restarts(tmp_path):
     assert ('pause', None) in fake_rosbag.calls
     assert fake_process.restart_count == 1
     assert controller.realsense_restart_count == 1
+    assert wait_calls == [('nodes', 0), ('realsense_restart_image_readiness', None)]
+
+
+def test_realsense_fatal_ignores_stale_duplicate_after_restart(tmp_path, monkeypatch):
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    fake_process = FakeProcess()
+    controller.rosbag = FakeRosbagControl()
+    controller.processes['realsense_camera'] = fake_process
+    controller.set_state(ControllerState.WAIT_START)
+    monkeypatch.setattr(controller, '_wait_realsense_nodes_up_before_image_readiness', lambda *, start_position=0: None)
+    monkeypatch.setattr(controller, '_wait_realsense_images_ready', lambda event_name: None)
+
+    event_time_ns = time.time_ns()
+    payload = {'line': 'Depth stream start failure, Hardware Error', 'process': 'realsense_camera', 'time_ns': event_time_ns}
+
+    controller.handle_realsense_fatal(payload)
+    controller.handle_realsense_fatal(payload)
+
+    assert fake_process.restart_count == 1
+    assert controller.realsense_restart_count == 1
+    events = [
+        json.loads(line)
+        for line in controller.logger.path.read_text(encoding='utf-8').splitlines()
+        if 'realsense_restart_skipped' in line
+    ]
+    assert events[-1]['reason'] == 'stale_fatal_after_restart'
 
 
 def test_realsense_fatal_does_not_restart_when_auto_pause_fails(tmp_path):

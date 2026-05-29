@@ -6,6 +6,7 @@ import time
 import uuid
 import json
 import argparse
+import io
 import types
 from pathlib import Path
 
@@ -18,7 +19,12 @@ from main_controller.drop_monitor import DropMonitor
 import main_controller.config as config_module
 from main_controller.config import RuntimeConfig, validate_repo_root
 from main_controller.main import MainController, build_config
-from main_controller.realsense_image_guard import validate_rosbag_image_metadata
+from main_controller.processes import ManagedProcess
+from main_controller.realsense_image_guard import (
+    check_ros_image_topic_readiness,
+    read_rosbag_topic_metadata,
+    validate_rosbag_image_metadata,
+)
 from main_controller.realsense_metadata import RealSenseMetadataMonitor, metadata_int, metadata_ms_to_ns, metadata_str
 from main_controller.timestamp_alignment import AlignmentOptions, align_demo_timestamps
 from main_controller.uds_client import UdsClient
@@ -33,6 +39,34 @@ from main_controller.zmq_telemetry import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
+
+
+def test_managed_process_reports_one_fatal_per_matching_line(tmp_path):
+    calls: list[tuple[str, str]] = []
+
+    class FakeStdout:
+        def __iter__(self):
+            return iter(['Depth stream start failure, Hardware Error\n'])
+
+    class FakeProcess:
+        stdout = FakeStdout()
+
+        def wait(self) -> int:
+            return 0
+
+    process = ManagedProcess(
+        'realsense_camera',
+        ['true'],
+        tmp_path,
+        tmp_path / 'process.log',
+        fatal_patterns=('Hardware Error', 'Depth stream start failure'),
+        on_fatal=lambda name, line: calls.append((name, line)),
+    )
+    process.process = FakeProcess()
+
+    process._read_output(io.StringIO())
+
+    assert calls == [('realsense_camera', 'Depth stream start failure, Hardware Error')]
 
 
 def test_zmq_unpack_frame_minimal():
@@ -65,7 +99,7 @@ def test_zmq_receiver_invalid_frame_is_nonfatal_and_receiver_continues():
     def on_frame(frame, _recv_time_ns, _recv_monotonic_ns):
         frames.append(frame)
 
-    receiver = ZmqTelemetryReceiver(endpoint, on_frame, errors.append, fatals.append)
+    receiver = ZmqTelemetryReceiver(endpoint, on_frame, errors.append, fatals.append, context=context)
     receiver.start()
     try:
         deadline = time.monotonic() + 2.0
@@ -106,7 +140,7 @@ def test_zmq_receiver_on_frame_exception_reports_fatal():
     def on_frame(_frame, _recv_time_ns, _recv_monotonic_ns):
         raise RuntimeError("callback exploded")
 
-    receiver = ZmqTelemetryReceiver(endpoint, on_frame, lambda _message: None, fatals.append)
+    receiver = ZmqTelemetryReceiver(endpoint, on_frame, lambda _message: None, fatals.append, context=context)
     receiver.start()
     try:
         payload = FRAME_STRUCT.pack(
@@ -310,16 +344,33 @@ def _config_args(**overrides):
         "alignment_mode": "causal",
         "alignment_hz": 30.0,
         "alignment_start_trim_s": 2.0,
+        "realsense_image_ready_timeout_s": 30.0,
+        "realsense_rosbag_count_skew_limit_percent": 0.5,
+        "realsense_capture_mode": "formal",
+        "realsense_debug_image_topic": [],
     }
     values.update(overrides)
     return argparse.Namespace(**values)
 
 
 def test_build_config_uses_explicit_repo_root(tmp_path):
-    config = build_config(_config_args(repo_root=str(REPO_ROOT), output_dir=str(tmp_path / "out")))
+    config = build_config(
+        _config_args(
+            repo_root=str(REPO_ROOT),
+            output_dir=str(tmp_path / "out"),
+            realsense_image_ready_timeout_s=12.0,
+            realsense_rosbag_count_skew_limit_percent=0.75,
+            realsense_capture_mode="debug_degraded",
+            realsense_debug_image_topic=("/cam1/camera/color/image_raw",),
+        )
+    )
 
     assert config.repo_root == REPO_ROOT
     assert config.output_dir == (tmp_path / "out").resolve()
+    assert config.realsense_image_ready_timeout_s == 12.0
+    assert config.realsense_rosbag_count_skew_limit_percent == 0.75
+    assert config.realsense_capture_mode == "debug_degraded"
+    assert config.realsense_debug_image_topics == ("/cam1/camera/color/image_raw",)
 
 
 def test_build_config_uses_build_time_hint(monkeypatch):
@@ -366,6 +417,69 @@ def test_realsense_debug_degraded_image_requirements_use_configured_subset():
     ]
 
 
+def test_realsense_image_readiness_uses_shallow_qos_and_destroys_ready_subscriptions(monkeypatch):
+    class FakeImage:
+        width = 640
+        height = 480
+        encoding = "rgb8"
+        step = 1920
+
+    message_module = types.ModuleType("sensor_msgs.msg")
+    message_module.Image = FakeImage
+    monkeypatch.setitem(sys.modules, "sensor_msgs", types.ModuleType("sensor_msgs"))
+    monkeypatch.setitem(sys.modules, "sensor_msgs.msg", message_module)
+
+    class FakeHistoryPolicy:
+        KEEP_LAST = "keep_last"
+
+    class FakeReliabilityPolicy:
+        BEST_EFFORT = "best_effort"
+
+    class FakeQoSProfile:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    qos_module = types.ModuleType("rclpy.qos")
+    qos_module.HistoryPolicy = FakeHistoryPolicy
+    qos_module.ReliabilityPolicy = FakeReliabilityPolicy
+    qos_module.QoSProfile = FakeQoSProfile
+    monkeypatch.setitem(sys.modules, "rclpy", types.ModuleType("rclpy"))
+    monkeypatch.setitem(sys.modules, "rclpy.qos", qos_module)
+
+    callbacks = {}
+    qos_values = []
+    destroyed = []
+
+    class FakeNode:
+        def create_subscription(self, _message_type, topic, callback, qos):
+            callbacks[topic] = callback
+            qos_values.append(qos)
+            return topic
+
+        def destroy_subscription(self, subscription):
+            destroyed.append(subscription)
+
+    class FakeExecutor:
+        def __init__(self):
+            self.calls = 0
+
+        def spin_once(self, timeout_sec=0.05):
+            del timeout_sec
+            self.calls += 1
+            if self.calls == 1:
+                callbacks["/cam1/camera/color/image_raw"](FakeImage())
+            elif self.calls == 2:
+                callbacks["/cam2/camera/color/image_raw"](FakeImage())
+
+    requirements = RuntimeConfig(repo_root=REPO_ROOT, cameras=("cam1", "cam2")).realsense_image_requirements[::2]
+    result = check_ros_image_topic_readiness(FakeNode(), FakeExecutor(), requirements, timeout_s=1.0, mode="formal")
+
+    assert result.ok
+    assert all(qos.kwargs["depth"] == 1 for qos in qos_values)
+    assert all(qos.kwargs["reliability"] == FakeReliabilityPolicy.BEST_EFFORT for qos in qos_values)
+    assert destroyed == ["/cam1/camera/color/image_raw", "/cam2/camera/color/image_raw"]
+
+
 def test_realsense_rosbag_postcheck_detects_missing_and_skew(tmp_path):
     config = RuntimeConfig(repo_root=REPO_ROOT)
     requirements = config.realsense_image_requirements
@@ -380,12 +494,53 @@ def test_realsense_rosbag_postcheck_detects_missing_and_skew(tmp_path):
         rosbag_uri=tmp_path / "demo" / "rosbag",
         requirements=requirements,
         topic_metadata=metadata,
-        count_skew_limit=config.realsense_rosbag_count_skew_limit,
+        count_skew_limit_percent=config.realsense_rosbag_count_skew_limit_percent,
     )
 
     assert not result.ok
     assert result.missing_topics == (requirements[-1].topic,)
     assert result.count_skew == 90
+    assert result.count_skew_reference_count == 10
+    assert result.count_skew_limit == 0.05
+
+
+def test_read_rosbag_topic_metadata_uses_detected_storage_id(tmp_path, monkeypatch):
+    bag_dir = tmp_path / "rosbag"
+    bag_dir.mkdir()
+    (bag_dir / "metadata.yaml").write_text(
+        "rosbag2_bagfile_information:\n  storage_identifier: mcap\n",
+        encoding="utf-8",
+    )
+    calls: list[tuple[str, str]] = []
+
+    class FakeTopicMetadata:
+        name = "/cam1/camera/color/image_raw"
+        type = "sensor_msgs/msg/Image"
+
+    class FakeTopicWithCount:
+        topic_metadata = FakeTopicMetadata()
+        message_count = 42
+
+    class FakeMetadata:
+        topics_with_message_count = [FakeTopicWithCount()]
+
+    class FakeInfo:
+        def read_metadata(self, uri: str, storage_id: str):
+            calls.append((uri, storage_id))
+            return FakeMetadata()
+
+    fake_rosbag2_py = types.SimpleNamespace(Info=lambda: FakeInfo())
+    monkeypatch.setitem(sys.modules, "rosbag2_py", fake_rosbag2_py)
+
+    result = read_rosbag_topic_metadata(bag_dir)
+
+    assert calls == [(str(bag_dir), "mcap")]
+    assert result == {
+        "/cam1/camera/color/image_raw": {
+            "message_type": "sensor_msgs/msg/Image",
+            "count": 42,
+        }
+    }
 
 
 def test_timestamp_alignment_xense_base_uses_timestamp_ns_0(tmp_path):

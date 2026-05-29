@@ -89,10 +89,10 @@ class RuntimeConfig:
     alignment_start_trim_s: float = 2.0
     zmq_first_frame_timeout_s: float = 5.0
     rosbag_timeout_s: float = 15.0
-    realsense_image_ready_timeout_s: float = 5.0
+    realsense_image_ready_timeout_s: float = 30.0
     realsense_capture_mode: str = 'formal'
     realsense_debug_image_topics: tuple[str, ...] = ()
-    realsense_rosbag_count_skew_limit: int = 3
+    realsense_rosbag_count_skew_limit_percent: float = 0.5
     rate: RateConfig = field(default_factory=RateConfig)
 
     cameras: tuple[str, ...] = ('cam1', 'cam2', 'cam3', 'cam4')

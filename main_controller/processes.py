@@ -106,9 +106,8 @@ class ManagedProcess:
             for line in self.process.stdout:
                 log_fp.write(line)
                 log_fp.flush()
-                for pattern in self.fatal_patterns:
-                    if pattern in line and self.on_fatal is not None:
-                        self.on_fatal(self.name, line.rstrip())
+                if self.on_fatal is not None and any(pattern in line for pattern in self.fatal_patterns):
+                    self.on_fatal(self.name, line.rstrip())
             rc = self.process.wait()
             if self.on_exit is not None:
                 self.on_exit(self.name, rc)

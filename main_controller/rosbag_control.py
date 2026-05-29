@@ -32,6 +32,8 @@ class RosbagControl:
         if not rclpy.ok():
             rclpy.init(args=None)
         self.node = rclpy.create_node(node_name)
+        self.executor = rclpy.executors.SingleThreadedExecutor()
+        self.executor.add_node(self.node)
         self.record_client = self.node.create_client(Record, '/rosbag2_recorder/record')
         self.resume_client = self.node.create_client(Resume, '/rosbag2_recorder/resume')
         self.pause_client = self.node.create_client(Pause, '/rosbag2_recorder/pause')
@@ -67,13 +69,13 @@ class RosbagControl:
         mode: str,
     ) -> ImageReadinessResult:
         """Validate that required RealSense image topics are alive before recording."""
-        return check_ros_image_topic_readiness(self.node, self._rclpy, requirements, timeout_s, mode)
+        return check_ros_image_topic_readiness(self.node, self.executor, requirements, timeout_s, mode)
 
     def validate_recorded_images(
         self,
         rosbag_uri: Path,
         requirements: tuple[ImageTopicRequirement, ...],
-        count_skew_limit: int,
+        count_skew_limit_percent: float,
         mode: str,
     ) -> RosbagImagePostcheckResult:
         """Validate required RealSense image topics in the recorded rosbag metadata."""
@@ -82,16 +84,18 @@ class RosbagControl:
             rosbag_uri=rosbag_uri,
             requirements=requirements,
             topic_metadata=read_rosbag_topic_metadata(rosbag_uri),
-            count_skew_limit=count_skew_limit,
+            count_skew_limit_percent=count_skew_limit_percent,
         )
 
     def close(self) -> None:
         """Destroy the ROS node."""
+        self.executor.remove_node(self.node)
+        self.executor.shutdown()
         self.node.destroy_node()
 
     def _call(self, client, request, timeout_s: float) -> None:
         future = client.call_async(request)
-        self._rclpy.spin_until_future_complete(self.node, future, timeout_sec=timeout_s)
+        self.executor.spin_until_future_complete(future, timeout_sec=timeout_s)
         if not future.done():
             raise TimeoutError(f'rosbag2 service call timed out: {client.srv_name}')
         result = future.result()

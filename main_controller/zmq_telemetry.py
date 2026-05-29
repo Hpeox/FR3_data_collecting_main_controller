@@ -65,12 +65,16 @@ class ZmqTelemetryReceiver:
         on_error: Callable[[str], None] | None = None,
         on_fatal: Callable[[str], None] | None = None,
         rcv_hwm: int = 1000,
+        context: zmq.Context | None = None,
+        destroy_context_on_stop: bool = False,
     ):
         self.endpoint = endpoint
         self.on_frame = on_frame
         self.on_error = on_error
         self.on_fatal = on_fatal
         self.rcv_hwm = rcv_hwm
+        self._context = context if context is not None else zmq.Context.instance()
+        self._destroy_context_on_stop = destroy_context_on_stop
         self.first_frame = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -94,8 +98,7 @@ class ZmqTelemetryReceiver:
         return self.first_frame.wait(timeout=timeout_s)
 
     def _run(self) -> None:
-        context = zmq.Context.instance()
-        socket = context.socket(zmq.SUB)
+        socket = self._context.socket(zmq.SUB)
         socket.setsockopt(zmq.SUBSCRIBE, b'')
         socket.setsockopt(zmq.RCVHWM, self.rcv_hwm)
         poller = zmq.Poller()
@@ -130,3 +133,5 @@ class ZmqTelemetryReceiver:
             except Exception:
                 pass
             socket.close(linger=0)
+            if self._destroy_context_on_stop:
+                self._context.destroy(linger=0)

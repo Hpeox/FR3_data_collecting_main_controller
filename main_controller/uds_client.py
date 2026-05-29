@@ -118,6 +118,10 @@ class UdsClient:
         self._thread = threading.Thread(target=self._run, name=f'UdsClient:{self.name}', daemon=True)
         self._thread.start()
 
+    def is_started(self) -> bool:
+        """Return whether the background client thread has been started."""
+        return self._thread is not None
+
     def stop(self, timeout_s: float = 2.0) -> None:
         """Stop the client and close the socket."""
         self._stop.set()
