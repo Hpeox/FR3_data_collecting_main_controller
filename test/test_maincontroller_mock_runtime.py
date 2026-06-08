@@ -625,6 +625,7 @@ def test_mock_runtime_start_pause_resume_done(tmp_path, monkeypatch):
         manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'done'
         assert manifest['run_id'] == controller.run_id
+        assert manifest['xense_sdk_version'] == '2.0'
         assert controller.logger.path == (
             controller.output_dir / f'controller_events_{controller.run_id}.jsonl'
         )
@@ -940,6 +941,7 @@ def test_start_processes_stops_earlier_processes_on_later_failure(tmp_path, monk
     assert by_name['ft300'].log_path == (
         controller.output_dir / 'process_logs' / controller.run_id / 'ft300.log'
     )
+    assert by_name['xense'].cmd[:4] == ['conda', 'run', '-n', 'xense2']
     assert by_name['ft300'].stop_count == 1
     assert by_name['xense'].stop_count == 0
     assert by_name['realsense_camera'].stop_count == 0
@@ -995,8 +997,61 @@ def test_start_processes_waits_for_xense_init_before_realsense(tmp_path, monkeyp
 
     controller._start_processes()
 
+    by_name = {process.name: process for process in controller.processes.values()}
+    assert by_name['xense'].cmd[:4] == ['conda', 'run', '-n', 'xense2']
     assert events.index('xense:init_ready') < events.index('realsense_camera:start')
     assert events.index('realsense_camera:start') < events.index('rosbag_recorder:start')
+
+
+def test_start_processes_maps_xense_sdk_1x_to_xense310(tmp_path, monkeypatch):
+    from main_controller import main as main_module
+
+    class FakeStartedUdsClient:
+        def is_started(self) -> bool:
+            return True
+
+        def wait_connected(self, _timeout_s: float) -> bool:
+            return True
+
+        def wait_init_ready(self, _timeout_s: float) -> bool:
+            return True
+
+    class FakeManagedProcess:
+        def __init__(
+            self,
+            name,
+            cmd,
+            cwd,
+            log_path,
+            fatal_patterns=(),
+            on_fatal=None,
+            on_exit=None,
+        ):
+            self.name = name
+            self.cmd = cmd
+            self.cwd = cwd
+            self.log_path = log_path
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(main_module, 'ManagedProcess', FakeManagedProcess)
+    controller = MainController(
+        RuntimeConfig(
+            repo_root=REPO_ROOT,
+            output_dir=tmp_path / 'sessions',
+            xense_sdk_version='1.x',
+        )
+    )
+    controller.ft_client = FakeStartedUdsClient()
+    controller.xense_client = FakeStartedUdsClient()
+
+    controller._start_processes()
+
+    assert controller.processes['xense'].cmd[:4] == ['conda', 'run', '-n', 'Xense310']
 
 
 def test_realsense_nodes_up_wait_reads_all_camera_ready_lines(tmp_path):
@@ -1702,6 +1757,26 @@ def test_demo_manifest_uses_per_demo_drop_monitor_stats(tmp_path):
     assert first_manifest['drop_monitors']['stream']['warning_count'] > 0
     assert second_manifest['drop_monitors']['stream']['warning_count'] == 0
     assert controller.drop_monitors['stream'].summary()['warning_count'] > 0
+
+
+def test_demo_manifest_records_xense_sdk_version_after_run_id(tmp_path):
+    controller = MainController(
+        RuntimeConfig(
+            repo_root=REPO_ROOT,
+            output_dir=tmp_path / 'sessions',
+            xense_sdk_version='1.x',
+        )
+    )
+    demo_dir = tmp_path / 'demo'
+    controller.demo_store = DemoStore(demo_dir)
+    controller.demo_started_ns = 1
+
+    controller._write_current_demo_manifest(status='failed', npz_paths={})
+
+    manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+    keys = list(manifest)
+    assert manifest['xense_sdk_version'] == '1.x'
+    assert keys[keys.index('run_id') + 1] == 'xense_sdk_version'
 
 
 def test_mock_runtime_start_discard_start_done_keeps_zmq_drain_after_discard(tmp_path, monkeypatch):

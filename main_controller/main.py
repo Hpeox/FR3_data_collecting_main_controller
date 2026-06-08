@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .buffers import DemoStore, JsonlLogger
-from .config import RuntimeConfig, ns_from_hz, validate_repo_root
+from .config import RuntimeConfig, XENSE_SDK_CONDA_ENVS, ns_from_hz, validate_repo_root
 from .drop_monitor import DropMonitor, DropWarning
 from .processes import ManagedProcess, bash_cmd
 from .realsense_metadata import RealSenseMetadataEvent, RealSenseMetadataMonitor
@@ -677,6 +677,7 @@ class MainController:
     def _start_processes(self) -> None:
         logs = self.output_dir / 'process_logs' / self.run_id
         root = self.config.repo_root
+        xense_conda_env = XENSE_SDK_CONDA_ENVS[self.config.xense_sdk_version]
         self.processes['ft300'] = ManagedProcess(
             'ft300',
             ['conda', 'run', '-n', 'modbus314', 'python', '-m', 'FT300S.app', '--uds-path', self.config.ft_uds_path, '--shm-name', self.config.ft_shm_name, '--fps', str(self.config.ft_fps)],
@@ -686,7 +687,7 @@ class MainController:
         )
         self.processes['xense'] = ManagedProcess(
             'xense',
-            ['conda', 'run', '-n', 'Xense310', 'python', '-m', 'XenseTacSensor.app', '--uds-path', self.config.xense_uds_path, '--shm-name', self.config.xense_shm_name, '--fps', str(self.config.xense_fps)],
+            ['conda', 'run', '-n', xense_conda_env, 'python', '-m', 'XenseTacSensor.app', '--uds-path', self.config.xense_uds_path, '--shm-name', self.config.xense_shm_name, '--fps', str(self.config.xense_fps)],
             root,
             logs / 'xense.log',
             on_exit=self._on_process_exit,
@@ -1083,6 +1084,7 @@ class MainController:
             'started_ns': self.demo_started_ns,
             'finished_ns': time.time_ns(),
             'run_id': self.run_id,
+            'xense_sdk_version': self.config.xense_sdk_version,
             'rosbag_uri': (
                 None
                 if self.rosbag_uri is None
@@ -1292,6 +1294,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--zmq-connect', default='tcp://127.0.0.1:6000')
     parser.add_argument('--output-dir', default=None)
     parser.add_argument('--startup-timeout-s', type=float, default=60.0)
+    parser.add_argument('--xense-sdk-version', choices=sorted(XENSE_SDK_CONDA_ENVS), default='2.0')
     parser.add_argument('--ack-timeout-s', type=float, default=2.0)
     parser.add_argument('--sensor-flush-timeout-s', type=_float_or_none, default=300.0)
     parser.add_argument('--progress-log-period-s', type=float, default=5.0)
@@ -1321,6 +1324,7 @@ def build_config(args: argparse.Namespace) -> RuntimeConfig:
     return RuntimeConfig(
         output_dir=output_dir,
         zmq_connect=args.zmq_connect,
+        xense_sdk_version=args.xense_sdk_version,
         startup_timeout_s=args.startup_timeout_s,
         ack_timeout_s=args.ack_timeout_s,
         sensor_flush_timeout_s=args.sensor_flush_timeout_s,

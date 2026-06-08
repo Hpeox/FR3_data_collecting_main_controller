@@ -336,6 +336,7 @@ def _config_args(**overrides):
         "repo_root": None,
         "output_dir": None,
         "zmq_connect": "tcp://127.0.0.1:6000",
+        "xense_sdk_version": "2.0",
         "startup_timeout_s": 60.0,
         "ack_timeout_s": 2.0,
         "sensor_flush_timeout_s": 300.0,
@@ -358,6 +359,7 @@ def test_build_config_uses_explicit_repo_root(tmp_path):
         _config_args(
             repo_root=str(REPO_ROOT),
             output_dir=str(tmp_path / "out"),
+            xense_sdk_version="1.x",
             realsense_image_ready_timeout_s=12.0,
             realsense_rosbag_count_skew_limit_percent=0.75,
             realsense_capture_mode="debug_degraded",
@@ -367,6 +369,7 @@ def test_build_config_uses_explicit_repo_root(tmp_path):
 
     assert config.repo_root == REPO_ROOT
     assert config.output_dir == (tmp_path / "out").resolve()
+    assert config.xense_sdk_version == "1.x"
     assert config.realsense_image_ready_timeout_s == 12.0
     assert config.realsense_rosbag_count_skew_limit_percent == 0.75
     assert config.realsense_capture_mode == "debug_degraded"
@@ -380,6 +383,12 @@ def test_build_config_uses_build_time_hint(monkeypatch):
 
     assert config.repo_root == REPO_ROOT
     assert config.output_dir == REPO_ROOT / "runtime_sessions"
+    assert config.xense_sdk_version == "2.0"
+
+
+def test_runtime_config_rejects_unknown_xense_sdk_version():
+    with pytest.raises(ValueError, match="unsupported xense_sdk_version"):
+        RuntimeConfig(repo_root=REPO_ROOT, xense_sdk_version="3.0")
 
 
 def test_realsense_formal_image_requirements_are_four_cameras_eight_topics():

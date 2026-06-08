@@ -21,6 +21,10 @@ REQUIRED_REALSENSE_LAUNCHES = (
     Path('RealSense') / 'launch' / 'four_realsense_640x480_30.launch.py',
     Path('RealSense') / 'launch' / 'rosbag2_recorder.launch.py',
 )
+XENSE_SDK_CONDA_ENVS = {
+    '1.x': 'Xense310',
+    '2.0': 'xense2',
+}
 
 
 def build_time_repo_root_hint() -> Path | None:
@@ -78,6 +82,7 @@ class RuntimeConfig:
     xense_shm_name: str = 'xense_sensor_frame'
     ft_fps: float = 100.0
     xense_fps: float = 30.0
+    xense_sdk_version: str = '2.0'
     startup_timeout_s: float = 60.0
     init_timeout_s: float = 15.0
     ack_timeout_s: float = 2.0
@@ -117,6 +122,9 @@ class RuntimeConfig:
     def __post_init__(self) -> None:
         """Normalize path settings after dataclass initialization."""
         repo_root = validate_repo_root(self.repo_root)
+        if self.xense_sdk_version not in XENSE_SDK_CONDA_ENVS:
+            allowed = ', '.join(sorted(XENSE_SDK_CONDA_ENVS))
+            raise ValueError(f'unsupported xense_sdk_version {self.xense_sdk_version!r}; expected one of: {allowed}')
         output_dir = (
             repo_root / 'runtime_sessions'
             if self.output_dir is None
