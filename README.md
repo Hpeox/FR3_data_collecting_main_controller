@@ -34,7 +34,7 @@ ros2 run main_controller main_controller -- \
   --output-dir ../runtime_sessions \
   --xense-sdk-version 2.0 \
   --sensor-flush-timeout-s 300 \
-  --alignment-base-source realsense
+  --alignment-base realsense:bundle
 ```
 
 其他参数可用：
@@ -116,21 +116,30 @@ rosbag record/resume 失败，MainController 会写入 `status: "failed"` 的轻
 - `manifest.json`：demo 保存摘要、`run_id`、`xense_sdk_version`、相对 demo 目录的 `.npz` / `rosbag_uri` 路径、相对仓库根的 `sensor_paths`（例如 `runtime_frames/<saved_file>`）、`frame_counts`、本 demo 丢帧统计、RealSense image readiness / rosbag post-check 和本 demo RealSense 重启记录。用户成功 discard 会写 lightweight manifest，`status: "discarded"` 且 `npz` 为空，不保存高频 `.npz`。active-demo abort 会写 `status: "failed"` 并保存已有 `.npz`。
 - `demos/demo_YYYYmmdd_HHMMSS/aligned/`：主控自动对齐输出目录，默认包含 `alignment_config.json`、`aligned_index.npz`、`aligned_manifest.json` 和 `alignment_report.md`。自动对齐不生成 `aligned_numeric.npz` 等实际训练数据文件。
 
-需要独立重跑或调参时，可在仓库根目录使用 `tools/align_demo_timestamps.py`：
+MainController 自动对齐使用显式 `--alignment-base`，默认 `realsense:bundle`。
+支持 `realsense:bundle`、`realsense:<topic>`、`xense:pair`、`robot` 和 `grid`。
+`realsense:bundle` 以多相机 visual bundle 作为目标时间轴；只有
+`realsense:<topic>` 会让 RealSense image streams 走 per-stream scalar matching。
+`xense:pair` 使用同一 raw row 的 `max(timestamp_ns_0, timestamp_ns_1)`，并保证
+`xense_0_*` 和 `xense_1_*` 投影自同一个 source row。可用
+`--alignment-start-trim-s` / `--alignment-end-trim-s` 裁掉全局 overlap 窗口首尾样本。
+
+需要独立重跑或调参时，可在仓库根目录使用 `tools/align_demo_timestamps_v3.py`：
 
 ```bash
-python tools/align_demo_timestamps.py \
+python tools/align_demo_timestamps_v3.py \
   --demo-dir runtime_sessions/demos/demo_YYYYmmdd_HHMMSS \
   --repo-root . \
-  --alignment-base-source realsense \
+  --base realsense:bundle \
   --mode causal \
   --start-trim-s 1.0
 ```
 
-对齐基准可以通过 `--alignment-base-source realsense|xense` 选择；手动工具也支持
-更精确的 `--base realsense:<topic>|xense:0|robot|grid`，且 `--base` 优先级更高。
-选择 Xense 作为基准时使用 `timestamp_ns_0`。对齐索引中 FT300S 字段使用
-`ft300s_*` key，报告中显示为 `FT300S`；Xense 两路触觉传感器分别输出
+`aligned_index.npz` 保存 `t_ns`、`segment_id`、`sample_valid`、各 stream 的
+`<stream>_index/time_ns/delta_ns/valid`，以及 bundle / pair 诊断字段；topic metadata
+保存在 `alignment_config.json` / `aligned_manifest.json`，不再作为 per-sample array
+写入 `aligned_index.npz`，RealSense `frame_number` 也不再作为对齐输出字段。对齐索引中
+FT300S 字段使用 `ft300s_*` key，报告中显示为 `FT300S`；Xense 两路触觉传感器分别输出
 `xense_0_*` 和 `xense_1_*`。
 
 TODO: materialize 实际训练数据暂不作为当前可用命令提供；需要先确认数据集具体组织格式。

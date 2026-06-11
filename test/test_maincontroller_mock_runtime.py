@@ -22,6 +22,7 @@ from main_controller.config import RuntimeConfig
 from main_controller.main import Command, ControllerState, MainController
 from main_controller.realsense_image_guard import ImageReadinessResult, ImageTopicBaseline, validate_rosbag_image_metadata
 from main_controller.realsense_metadata import RealSenseMetadataEvent
+import main_controller.timestamp_alignment as timestamp_alignment_module
 from main_controller.uds_client import MsgType
 from main_controller.zmq_telemetry import FRAME_STRUCT, MAGIC, VERSION
 import XenseTacSensor.protocol.messages as xense_protocol
@@ -254,13 +255,14 @@ class MockUdsSensor:
 
 
 class LocalZmqTelemetryPublisher:
-    def __init__(self, hz: float = 80.0, source: int = 1):
+    def __init__(self, hz: float = 80.0, source: int = 1, stamp_offset_s: float = 0.0):
         pytest.importorskip('zmq')
         import zmq
 
         self._zmq = zmq
         self.hz = hz
         self.source = source
+        self.stamp_offset_s = stamp_offset_s
         self.seq = 0
         self._stop = threading.Event()
         self._context = zmq.Context.instance()
@@ -293,7 +295,7 @@ class LocalZmqTelemetryPublisher:
                 self.source,
                 0,
                 self.seq,
-                time.time_ns() / 1_000_000_000.0,
+                time.time_ns() / 1_000_000_000.0 + self.stamp_offset_s,
                 1,
                 *floats,
                 0,
@@ -454,6 +456,26 @@ class FakeReceiver:
         self.stop_count += 1
 
 
+def fake_read_rosbag_image_streams(rosbag_uri: Path | None, topics: list[str], _warnings: list[str]):
+    if rosbag_uri is None or not topics:
+        return {}
+    demo_dir = rosbag_uri.parent
+    xense_path = demo_dir / 'xense_timestamps.npz'
+    if xense_path.exists():
+        xense = np.load(xense_path, allow_pickle=True)
+        times = np.maximum(xense['timestamp_ns_0'].astype(np.int64), xense['timestamp_ns_1'].astype(np.int64))
+    else:
+        base = time.time_ns()
+        times = np.asarray([base + index * 33_000_000 for index in range(3)], dtype=np.int64)
+    return {
+        topic: timestamp_alignment_module.RosbagImageStream(
+            times.copy(),
+            (times + 1_000).astype(np.int64, copy=False),
+        )
+        for topic in topics
+    }
+
+
 class MockRuntime:
     def __init__(self, tmp_path: Path, monkeypatch, **config_overrides):
         from main_controller import main as main_module
@@ -461,12 +483,14 @@ class MockRuntime:
         self.tmp_path = tmp_path
         self.ft300 = MockUdsSensor('ft300', tmp_path / 'ft300.sock', hz=100.0, protocol=ft300_protocol)
         self.xense = MockUdsSensor('xense', tmp_path / 'xense.sock', hz=30.0, protocol=xense_protocol)
-        self.zmq_pub = LocalZmqTelemetryPublisher(hz=80.0)
+        self.zmq_stamp_offset_s = float(config_overrides.pop('zmq_stamp_offset_s', 0.0))
+        self.zmq_pub = LocalZmqTelemetryPublisher(hz=80.0, stamp_offset_s=self.zmq_stamp_offset_s)
         self.rosbag = FakeRosbagControl()
         self.config_overrides = config_overrides
 
         monkeypatch.setattr(main_module, 'RealSenseMetadataMonitor', FakeRealSenseMetadataMonitor)
         monkeypatch.setattr(main_module, 'RosbagControl', lambda: self.rosbag)
+        monkeypatch.setattr(timestamp_alignment_module, 'read_rosbag_image_streams', fake_read_rosbag_image_streams)
 
         self.controller: MainController | None = None
         self._monkeypatch = monkeypatch
@@ -685,7 +709,8 @@ def test_mock_runtime_auto_alignment_success_with_short_trim(tmp_path, monkeypat
         manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'done'
         assert manifest['alignment']['status'] == 'done'
-        assert manifest['alignment']['base'].startswith('realsense:')
+        assert manifest['alignment']['base'] == 'realsense:bundle'
+        assert manifest['alignment']['base_kind'] == 'realsense_bundle'
         assert manifest['alignment']['config_path'] == 'aligned/alignment_config.json'
         assert manifest['alignment']['index_path'] == 'aligned/aligned_index.npz'
         assert manifest['alignment']['manifest_path'] == 'aligned/aligned_manifest.json'
@@ -700,6 +725,14 @@ def test_mock_runtime_auto_alignment_success_with_short_trim(tmp_path, monkeypat
         aligned_manifest = json.loads(
             (demo_dir / 'aligned' / 'aligned_manifest.json').read_text(encoding='utf-8')
         )
+        assert alignment_config['schema_version'] == 3
+        assert alignment_config['base'] == 'realsense:bundle'
+        assert alignment_config['realsense_alignment_kind'] == 'bundle'
+        assert alignment_config['xense_alignment_kind'] == 'same_row_pair'
+        assert aligned_manifest['schema_version'] == 3
+        assert aligned_manifest['base'] == 'realsense:bundle'
+        assert aligned_manifest['realsense_alignment_kind'] == 'bundle'
+        assert aligned_manifest['xense_alignment_kind'] == 'same_row_pair'
         assert aligned_manifest['demo_dir'] == '.'
         assert aligned_manifest['sources']['npz']['ft300'] == 'ft300_timestamps.npz'
         assert aligned_manifest['sources']['rosbag_uri'] == 'rosbag'
@@ -717,6 +750,17 @@ def test_mock_runtime_auto_alignment_success_with_short_trim(tmp_path, monkeypat
         assert len(t_ns) > 0
         assert len(aligned_index['segment_id']) == len(t_ns)
         assert len(aligned_index['sample_valid']) == len(t_ns)
+        assert 'realsense_bundle_valid' in aligned_index.files
+        assert 'realsense_bundle_mode_code' in aligned_index.files
+        assert aligned_index['realsense_bundle_mode_code'].dtype == np.dtype('uint8')
+        assert len(aligned_index['realsense_bundle_valid']) == len(t_ns)
+        assert len(aligned_index['realsense_bundle_mode_code']) == len(t_ns)
+        assert 'realsense_bundle_degraded' not in aligned_index.files
+        assert 'realsense_bundle_mode' not in aligned_index.files
+        assert 'realsense_bundle_resync' not in aligned_index.files
+        assert 'realsense_bundle_reused' not in aligned_index.files
+        assert not any(field.endswith('_topic') for field in aligned_index.files)
+        assert not any(field.endswith('_frame_number') for field in aligned_index.files)
         assert aligned_manifest['sample_count'] == len(t_ns)
         assert int(aligned_index['sample_valid'].sum()) == aligned_manifest['valid_count']
         assert aligned_manifest['valid_count'] == manifest['alignment']['valid_count']
@@ -725,11 +769,11 @@ def test_mock_runtime_auto_alignment_success_with_short_trim(tmp_path, monkeypat
         assert {'ft300s', 'xense_0', 'xense_1', 'zmq_source_1'}.issubset(streams)
         realsense_streams = [name for name in streams if name.startswith('realsense_')]
         assert realsense_streams
-        base_topic = manifest['alignment']['base'].split(':', 1)[1]
-        base_stream = next(
-            name for name, stream in streams.items() if stream.get('topic') == base_topic
+        assert alignment_config['realsense_details']['required_topics'] == (
+            manifest['realsense_rosbag_postcheck']['required_topics']
         )
-        assert base_stream in realsense_streams
+        for stream in realsense_streams:
+            assert streams[stream]['topic']
 
         for stream in streams:
             for suffix in ('index', 'time_ns', 'delta_ns', 'valid'):
@@ -740,10 +784,43 @@ def test_mock_runtime_auto_alignment_success_with_short_trim(tmp_path, monkeypat
                 aligned_index[f'{stream}_valid'].sum()
             )
 
-        assert f'{base_stream}_topic' in aligned_index.files
-        assert f'{base_stream}_frame_number' in aligned_index.files
-        assert len(aligned_index[f'{base_stream}_topic']) == len(t_ns)
-        assert len(aligned_index[f'{base_stream}_frame_number']) == len(t_ns)
+
+def test_mock_runtime_auto_alignment_large_zmq_offset_warns(tmp_path, monkeypatch, capsys):
+    with MockRuntime(
+        tmp_path,
+        monkeypatch,
+        alignment_start_trim_s=0.0,
+        zmq_stamp_offset_s=-0.150,
+    ) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+
+        emit_realsense_metadata(controller, frame_number=1)
+        time.sleep(0.05)
+        emit_realsense_metadata(controller, frame_number=2)
+        time.sleep(0.1)
+        controller.finish_demo()
+
+        captured = capsys.readouterr().out
+        warning_lines = [
+            line for line in captured.splitlines()
+            if 'ZMQ source 1 clock offset' in line and 'chronyc sources -v' in line
+        ]
+        assert len(warning_lines) == 1
+        assert warning_lines[0].startswith('[WARN] ')
+        assert '^*192.168.10.1' in warning_lines[0]
+
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'done'
+        assert manifest['alignment']['status'] == 'done'
+        offset = manifest['alignment']['zmq_clock_offsets']['zmq_source_1']
+        assert offset['source'] == 1
+        assert offset['offset_ms'] > 100.0
+        assert offset['frame_count'] > 0
+        assert manifest['alignment']['warnings'] == [
+            warning_lines[0].removeprefix('[WARN] ')
+        ]
 
 
 def test_mock_runtime_paused_finish_returns_to_wait_start(tmp_path, monkeypatch):

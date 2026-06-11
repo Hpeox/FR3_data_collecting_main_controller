@@ -88,10 +88,11 @@ class RuntimeConfig:
     ack_timeout_s: float = 2.0
     sensor_flush_timeout_s: float | None = 300.0
     progress_log_period_s: float = 5.0
-    alignment_base_source: str = 'realsense'
+    alignment_base: str = 'realsense:bundle'
     alignment_mode: str = 'causal'
     alignment_hz: float = 30.0
     alignment_start_trim_s: float = 2.0
+    alignment_end_trim_s: float = 0.0
     zmq_first_frame_timeout_s: float = 5.0
     rosbag_timeout_s: float = 15.0
     realsense_image_ready_timeout_s: float = 30.0

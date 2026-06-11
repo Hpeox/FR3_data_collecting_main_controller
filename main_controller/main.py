@@ -1115,17 +1115,20 @@ class MainController:
         demo_dir = self.demo_store.demo_dir
         options = AlignmentOptions(
             repo_root=self.config.repo_root,
-            base='auto',
-            alignment_base_source=self.config.alignment_base_source,
+            base=self.config.alignment_base,
             mode=self.config.alignment_mode,
             hz=self.config.alignment_hz,
             start_trim_s=self.config.alignment_start_trim_s,
+            end_trim_s=self.config.alignment_end_trim_s,
         )
         try:
             result = align_demo_timestamps(demo_dir, options)
             entry = result.to_manifest_entry(started_ns=started_ns, finished_ns=time.time_ns())
             update_manifest_alignment(manifest_path, entry)
             self.log('timestamp_alignment_done', **entry)
+            for warning in entry.get('warnings', []):
+                if isinstance(warning, str) and warning.startswith('ZMQ source ') and ' clock offset ' in warning:
+                    print(f'[WARN] {warning}')
         except Exception as exc:
             entry = failure_manifest_entry(started_ns, exc)
             update_manifest_alignment(manifest_path, entry)
@@ -1298,10 +1301,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--ack-timeout-s', type=float, default=2.0)
     parser.add_argument('--sensor-flush-timeout-s', type=_float_or_none, default=300.0)
     parser.add_argument('--progress-log-period-s', type=float, default=5.0)
-    parser.add_argument('--alignment-base-source', choices=['realsense', 'xense'], default='realsense')
+    parser.add_argument(
+        '--alignment-base',
+        default='realsense:bundle',
+        help='Explicit alignment base: realsense:bundle, realsense:<topic>, xense:pair, robot, or grid.',
+    )
     parser.add_argument('--alignment-mode', choices=['causal', 'nearest'], default='causal')
     parser.add_argument('--alignment-hz', type=float, default=30.0)
     parser.add_argument('--alignment-start-trim-s', type=float, default=2.0)
+    parser.add_argument('--alignment-end-trim-s', type=float, default=0.0)
     parser.add_argument('--realsense-image-ready-timeout-s', type=float, default=30.0)
     parser.add_argument('--realsense-rosbag-count-skew-limit-percent', type=float, default=0.5)
     parser.add_argument('--realsense-capture-mode', choices=['formal', 'debug_degraded'], default='formal')
@@ -1329,10 +1337,11 @@ def build_config(args: argparse.Namespace) -> RuntimeConfig:
         ack_timeout_s=args.ack_timeout_s,
         sensor_flush_timeout_s=args.sensor_flush_timeout_s,
         progress_log_period_s=args.progress_log_period_s,
-        alignment_base_source=args.alignment_base_source,
+        alignment_base=args.alignment_base,
         alignment_mode=args.alignment_mode,
         alignment_hz=args.alignment_hz,
         alignment_start_trim_s=args.alignment_start_trim_s,
+        alignment_end_trim_s=args.alignment_end_trim_s,
         realsense_image_ready_timeout_s=args.realsense_image_ready_timeout_s,
         realsense_rosbag_count_skew_limit_percent=args.realsense_rosbag_count_skew_limit_percent,
         realsense_capture_mode=args.realsense_capture_mode,

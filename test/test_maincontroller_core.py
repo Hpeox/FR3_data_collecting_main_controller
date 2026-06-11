@@ -341,10 +341,11 @@ def _config_args(**overrides):
         "ack_timeout_s": 2.0,
         "sensor_flush_timeout_s": 300.0,
         "progress_log_period_s": 5.0,
-        "alignment_base_source": "realsense",
+        "alignment_base": "realsense:bundle",
         "alignment_mode": "causal",
         "alignment_hz": 30.0,
         "alignment_start_trim_s": 2.0,
+        "alignment_end_trim_s": 0.0,
         "realsense_image_ready_timeout_s": 30.0,
         "realsense_rosbag_count_skew_limit_percent": 0.5,
         "realsense_capture_mode": "formal",
@@ -360,6 +361,8 @@ def test_build_config_uses_explicit_repo_root(tmp_path):
             repo_root=str(REPO_ROOT),
             output_dir=str(tmp_path / "out"),
             xense_sdk_version="1.x",
+            alignment_base="xense:pair",
+            alignment_end_trim_s=0.25,
             realsense_image_ready_timeout_s=12.0,
             realsense_rosbag_count_skew_limit_percent=0.75,
             realsense_capture_mode="debug_degraded",
@@ -370,6 +373,8 @@ def test_build_config_uses_explicit_repo_root(tmp_path):
     assert config.repo_root == REPO_ROOT
     assert config.output_dir == (tmp_path / "out").resolve()
     assert config.xense_sdk_version == "1.x"
+    assert config.alignment_base == "xense:pair"
+    assert config.alignment_end_trim_s == 0.25
     assert config.realsense_image_ready_timeout_s == 12.0
     assert config.realsense_rosbag_count_skew_limit_percent == 0.75
     assert config.realsense_capture_mode == "debug_degraded"
@@ -552,8 +557,7 @@ def test_read_rosbag_topic_metadata_uses_detected_storage_id(tmp_path, monkeypat
     }
 
 
-def test_timestamp_alignment_xense_base_uses_timestamp_ns_0(tmp_path):
-    demo_dir = tmp_path / "demo"
+def _write_timestamp_alignment_demo(demo_dir: Path, zmq_offset_ns: int = 0) -> np.ndarray:
     demo_dir.mkdir()
     t = np.asarray([1_000_000_000, 1_033_000_000, 1_066_000_000], dtype=np.int64)
     np.savez(demo_dir / "ft300_timestamps.npz", frame_id=np.arange(3), timestamp_ns=t - 1_000_000, recv_time_ns=t, recv_monotonic_ns=t)
@@ -573,7 +577,7 @@ def test_timestamp_alignment_xense_base_uses_timestamp_ns_0(tmp_path):
         demo_dir / "zmq_telemetry.npz",
         source=np.asarray([2, 2, 2]),
         seq=np.arange(3),
-        stamp_s=t.astype(float) / 1_000_000_000.0,
+        stamp_s=(t - zmq_offset_ns).astype(float) / 1_000_000_000.0,
         valid_mask=np.ones(3, dtype=np.uint64),
         floats_58=np.zeros((3, 58)),
         gripper_gPO=np.zeros(3, dtype=np.uint8),
@@ -591,17 +595,67 @@ def test_timestamp_alignment_xense_base_uses_timestamp_ns_0(tmp_path):
             "realsense": "realsense_metadata.npz",
             "zmq": "zmq_telemetry.npz",
         },
-        "realsense_image_readiness": {"required_topics": ["/cam1/camera/color/image_raw"]},
-        "realsense_rosbag_postcheck": {"required_topics": ["/cam1/camera/color/image_raw"]},
+        "realsense_image_readiness": {"required_topics": []},
+        "realsense_rosbag_postcheck": {"required_topics": []},
     }
     (demo_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return t
 
+
+def test_timestamp_alignment_xense_pair_base_uses_same_row_max(tmp_path):
+    demo_dir = tmp_path / "demo"
+    t = _write_timestamp_alignment_demo(demo_dir)
     result = align_demo_timestamps(
         demo_dir,
-        AlignmentOptions(repo_root=REPO_ROOT, alignment_base_source="xense", start_trim_s=0.0),
+        AlignmentOptions(repo_root=REPO_ROOT, base="xense:pair", start_trim_s=0.0),
     )
 
     index = np.load(result.index_path, allow_pickle=True)
-    np.testing.assert_array_equal(index["t_ns"], np.asarray([t[1]], dtype=np.int64))
-    assert result.base == "xense:0"
+    expected = np.asarray([t[0] + 6_000_000, t[1] + 6_000_000], dtype=np.int64)
+    np.testing.assert_array_equal(index["t_ns"], expected)
+    np.testing.assert_array_equal(index["t_ns"], index["xense_pair_time_ns"])
+    np.testing.assert_array_equal(index["xense_0_index"], index["xense_pair_source_index"])
+    np.testing.assert_array_equal(index["xense_1_index"], index["xense_pair_source_index"])
+    assert result.base == "xense:pair"
     assert np.all(index["ft300s_delta_ns"] <= 0)
+
+
+def test_timestamp_alignment_records_zmq_clock_offset_without_warning(tmp_path):
+    demo_dir = tmp_path / "demo"
+    offset_ns = 50_000_000
+    _write_timestamp_alignment_demo(demo_dir, zmq_offset_ns=offset_ns)
+
+    result = align_demo_timestamps(
+        demo_dir,
+        AlignmentOptions(repo_root=REPO_ROOT, base="xense:pair", start_trim_s=0.0),
+    )
+
+    aligned_manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    offset = aligned_manifest["zmq_clock_offsets"]["zmq_source_2"]
+    assert offset == {
+        "source": 2,
+        "offset_ms": 50.0,
+        "offset_ns": offset_ns,
+        "frame_count": 3,
+    }
+    assert result.to_manifest_entry(started_ns=1, finished_ns=2)["zmq_clock_offsets"] == aligned_manifest["zmq_clock_offsets"]
+    assert not any("clock offset" in warning for warning in aligned_manifest["warnings"])
+    assert "## ZMQ Clock Offsets" in result.report_path.read_text(encoding="utf-8")
+
+
+def test_timestamp_alignment_warns_on_large_zmq_clock_offset(tmp_path):
+    demo_dir = tmp_path / "demo"
+    offset_ns = 150_000_000
+    _write_timestamp_alignment_demo(demo_dir, zmq_offset_ns=offset_ns)
+
+    result = align_demo_timestamps(
+        demo_dir,
+        AlignmentOptions(repo_root=REPO_ROOT, base="xense:pair", start_trim_s=0.0),
+    )
+
+    aligned_manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert aligned_manifest["zmq_clock_offsets"]["zmq_source_2"]["offset_ms"] == 150.0
+    assert aligned_manifest["warnings"] == [
+        "ZMQ source 2 clock offset 150.000 ms exceeds 100.000 ms; "
+        "check chrony/NTP sync: run `chronyc sources -v`; expected first line: ^*192.168.10.1"
+    ]
