@@ -81,6 +81,15 @@ class ChildSource:
     source_index: np.ndarray
     columns: dict[str, np.ndarray] = field(default_factory=dict)
     details: dict[str, Any] = field(default_factory=dict)
+    row_valid: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if self.row_valid is None:
+            self.row_valid = np.ones(len(self.time_ns), dtype=bool)
+        else:
+            self.row_valid = np.asarray(self.row_valid, dtype=bool)
+        if len(self.row_valid) != len(self.time_ns):
+            raise ValueError(f'{self.name} row_valid length does not match time_ns length')
 
     def subset(self, indices: np.ndarray) -> 'ChildSource':
         return ChildSource(
@@ -90,6 +99,7 @@ class ChildSource:
             self.source_index[indices].astype(np.int64, copy=False),
             {key: value[indices] for key, value in self.columns.items()},
             dict(self.details),
+            self.row_valid[indices],
         )
 
 
@@ -104,6 +114,15 @@ class Source:
     columns: dict[str, np.ndarray] = field(default_factory=dict)
     children: dict[str, ChildSource] = field(default_factory=dict)
     details: dict[str, Any] = field(default_factory=dict)
+    row_valid: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if self.row_valid is None:
+            self.row_valid = np.ones(len(self.time_ns), dtype=bool)
+        else:
+            self.row_valid = np.asarray(self.row_valid, dtype=bool)
+        if len(self.row_valid) != len(self.time_ns):
+            raise ValueError(f'{self.name} row_valid length does not match time_ns length')
 
     def sorted_valid(self) -> 'Source':
         valid = self.time_ns > 0
@@ -119,6 +138,7 @@ class Source:
             {key: value[indices] for key, value in self.columns.items()},
             {key: child.subset(indices) for key, child in self.children.items()},
             dict(self.details),
+            self.row_valid[indices],
         )
 
     def trim(self, start_ns: int, end_ns: int) -> 'Source':
@@ -133,6 +153,7 @@ class Source:
             {key: value[keep] for key, value in self.columns.items()},
             {key: child.subset(keep) for key, child in self.children.items()},
             trim_details(self.details, self.source_index[keep]),
+            self.row_valid[keep],
         )
 
 
@@ -634,6 +655,7 @@ def align_realsense_group(
         stats,
         valid_masks,
         valid_output_name='realsense_bundle_valid',
+        project_invalid_rows=True,
     )
     details = dict(bundle_source.details)
     details['kind'] = 'bundle'
@@ -658,20 +680,22 @@ def emit_source(
     stats: dict[str, dict[str, Any]],
     valid_masks: list[np.ndarray],
     valid_output_name: str | None = None,
+    project_invalid_rows: bool = False,
 ) -> None:
     positions = source_match.position
     valid = source_match.valid
     present = positions >= 0
     matched = present & valid
+    project_present = present if project_invalid_rows else matched
     arrays[f'{source.name}_index'] = source_match.index
     arrays[f'{source.name}_time_ns'] = source_match.time_ns
     arrays[f'{source.name}_delta_ns'] = source_match.delta_ns
     arrays[f'{source.name}_valid'] = valid
     if valid_output_name:
         arrays[valid_output_name] = valid
-    arrays.update(project_columns(source.columns, positions, matched))
+    arrays.update(project_columns(source.columns, positions, project_present))
     for child in source.children.values():
-        emit_child_source(child, positions, matched, valid, t_ns, arrays, stats, valid_masks)
+        emit_child_source(child, positions, project_present, valid, t_ns, arrays, stats, valid_masks)
     valid_masks.append(valid)
     stats[source.name] = entity_stats(source.display_name, len(source.time_ns), source_match, source.details)
 
@@ -735,7 +759,7 @@ def project_child_match(
     position[matched] = positions[matched]
     time_ns[matched] = child.time_ns[positions[matched]]
     source_valid = np.zeros(len(t_ns), dtype=bool)
-    source_valid[matched] = child.time_ns[positions[matched]] > 0
+    source_valid[matched] = (child.time_ns[positions[matched]] > 0) & child.row_valid[positions[matched]]
     return Match(index, position, time_ns, time_ns - t_ns, parent_valid & matched & source_valid)
 
 
@@ -825,12 +849,10 @@ def build_realsense_bundle_source(
     modes: list[int] = []
     mode_labels: list[str] = []
     resync: list[bool] = []
-    reused: list[bool] = []
     current = initial
     current_mode = 0
     current_mode_label = 'initial_search'
     current_resync = False
-    current_reused = False
     last_t = -1
     while True:
         bundle_time = max(int(representative_sources[camera].time_ns[current[camera]]) for camera in cameras)
@@ -841,7 +863,6 @@ def build_realsense_bundle_source(
             modes.append(current_mode)
             mode_labels.append(current_mode_label)
             resync.append(current_resync)
-            reused.append(current_reused)
             last_t = bundle_time
         expected = {camera: current[camera] + 1 for camera in cameras}
         if any(expected[camera] >= len(representative_sources[camera].time_ns) for camera in cameras):
@@ -852,7 +873,6 @@ def build_realsense_bundle_source(
             current_mode = 1
             current_mode_label = 'locked_plus_one'
             current_resync = False
-            current_reused = False
             continue
         fallback = choose_local_bundle(cameras, representative_sources, expected, last_t, end_ns)
         if fallback is None:
@@ -860,7 +880,6 @@ def build_realsense_bundle_source(
             current_mode = 3
             current_mode_label = 'degraded_best_effort'
             current_resync = False
-            current_reused = False
             if max(int(representative_sources[camera].time_ns[current[camera]]) for camera in cameras) <= last_t:
                 break
             continue
@@ -868,7 +887,6 @@ def build_realsense_bundle_source(
         current_mode = 2
         current_mode_label = 'fallback_search'
         current_resync = True
-        current_reused = any(current[camera] <= selected_indices[-1][camera] for camera in cameras)
 
     if not selected_indices:
         return empty_source('realsense_bundle', 'RealSense visual bundle', 'realsense_bundle')
@@ -882,19 +900,18 @@ def build_realsense_bundle_source(
         dtype=np.int64,
     )
     degraded = bundle_span > REALSENSE_BUNDLE_SPAN_WARN_NS
-    quality = np.asarray(['degraded_span' if value else 'ok' for value in degraded], dtype='<U32')
     mode_code = np.asarray(modes, dtype=np.uint8)
     resync_array = np.asarray(resync, dtype=bool)
-    reused_array = np.asarray(reused, dtype=bool)
 
     arrays: dict[str, np.ndarray] = {
         'realsense_bundle_time_ns': bundle_time_ns,
         'realsense_bundle_span_ns': bundle_span,
         'realsense_bundle_mode_code': mode_code,
-        'realsense_bundle_quality': quality,
     }
     children: dict[str, ChildSource] = {}
     selected_recorded_times: list[np.ndarray] = []
+    bundle_row_valid = np.ones(len(bundle_time_ns), dtype=bool)
+    reused_row = np.zeros(len(bundle_time_ns), dtype=bool)
     for camera in cameras:
         rep_source = representative_sources[camera]
         rep_positions = np.asarray([indices[camera] for indices in selected_indices], dtype=np.int64)
@@ -904,33 +921,59 @@ def build_realsense_bundle_source(
         rep_times = rep_source.time_ns[rep_positions]
         for topic in camera_topics[camera]:
             source = sources[realsense_stream_name(topic)]
-            positions = nearest_positions_for_times(source.time_ns, rep_times)
-            deltas = np.abs(source.time_ns[positions] - rep_times)
-            mismatch_count = int(np.count_nonzero(deltas))
-            if mismatch_count:
+            if topic == representative_topics[camera]:
+                positions = rep_positions
+                has_causal = np.ones(len(rep_times), dtype=bool)
+            else:
+                positions, has_causal = causal_positions_for_times(source.time_ns, rep_times)
+            child_time_ns = np.full(len(rep_times), -1, dtype=np.int64)
+            child_time_ns[has_causal] = source.time_ns[positions[has_causal]]
+            child_source_index = np.full(len(rep_times), -1, dtype=np.int64)
+            child_source_index[has_causal] = source.source_index[positions[has_causal]]
+            exact_stamp = has_causal & (child_time_ns == rep_times)
+            invalid_count = int(np.count_nonzero(~exact_stamp))
+            if invalid_count:
+                missing_causal_count = int(np.count_nonzero(~has_causal))
+                stamp_mismatch_count = int(np.count_nonzero(has_causal & (child_time_ns != rep_times)))
                 warnings.append(
-                    f'RealSense bundle camera {camera} topic {topic} has {mismatch_count} frame(s) '
-                    'whose selected header stamp differs from the representative color stamp'
+                    f'RealSense bundle camera {camera} topic {topic} has {invalid_count} invalid frame(s): '
+                    f'{stamp_mismatch_count} header stamp mismatch, {missing_causal_count} missing causal frame'
                 )
+            bundle_row_valid &= exact_stamp
+            if len(child_source_index) > 1:
+                topic_reused = np.zeros(len(child_source_index), dtype=bool)
+                topic_reused[1:] = (child_source_index[1:] >= 0) & (child_source_index[1:] == child_source_index[:-1])
+                reused_row |= topic_reused
             child_columns = {
-                key: value[positions]
+                key: project_table_column(value, positions, has_causal)
                 for key, value in source.columns.items()
             }
             children[source.name] = ChildSource(
                 source.name,
                 source.display_name,
-                source.time_ns[positions],
-                source.source_index[positions],
+                child_time_ns,
+                child_source_index,
                 child_columns,
                 dict(source.details),
+                exact_stamp,
             )
-            selected_recorded_times.append(source.columns[f'{source.name}_recorded_time_ns'][positions])
+            selected_recorded_times.append(child_columns[f'{source.name}_recorded_time_ns'])
 
     recorded_stack = np.vstack(selected_recorded_times)
     recorded_time_ns = recorded_stack.max(axis=0).astype(np.int64, copy=False)
     recorded_span_ns = (recorded_stack.max(axis=0) - recorded_stack.min(axis=0)).astype(np.int64, copy=False)
+    recorded_valid = np.all(recorded_stack >= 0, axis=0)
+    recorded_time_ns[~recorded_valid] = -1
+    recorded_span_ns[~recorded_valid] = -1
     arrays['realsense_bundle_recorded_time_ns'] = recorded_time_ns
     arrays['realsense_bundle_recorded_span_ns'] = recorded_span_ns
+    invalid_timestamp_mismatch = ~bundle_row_valid
+    quality = np.where(
+        invalid_timestamp_mismatch,
+        'invalid_timestamp_mismatch',
+        np.where(degraded, 'degraded_span', 'ok'),
+    ).astype('<U32')
+    arrays['realsense_bundle_quality'] = quality
 
     details = {
         'kind': 'realsense_bundle',
@@ -943,7 +986,8 @@ def build_realsense_bundle_source(
         'quality_counts': value_counts(quality),
         'resync_count': int(resync_array.sum()),
         'degraded_count': int(degraded.sum()),
-        'reused_count': int(reused_array.sum()),
+        'invalid_timestamp_mismatch_count': int(invalid_timestamp_mismatch.sum()),
+        'reused_count': int(reused_row.sum()),
         'span_warn_ns': REALSENSE_BUNDLE_SPAN_WARN_NS,
     }
     return Source(
@@ -956,6 +1000,7 @@ def build_realsense_bundle_source(
         arrays,
         children,
         details,
+        bundle_row_valid,
     )
 
 
@@ -964,6 +1009,7 @@ def match_source(t_ns: np.ndarray, source: Source, mode: str) -> Match:
         t_ns,
         source.time_ns,
         source.source_index,
+        source.row_valid,
         source.tolerance_causal_ns,
         source.tolerance_nearest_ns,
         mode,
@@ -974,6 +1020,7 @@ def match_timestamps(
     t_ns: np.ndarray,
     source_time_ns: np.ndarray,
     source_index: np.ndarray,
+    source_row_valid: np.ndarray,
     tolerance_causal_ns: int,
     tolerance_nearest_ns: int,
     mode: str,
@@ -1002,7 +1049,9 @@ def match_timestamps(
     matched_time[valid_index] = source_time_ns[chosen[valid_index]]
     delta_ns = matched_time - t_ns
     tolerance = tolerance_causal_ns if mode == 'causal' else tolerance_nearest_ns
-    valid = valid_index & (np.abs(delta_ns) <= tolerance)
+    valid_row = np.zeros(len(t_ns), dtype=bool)
+    valid_row[valid_index] = source_row_valid[chosen[valid_index]]
+    valid = valid_index & valid_row & (np.abs(delta_ns) <= tolerance)
     if mode == 'causal':
         valid &= delta_ns <= 0
     index = np.full(len(t_ns), -1, dtype=np.int64)
@@ -1085,11 +1134,10 @@ def bundle_span_ns(cameras: list[str], sources: dict[str, Source], indices: dict
     return max(times) - min(times)
 
 
-def nearest_positions_for_times(stream_time_ns: np.ndarray, target_time_ns: np.ndarray) -> np.ndarray:
-    right = np.searchsorted(stream_time_ns, target_time_ns, side='left')
-    left = np.maximum(right - 1, 0)
-    right = np.minimum(right, len(stream_time_ns) - 1)
-    return np.where(np.abs(stream_time_ns[right] - target_time_ns) < np.abs(stream_time_ns[left] - target_time_ns), right, left).astype(np.int64)
+def causal_positions_for_times(stream_time_ns: np.ndarray, target_time_ns: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    positions = np.searchsorted(stream_time_ns, target_time_ns, side='right') - 1
+    valid = positions >= 0
+    return np.maximum(positions, 0).astype(np.int64), valid
 
 
 def numeric_summary(values: np.ndarray) -> dict[str, Any]:

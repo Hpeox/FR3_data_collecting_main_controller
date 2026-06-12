@@ -26,6 +26,7 @@ from main_controller.realsense_image_guard import (
     validate_rosbag_image_metadata,
 )
 from main_controller.realsense_metadata import RealSenseMetadataMonitor, metadata_int, metadata_ms_to_ns, metadata_str
+import main_controller.timestamp_alignment as timestamp_alignment_module
 from main_controller.timestamp_alignment import AlignmentOptions, align_demo_timestamps
 from main_controller.uds_client import UdsClient
 from main_controller.zmq_telemetry import (
@@ -557,7 +558,11 @@ def test_read_rosbag_topic_metadata_uses_detected_storage_id(tmp_path, monkeypat
     }
 
 
-def _write_timestamp_alignment_demo(demo_dir: Path, zmq_offset_ns: int = 0) -> np.ndarray:
+def _write_timestamp_alignment_demo(
+    demo_dir: Path,
+    zmq_offset_ns: int = 0,
+    required_realsense_topics: list[str] | None = None,
+) -> np.ndarray:
     demo_dir.mkdir()
     t = np.asarray([1_000_000_000, 1_033_000_000, 1_066_000_000], dtype=np.int64)
     np.savez(demo_dir / "ft300_timestamps.npz", frame_id=np.arange(3), timestamp_ns=t - 1_000_000, recv_time_ns=t, recv_monotonic_ns=t)
@@ -585,6 +590,7 @@ def _write_timestamp_alignment_demo(demo_dir: Path, zmq_offset_ns: int = 0) -> n
         recv_time_ns=t,
         recv_monotonic_ns=t,
     )
+    required_realsense_topics = required_realsense_topics or []
     manifest = {
         "status": "done",
         "rosbag_uri": "rosbag",
@@ -595,11 +601,152 @@ def _write_timestamp_alignment_demo(demo_dir: Path, zmq_offset_ns: int = 0) -> n
             "realsense": "realsense_metadata.npz",
             "zmq": "zmq_telemetry.npz",
         },
-        "realsense_image_readiness": {"required_topics": []},
+        "realsense_image_readiness": {"required_topics": required_realsense_topics},
         "realsense_rosbag_postcheck": {"required_topics": []},
     }
     (demo_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     return t
+
+
+_BUNDLE_COLOR_TOPIC = "/cam1/camera/color/image_raw"
+_BUNDLE_DEPTH_TOPIC = "/cam1/camera/aligned_depth_to_color/image_raw"
+
+
+def _patch_realsense_bundle_streams(monkeypatch, streams: dict[str, np.ndarray]) -> None:
+    def fake_read_rosbag_image_streams(rosbag_uri: Path | None, topics: list[str], _warnings: list[str]):
+        if rosbag_uri is None or not topics:
+            return {}
+        return {
+            topic: timestamp_alignment_module.RosbagImageStream(
+                np.asarray(streams[topic], dtype=np.int64),
+                (np.asarray(streams[topic], dtype=np.int64) + 1_000).astype(np.int64, copy=False),
+            )
+            for topic in topics
+        }
+
+    monkeypatch.setattr(timestamp_alignment_module, "read_rosbag_image_streams", fake_read_rosbag_image_streams)
+
+
+def test_realsense_bundle_exact_required_topic_stamps_remain_valid(tmp_path, monkeypatch):
+    demo_dir = tmp_path / "demo"
+    t = _write_timestamp_alignment_demo(
+        demo_dir,
+        required_realsense_topics=[_BUNDLE_COLOR_TOPIC, _BUNDLE_DEPTH_TOPIC],
+    )
+    _patch_realsense_bundle_streams(
+        monkeypatch,
+        {
+            _BUNDLE_COLOR_TOPIC: t,
+            _BUNDLE_DEPTH_TOPIC: t,
+        },
+    )
+
+    result = align_demo_timestamps(
+        demo_dir,
+        AlignmentOptions(repo_root=REPO_ROOT, base="realsense:bundle", start_trim_s=0.0),
+    )
+
+    index = np.load(result.index_path, allow_pickle=True)
+    depth_name = timestamp_alignment_module.realsense_stream_name(_BUNDLE_DEPTH_TOPIC)
+    assert np.all(index["realsense_bundle_valid"])
+    assert np.all(index[f"{depth_name}_valid"])
+    assert np.all(index["sample_valid"])
+    aligned_manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert aligned_manifest["realsense_details"]["quality_counts"] == {"ok": len(index["t_ns"])}
+
+
+def test_realsense_bundle_uses_causal_child_projection_and_invalidates_mismatch(tmp_path, monkeypatch):
+    demo_dir = tmp_path / "demo"
+    t = _write_timestamp_alignment_demo(
+        demo_dir,
+        required_realsense_topics=[_BUNDLE_COLOR_TOPIC, _BUNDLE_DEPTH_TOPIC],
+    )
+    depth_times = t + 5_000_000
+    _patch_realsense_bundle_streams(
+        monkeypatch,
+        {
+            _BUNDLE_COLOR_TOPIC: t,
+            _BUNDLE_DEPTH_TOPIC: depth_times,
+        },
+    )
+
+    result = align_demo_timestamps(
+        demo_dir,
+        AlignmentOptions(repo_root=REPO_ROOT, base="realsense:bundle", start_trim_s=0.0),
+    )
+
+    index = np.load(result.index_path, allow_pickle=True)
+    depth_name = timestamp_alignment_module.realsense_stream_name(_BUNDLE_DEPTH_TOPIC)
+    assert not np.any(index["realsense_bundle_valid"])
+    assert not np.any(index[f"{depth_name}_valid"])
+    assert not np.any(index["sample_valid"])
+    assert index[f"{depth_name}_time_ns"][0] == depth_times[0]
+    assert index[f"{depth_name}_time_ns"][0] <= index["realsense_bundle_time_ns"][0]
+    aligned_manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert aligned_manifest["realsense_details"]["quality_counts"] == {
+        "invalid_timestamp_mismatch": len(index["t_ns"])
+    }
+    assert aligned_manifest["realsense_details"]["invalid_timestamp_mismatch_count"] == len(index["t_ns"])
+    assert any("header stamp mismatch" in warning for warning in aligned_manifest["warnings"])
+
+
+def test_realsense_bundle_reuse_count_requires_same_topic_source_index_reuse(tmp_path, monkeypatch):
+    demo_dir = tmp_path / "demo"
+    t = _write_timestamp_alignment_demo(
+        demo_dir,
+        required_realsense_topics=[_BUNDLE_COLOR_TOPIC, _BUNDLE_DEPTH_TOPIC],
+    )
+    color_times = t - 10_000_000
+    _patch_realsense_bundle_streams(
+        monkeypatch,
+        {
+            _BUNDLE_COLOR_TOPIC: color_times,
+            _BUNDLE_DEPTH_TOPIC: np.asarray([color_times[0], color_times[-1] + 33_000_000], dtype=np.int64),
+        },
+    )
+
+    result = align_demo_timestamps(
+        demo_dir,
+        AlignmentOptions(repo_root=REPO_ROOT, base="realsense:bundle", start_trim_s=0.0),
+    )
+
+    index = np.load(result.index_path, allow_pickle=True)
+    depth_name = timestamp_alignment_module.realsense_stream_name(_BUNDLE_DEPTH_TOPIC)
+    np.testing.assert_array_equal(index[f"{depth_name}_index"], np.zeros(len(index["t_ns"]), dtype=np.int64))
+    aligned_manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert aligned_manifest["realsense_details"]["reused_count"] == max(len(index["t_ns"]) - 1, 0)
+    assert aligned_manifest["realsense_details"]["invalid_timestamp_mismatch_count"] == len(index["t_ns"])
+
+
+@pytest.mark.parametrize("base", ["xense:pair", "grid"])
+def test_external_base_realsense_bundle_projection_inherits_invalid_rows(tmp_path, monkeypatch, base):
+    demo_dir = tmp_path / "demo"
+    t = _write_timestamp_alignment_demo(
+        demo_dir,
+        required_realsense_topics=[_BUNDLE_COLOR_TOPIC, _BUNDLE_DEPTH_TOPIC],
+    )
+    _patch_realsense_bundle_streams(
+        monkeypatch,
+        {
+            _BUNDLE_COLOR_TOPIC: t,
+            _BUNDLE_DEPTH_TOPIC: t + 5_000_000,
+        },
+    )
+
+    result = align_demo_timestamps(
+        demo_dir,
+        AlignmentOptions(repo_root=REPO_ROOT, base=base, start_trim_s=0.0),
+    )
+
+    index = np.load(result.index_path, allow_pickle=True)
+    assert "realsense_bundle_valid" in index.files
+    assert not np.any(index["realsense_bundle_valid"])
+    assert not np.any(index["sample_valid"])
+    aligned_manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert aligned_manifest["realsense_alignment_kind"] == "bundle"
+    assert aligned_manifest["realsense_details"]["quality_counts"] == {
+        "invalid_timestamp_mismatch": aligned_manifest["realsense_details"]["bundle_count"]
+    }
 
 
 def test_timestamp_alignment_xense_pair_base_uses_same_row_max(tmp_path):
