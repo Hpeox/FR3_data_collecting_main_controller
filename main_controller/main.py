@@ -86,11 +86,12 @@ class MainController:
 
     def __init__(self, config: RuntimeConfig):
         self.config = config
-        self.output_dir = config.output_dir
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.runtime_sessions_dir = config.runtime_sessions_dir
+        self.runtime_sessions_dir.mkdir(parents=True, exist_ok=True)
+        self.config.runtime_frames_dir.mkdir(parents=True, exist_ok=True)
         self.run_id = time.strftime('run_%Y%m%d_%H%M%S')
         self.logger = JsonlLogger(
-            self.output_dir / f'controller_events_{self.run_id}.jsonl'
+            self.runtime_sessions_dir / f'controller_events_{self.run_id}.jsonl'
         )
         self.commands: queue.Queue[Command] = queue.Queue()
         self.state = ControllerState.BOOT
@@ -675,19 +676,19 @@ class MainController:
             self.stop_all()
 
     def _start_processes(self) -> None:
-        logs = self.output_dir / 'process_logs' / self.run_id
+        logs = self.runtime_sessions_dir / 'process_logs' / self.run_id
         root = self.config.repo_root
         xense_conda_env = XENSE_SDK_CONDA_ENVS[self.config.xense_sdk_version]
         self.processes['ft300'] = ManagedProcess(
             'ft300',
-            ['conda', 'run', '-n', 'modbus314', 'python', '-m', 'FT300S.app', '--uds-path', self.config.ft_uds_path, '--shm-name', self.config.ft_shm_name, '--fps', str(self.config.ft_fps)],
+            ['conda', 'run', '-n', 'modbus314', 'python', '-m', 'FT300S.app', '--uds-path', self.config.ft_uds_path, '--shm-name', self.config.ft_shm_name, '--fps', str(self.config.ft_fps), '--save-dir', str(self.config.runtime_frames_dir)],
             root,
             logs / 'ft300.log',
             on_exit=self._on_process_exit,
         )
         self.processes['xense'] = ManagedProcess(
             'xense',
-            ['conda', 'run', '-n', xense_conda_env, 'python', '-m', 'XenseTacSensor.app', '--uds-path', self.config.xense_uds_path, '--shm-name', self.config.xense_shm_name, '--fps', str(self.config.xense_fps)],
+            ['conda', 'run', '-n', xense_conda_env, 'python', '-m', 'XenseTacSensor.app', '--uds-path', self.config.xense_uds_path, '--shm-name', self.config.xense_shm_name, '--fps', str(self.config.xense_fps), '--save-dir', str(self.config.runtime_frames_dir)],
             root,
             logs / 'xense.log',
             on_exit=self._on_process_exit,
@@ -1114,7 +1115,7 @@ class MainController:
         started_ns = time.time_ns()
         demo_dir = self.demo_store.demo_dir
         options = AlignmentOptions(
-            repo_root=self.config.repo_root,
+            repo_root=self.config.runtime_root,
             base=self.config.alignment_base,
             mode=self.config.alignment_mode,
             hz=self.config.alignment_hz,
@@ -1190,7 +1191,7 @@ class MainController:
     def _new_demo_dir(self) -> Path:
         """Return a unique demo directory path for rapid repeated captures."""
         base = time.strftime('demo_%Y%m%d_%H%M%S')
-        demos_dir = self.output_dir / 'demos'
+        demos_dir = self.runtime_sessions_dir / 'demos'
         candidate = demos_dir / base
         if not candidate.exists():
             return candidate
@@ -1294,8 +1295,8 @@ def parse_args() -> argparse.Namespace:
     """Parse MainController CLI arguments."""
     parser = argparse.ArgumentParser(description='MainController for multi-sensor data collection')
     parser.add_argument('--repo-root', default=None)
+    parser.add_argument('--runtime-root', default=None)
     parser.add_argument('--zmq-connect', default='tcp://127.0.0.1:6000')
-    parser.add_argument('--output-dir', default=None)
     parser.add_argument('--startup-timeout-s', type=float, default=60.0)
     parser.add_argument('--xense-sdk-version', choices=sorted(XENSE_SDK_CONDA_ENVS), default='2.0')
     parser.add_argument('--ack-timeout-s', type=float, default=2.0)
@@ -1325,12 +1326,11 @@ def parse_args() -> argparse.Namespace:
 def build_config(args: argparse.Namespace) -> RuntimeConfig:
     """Build RuntimeConfig from CLI arguments."""
     repo_root = validate_repo_root(Path(args.repo_root)) if args.repo_root is not None else None
-    output_dir = None if args.output_dir is None else Path(args.output_dir)
     kwargs: dict[str, Any] = {}
     if repo_root is not None:
         kwargs['repo_root'] = repo_root
     return RuntimeConfig(
-        output_dir=output_dir,
+        runtime_root=None if args.runtime_root is None else Path(args.runtime_root),
         zmq_connect=args.zmq_connect,
         xense_sdk_version=args.xense_sdk_version,
         startup_timeout_s=args.startup_timeout_s,

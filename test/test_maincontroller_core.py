@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from main_controller.drop_monitor import DropMonitor
 import main_controller.config as config_module
 from main_controller.config import RuntimeConfig, validate_repo_root
-from main_controller.main import MainController, build_config
+from main_controller.main import MainController, build_config, parse_args
 from main_controller.processes import ManagedProcess
 from main_controller.realsense_image_guard import (
     check_ros_image_topic_readiness,
@@ -206,8 +206,12 @@ def test_uds_client_disconnect_callback_wakes_pending_ack():
 
 
 def test_sensor_path_from_payload_allows_missing_saved_file(tmp_path):
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / "sessions"))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
 
+    assert controller.runtime_sessions_dir == tmp_path / "runtime_sessions"
+    assert controller.runtime_sessions_dir.is_dir()
+    assert controller.config.runtime_frames_dir == tmp_path / "runtime_frames"
+    assert controller.config.runtime_frames_dir.is_dir()
     assert controller._sensor_path_from_payload({}) is None
     assert controller._sensor_path_from_payload({"saved_file": None}) is None
     assert controller._sensor_path_from_payload({"saved_file": "data_FT_demo.npy"}) == (
@@ -335,7 +339,7 @@ def test_repo_root_validation_rejects_missing_modules(tmp_path):
 def _config_args(**overrides):
     values = {
         "repo_root": None,
-        "output_dir": None,
+        "runtime_root": None,
         "zmq_connect": "tcp://127.0.0.1:6000",
         "xense_sdk_version": "2.0",
         "startup_timeout_s": 60.0,
@@ -360,7 +364,7 @@ def test_build_config_uses_explicit_repo_root(tmp_path):
     config = build_config(
         _config_args(
             repo_root=str(REPO_ROOT),
-            output_dir=str(tmp_path / "out"),
+            runtime_root=str(tmp_path / "runtime"),
             xense_sdk_version="1.x",
             alignment_base="xense:pair",
             alignment_end_trim_s=0.25,
@@ -372,7 +376,9 @@ def test_build_config_uses_explicit_repo_root(tmp_path):
     )
 
     assert config.repo_root == REPO_ROOT
-    assert config.output_dir == (tmp_path / "out").resolve()
+    assert config.runtime_root == (tmp_path / "runtime").resolve()
+    assert config.runtime_sessions_dir == (tmp_path / "runtime" / "runtime_sessions").resolve()
+    assert config.runtime_frames_dir == (tmp_path / "runtime" / "runtime_frames").resolve()
     assert config.xense_sdk_version == "1.x"
     assert config.alignment_base == "xense:pair"
     assert config.alignment_end_trim_s == 0.25
@@ -388,8 +394,29 @@ def test_build_config_uses_build_time_hint(monkeypatch):
     config = build_config(_config_args())
 
     assert config.repo_root == REPO_ROOT
-    assert config.output_dir == REPO_ROOT / "runtime_sessions"
+    assert config.runtime_root == REPO_ROOT
+    assert config.runtime_sessions_dir == REPO_ROOT / "runtime_sessions"
+    assert config.runtime_frames_dir == REPO_ROOT / "runtime_frames"
     assert config.xense_sdk_version == "2.0"
+
+
+def test_sensor_apps_accept_save_dir(monkeypatch, tmp_path):
+    from FT300S.app import parse_args as parse_ft300_args
+    from XenseTacSensor.app import parse_args as parse_xense_args
+
+    save_dir = tmp_path / "runtime_frames"
+    monkeypatch.setattr(sys, "argv", ["ft300", "--save-dir", str(save_dir)])
+    assert parse_ft300_args().save_dir == save_dir
+
+    monkeypatch.setattr(sys, "argv", ["xense", "--save-dir", str(save_dir)])
+    assert parse_xense_args().save_dir == save_dir
+
+
+def test_parse_args_rejects_removed_output_dir(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["main_controller", "--output-dir", "/tmp/sessions"])
+
+    with pytest.raises(SystemExit):
+        parse_args()
 
 
 def test_runtime_config_rejects_unknown_xense_sdk_version():

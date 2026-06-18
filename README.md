@@ -25,13 +25,25 @@ source install/setup.bash
 ros2 run main_controller main_controller
 ```
 
-常用参数：
+直接保存到代码仓库下的 `runtime_sessions/` 和 `runtime_frames/`：
 
 ```bash
 ros2 run main_controller main_controller -- \
-  --repo-root .. \
+  --repo-root /home/robot/Desktop/gello-deploy \
   --zmq-connect tcp://192.168.10.37:6000 \
-  --output-dir ../runtime_sessions \
+  --xense-sdk-version 2.0 \
+  --sensor-flush-timeout-s 300 \
+  --alignment-base realsense:bundle
+```
+
+保存到 `/data/external/runtime/runtime_sessions/` 和
+`/data/external/runtime/runtime_frames/`：
+
+```bash
+ros2 run main_controller main_controller -- \
+  --repo-root /home/robot/Desktop/gello-deploy \
+  --runtime-root /data/external/runtime \
+  --zmq-connect tcp://192.168.10.37:6000 \
   --xense-sdk-version 2.0 \
   --sensor-flush-timeout-s 300 \
   --alignment-base realsense:bundle
@@ -47,6 +59,9 @@ ros2 run main_controller main_controller -- --help
 repo-root hint。若 install tree 被移动，或在其他路径 / 机器运行，请通过
 `--repo-root PATH` 显式指定仓库根。MainController 作为集成仓库的一部分构建，
 不支持脱离同级 `FT300S`、`XenseTacSensor`、`RealSense` 模块独立 build。
+`--repo-root` 只表示集成代码仓库根目录。`--runtime-root` 表示运行数据根目录，
+并固定派生 `<runtime-root>/runtime_sessions` 和
+`<runtime-root>/runtime_frames`；未指定时默认使用 `repo-root`。
 `--xense-sdk-version` 使用 SDK 版本语义，允许 `1.x` 或 `2.0`，默认 `2.0`；
 主控内部映射为 `1.x -> Xense310`、`2.0 -> xense2` 的 conda 环境启动
 XenseTacSensor。
@@ -84,8 +99,8 @@ disconnect 或 required subprocess unexpected exit 会写 `status: "failed"` man
 timestamp alignment；异步 fatal 随后进入 `ERROR -> STOPPING -> STOPPED`。
 `STOP_REQ` ACK 中的 `saved_file` 是 optional diagnostic output，缺失时对应
 `sensor_paths` 为 `None`。该字段按正式协议只表示 basename / filename；MainController
-runtime 内部解析为仓库根目录下的 `runtime_frames/<saved_file>`，manifest 中只写
-repo-root 相对 `sensor_paths`。UDS peer disconnect 会唤醒 pending ACK wait 并把对应
+runtime 内部解析为 runtime root 下的 `runtime_frames/<saved_file>`，manifest 中只写
+runtime-root 相对 `sensor_paths`。UDS peer disconnect 会唤醒 pending ACK wait 并把对应
 command 标记为 `uds_disconnected`；有限 flush timeout 会记录 `ack_timeout` 和 timeout 秒数。
 当 `sensor_flush_timeout_s` 显式配置为 `none` / `unbounded` 时，不产生
 `ack_timeout`，等待只会被 ACK、对应 sensor `ERROR`、UDS disconnect 或进程停止唤醒。
@@ -105,7 +120,7 @@ rosbag record/resume 失败，MainController 会写入 `status: "failed"` 的轻
 
 ## 输出
 
-默认输出目录为仓库根目录下的 `runtime_sessions/`：
+输出目录固定为 `<runtime-root>/runtime_sessions/`；默认 runtime root 为代码仓库根目录：
 
 - `controller_events_run_YYYYmmdd_HHMMSS.jsonl`：主控状态、命令、告警、错误和保存记录。
 - `process_logs/run_YYYYmmdd_HHMMSS/`：FT300S、Xense、RealSense、rosbag2 子进程日志。
@@ -113,7 +128,7 @@ rosbag record/resume 失败，MainController 会写入 `status: "failed"` 的轻
 - `*.npz`：主控侧缓存的结构化数据，如 ZMQ、RealSense metadata、UDS frame 记录。
   `realsense_metadata.npz` 包含 metadata JSON 中的 `clock_domain`；如果单帧 metadata
   缺少该字段，会保存为空值并在 log/report 中告警，不会导致采集失败。
-- `manifest.json`：demo 保存摘要、`run_id`、`xense_sdk_version`、相对 demo 目录的 `.npz` / `rosbag_uri` 路径、相对仓库根的 `sensor_paths`（例如 `runtime_frames/<saved_file>`）、`frame_counts`、本 demo 丢帧统计、RealSense image readiness / rosbag post-check 和本 demo RealSense 重启记录。用户成功 discard 会写 lightweight manifest，`status: "discarded"` 且 `npz` 为空，不保存高频 `.npz`。active-demo abort 会写 `status: "failed"` 并保存已有 `.npz`。
+- `manifest.json`：demo 保存摘要、`run_id`、`xense_sdk_version`、相对 demo 目录的 `.npz` / `rosbag_uri` 路径、相对 runtime root 的 `sensor_paths`（例如 `runtime_frames/<saved_file>`）、`frame_counts`、本 demo 丢帧统计、RealSense image readiness / rosbag post-check 和本 demo RealSense 重启记录。用户成功 discard 会写 lightweight manifest，`status: "discarded"` 且 `npz` 为空，不保存高频 `.npz`。active-demo abort 会写 `status: "failed"` 并保存已有 `.npz`。
 - `demos/demo_YYYYmmdd_HHMMSS/aligned/`：主控自动对齐输出目录，默认包含 `alignment_config.json`、`aligned_index.npz`、`aligned_manifest.json` 和 `alignment_report.md`。自动对齐不生成 `aligned_numeric.npz` 等实际训练数据文件。
 
 MainController 自动对齐使用显式 `--alignment-base`，默认 `realsense:bundle`。

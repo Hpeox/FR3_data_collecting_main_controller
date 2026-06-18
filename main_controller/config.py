@@ -74,7 +74,9 @@ class RuntimeConfig:
     """Configuration values shared by controller components."""
 
     repo_root: Path = field(default_factory=default_repo_root)
-    output_dir: Path | None = None
+    runtime_root: Path | None = None
+    runtime_sessions_dir: Path = field(init=False)
+    runtime_frames_dir: Path = field(init=False)
     zmq_connect: str = 'tcp://127.0.0.1:6000'
     ft_uds_path: str = '/tmp/ft300_sensor.sock'
     xense_uds_path: str = '/tmp/xense_sensor.sock'
@@ -126,13 +128,15 @@ class RuntimeConfig:
         if self.xense_sdk_version not in XENSE_SDK_CONDA_ENVS:
             allowed = ', '.join(sorted(XENSE_SDK_CONDA_ENVS))
             raise ValueError(f'unsupported xense_sdk_version {self.xense_sdk_version!r}; expected one of: {allowed}')
-        output_dir = (
-            repo_root / 'runtime_sessions'
-            if self.output_dir is None
-            else Path(self.output_dir).expanduser().resolve()
+        runtime_root = (
+            repo_root
+            if self.runtime_root is None
+            else Path(self.runtime_root).expanduser().resolve()
         )
         object.__setattr__(self, 'repo_root', repo_root)
-        object.__setattr__(self, 'output_dir', output_dir)
+        object.__setattr__(self, 'runtime_root', runtime_root)
+        object.__setattr__(self, 'runtime_sessions_dir', runtime_root / 'runtime_sessions')
+        object.__setattr__(self, 'runtime_frames_dir', runtime_root / 'runtime_frames')
 
     @property
     def realsense_metadata_topics(self) -> tuple[str, ...]:

@@ -502,7 +502,7 @@ class MockRuntime:
 
         config = RuntimeConfig(
             repo_root=REPO_ROOT,
-            output_dir=self.tmp_path / 'sessions',
+            runtime_root=self.tmp_path,
             zmq_connect=self.zmq_pub.endpoint,
             ft_uds_path=str(self.tmp_path / 'ft300.sock'),
             xense_uds_path=str(self.tmp_path / 'xense.sock'),
@@ -651,11 +651,11 @@ def test_mock_runtime_start_pause_resume_done(tmp_path, monkeypatch):
         assert manifest['run_id'] == controller.run_id
         assert manifest['xense_sdk_version'] == '2.0'
         assert controller.logger.path == (
-            controller.output_dir / f'controller_events_{controller.run_id}.jsonl'
+            controller.runtime_sessions_dir / f'controller_events_{controller.run_id}.jsonl'
         )
         assert controller.logger.path.exists()
         assert not any(
-            path.name.startswith('session_') for path in controller.output_dir.iterdir()
+            path.name.startswith('session_') for path in controller.runtime_sessions_dir.iterdir()
         )
         assert 'sensor_saved_files' not in manifest
         assert manifest['sensor_paths']['ft300'] == (
@@ -894,7 +894,7 @@ def test_startup_failure_cleans_started_resources_and_reraises(tmp_path, monkeyp
     controller = MainController(
         RuntimeConfig(
             repo_root=REPO_ROOT,
-            output_dir=tmp_path / 'sessions',
+            runtime_root=tmp_path,
             ack_timeout_s=0.01,
             rosbag_timeout_s=0.01,
         )
@@ -957,7 +957,7 @@ def test_startup_ready_requires_realsense_metadata_monitor(tmp_path):
     controller = MainController(
         RuntimeConfig(
             repo_root=REPO_ROOT,
-            output_dir=tmp_path / 'sessions',
+            runtime_root=tmp_path,
             startup_timeout_s=0.01,
         )
     )
@@ -1007,7 +1007,7 @@ def test_start_processes_stops_earlier_processes_on_later_failure(tmp_path, monk
             self.stop_count += 1
 
     monkeypatch.setattr(main_module, 'ManagedProcess', FakeManagedProcess)
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
 
     with pytest.raises(RuntimeError, match='xense start failed'):
         controller._start_processes()
@@ -1016,9 +1016,11 @@ def test_start_processes_stops_earlier_processes_on_later_failure(tmp_path, monk
     assert by_name['ft300'].started
     assert by_name['ft300'].cwd == REPO_ROOT
     assert by_name['ft300'].log_path == (
-        controller.output_dir / 'process_logs' / controller.run_id / 'ft300.log'
+        controller.runtime_sessions_dir / 'process_logs' / controller.run_id / 'ft300.log'
     )
     assert by_name['xense'].cmd[:4] == ['conda', 'run', '-n', 'xense2']
+    assert by_name['ft300'].cmd[-2:] == ['--save-dir', str(tmp_path / 'runtime_frames')]
+    assert by_name['xense'].cmd[-2:] == ['--save-dir', str(tmp_path / 'runtime_frames')]
     assert by_name['ft300'].stop_count == 1
     assert by_name['xense'].stop_count == 0
     assert by_name['realsense_camera'].stop_count == 0
@@ -1068,7 +1070,7 @@ def test_start_processes_waits_for_xense_init_before_realsense(tmp_path, monkeyp
             events.append(f'{self.name}:stop')
 
     monkeypatch.setattr(main_module, 'ManagedProcess', FakeManagedProcess)
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
     controller.ft_client = FakeStartedUdsClient('ft300')
     controller.xense_client = FakeStartedUdsClient('xense')
 
@@ -1119,7 +1121,7 @@ def test_start_processes_maps_xense_sdk_1x_to_xense310(tmp_path, monkeypatch):
     controller = MainController(
         RuntimeConfig(
             repo_root=REPO_ROOT,
-            output_dir=tmp_path / 'sessions',
+            runtime_root=tmp_path,
             xense_sdk_version='1.x',
         )
     )
@@ -1132,7 +1134,7 @@ def test_start_processes_maps_xense_sdk_1x_to_xense310(tmp_path, monkeypatch):
 
 
 def test_realsense_nodes_up_wait_reads_all_camera_ready_lines(tmp_path):
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
     log_path = tmp_path / 'realsense_camera.log'
     log_path.write_text(
         '\n'.join(
@@ -1178,7 +1180,7 @@ def test_start_transaction_rolls_back_acked_sensor_on_later_sensor_error(tmp_pat
         assert controller.demo_store is None
         assert runtime.ft300.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
         assert runtime.xense.commands == ['START_REQ']
-        demo_dirs = sorted((controller.output_dir / 'demos').iterdir())
+        demo_dirs = sorted((controller.runtime_sessions_dir / 'demos').iterdir())
         assert len(demo_dirs) == 1
         manifest = json.loads((demo_dirs[0] / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'failed'
@@ -1278,7 +1280,7 @@ def test_rosbag_resume_failure_rolls_back_started_sensors_and_writes_failed_mani
         assert controller.demo_store is None
         assert runtime.ft300.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
         assert runtime.xense.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
-        demo_dirs = sorted((controller.output_dir / 'demos').iterdir())
+        demo_dirs = sorted((controller.runtime_sessions_dir / 'demos').iterdir())
         assert len(demo_dirs) == 1
         manifest = json.loads((demo_dirs[0] / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'failed'
@@ -1309,7 +1311,7 @@ def test_realsense_readiness_failure_blocks_formal_recording(tmp_path, monkeypat
         assert controller.demo_store is None
         assert runtime.ft300.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
         assert runtime.xense.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
-        demo_dirs = sorted((controller.output_dir / 'demos').iterdir())
+        demo_dirs = sorted((controller.runtime_sessions_dir / 'demos').iterdir())
         manifest = json.loads((demo_dirs[0] / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'failed'
         assert manifest['failure_stage'] == 'realsense_image_readiness'
@@ -1582,7 +1584,7 @@ def test_active_quit_writes_failed_manifest_saves_partial_npz_and_stops(tmp_path
 
 
 def test_active_abort_allows_missing_stop_saved_file(tmp_path):
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
     demo_dir = tmp_path / 'demo'
     controller.demo_store = DemoStore(demo_dir)
     controller.demo_store.ft300.append(frame_id=1, timestamp_ns=1, recv_time_ns=1, recv_monotonic_ns=1)
@@ -1613,7 +1615,7 @@ def test_active_abort_allows_missing_stop_saved_file(tmp_path):
     ],
 )
 def test_active_async_fatal_writes_failed_manifest_and_stops(tmp_path, command, payload, failure_stage):
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
     demo_dir = tmp_path / 'demo'
     controller.demo_store = DemoStore(demo_dir)
     controller.demo_store.zmq.append(source=1, seq=1, stamp_s=1.0, valid_mask=1, floats_58=tuple([0.0] * 58), gripper_gPO=0, gripper_gCU=0, recv_time_ns=1, recv_monotonic_ns=1)
@@ -1636,7 +1638,7 @@ def test_active_async_fatal_writes_failed_manifest_and_stops(tmp_path, command, 
 
 
 def test_zmq_warning_does_not_stop_controller(tmp_path):
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
     controller.set_state(ControllerState.COLLECTING)
 
     controller._on_zmq_error('invalid ZMQ frame: injected')
@@ -1645,7 +1647,7 @@ def test_zmq_warning_does_not_stop_controller(tmp_path):
 
 
 def test_zmq_fatal_stops_controller_and_cleans_resources(tmp_path):
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions', ack_timeout_s=0.01, rosbag_timeout_s=0.01))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path, ack_timeout_s=0.01, rosbag_timeout_s=0.01))
     fake_rosbag = FakeRosbagControl()
     fake_receiver = FakeReceiver()
     fake_monitor = FakeRealSenseMetadataMonitor((), lambda _event: None)
@@ -1683,7 +1685,7 @@ def test_stop_all_shuts_down_rclpy_context(tmp_path, monkeypatch):
             shutdown_calls.append(True)
 
     monkeypatch.setitem(sys.modules, 'rclpy', FakeRclpy)
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions', ack_timeout_s=0.01, rosbag_timeout_s=0.01))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path, ack_timeout_s=0.01, rosbag_timeout_s=0.01))
     controller.ft_client = FakeSensorClient('ft300')
     controller.xense_client = FakeSensorClient('xense')
     controller.set_state(ControllerState.WAIT_START)
@@ -1717,7 +1719,7 @@ def test_run_shutdowns_rclpy_context_after_stopped_state(tmp_path, monkeypatch):
 
     monkeypatch.setitem(sys.modules, 'rclpy', FakeRclpy)
     monkeypatch.setattr(main_module, 'InputThread', FakeInputThread)
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
     monkeypatch.setattr(controller, 'startup', lambda: controller.set_state(ControllerState.STOPPED))
 
     controller.run()
@@ -1739,7 +1741,7 @@ def test_main_forces_process_exit_after_clean_controller_return(tmp_path, monkey
             return
 
     monkeypatch.setattr(main_module, 'parse_args', lambda: object())
-    monkeypatch.setattr(main_module, 'build_config', lambda _args: RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    monkeypatch.setattr(main_module, 'build_config', lambda _args: RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
     monkeypatch.setattr(main_module, 'MainController', FakeController)
     monkeypatch.setattr(main_module.os, '_exit', lambda code: exits.append(code))
 
@@ -1749,7 +1751,7 @@ def test_main_forces_process_exit_after_clean_controller_return(tmp_path, monkey
 
 
 def test_realsense_metadata_fatal_stops_controller_and_cleans_resources(tmp_path):
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions', ack_timeout_s=0.01, rosbag_timeout_s=0.01))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path, ack_timeout_s=0.01, rosbag_timeout_s=0.01))
     fake_rosbag = FakeRosbagControl()
     fake_receiver = FakeReceiver()
     fake_monitor = FakeRealSenseMetadataMonitor((), lambda _event: None)
@@ -1813,7 +1815,7 @@ def test_mock_runtime_start_done_start_done_keeps_zmq_drain_between_demos(tmp_pa
 
 
 def test_demo_manifest_uses_per_demo_drop_monitor_stats(tmp_path):
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
     first_demo = tmp_path / 'demo1'
     controller.demo_store = DemoStore(first_demo)
     controller.demo_started_ns = 1
@@ -1840,7 +1842,7 @@ def test_demo_manifest_records_xense_sdk_version_after_run_id(tmp_path):
     controller = MainController(
         RuntimeConfig(
             repo_root=REPO_ROOT,
-            output_dir=tmp_path / 'sessions',
+            runtime_root=tmp_path,
             xense_sdk_version='1.x',
         )
     )
@@ -1898,7 +1900,7 @@ def test_mock_runtime_start_discard_start_done_keeps_zmq_drain_after_discard(tmp
 
 
 def test_realsense_fatal_pauses_collecting_and_restarts(tmp_path, monkeypatch):
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
     fake_rosbag = FakeRosbagControl()
     fake_process = FakeProcess()
     controller.ft_client = FakeSensorClient('ft300')
@@ -1931,7 +1933,7 @@ def test_realsense_fatal_pauses_collecting_and_restarts(tmp_path, monkeypatch):
 
 
 def test_realsense_fatal_ignores_stale_duplicate_after_restart(tmp_path, monkeypatch):
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
     fake_process = FakeProcess()
     controller.rosbag = FakeRosbagControl()
     controller.processes['realsense_camera'] = fake_process
@@ -1956,7 +1958,7 @@ def test_realsense_fatal_ignores_stale_duplicate_after_restart(tmp_path, monkeyp
 
 
 def test_realsense_fatal_does_not_restart_when_auto_pause_fails(tmp_path):
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
     demo_dir = tmp_path / 'demo'
     fake_rosbag = FakeRosbagControl()
     fake_rosbag.fail_methods.add('pause')
@@ -1980,7 +1982,7 @@ def test_realsense_fatal_does_not_restart_when_auto_pause_fails(tmp_path):
 
 
 def test_expected_process_exit_is_not_fatal(tmp_path):
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, output_dir=tmp_path / 'sessions'))
+    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
     controller.expected_process_exits.add('realsense_camera')
     controller.set_state(ControllerState.WAIT_START)
 
