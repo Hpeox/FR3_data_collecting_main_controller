@@ -17,7 +17,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from main_controller.drop_monitor import DropMonitor
 import main_controller.config as config_module
-from main_controller.config import RuntimeConfig, validate_repo_root
+from main_controller.config import (
+    RuntimeConfig as RuntimeConfigClass,
+    load_task_instruction_config,
+    parse_task_instruction_payload,
+    validate_repo_root,
+    validate_task_name,
+)
+import main_controller.main as main_module
 from main_controller.main import MainController, build_config, parse_args
 from main_controller.processes import ManagedProcess
 from main_controller.realsense_image_guard import (
@@ -40,6 +47,17 @@ from main_controller.zmq_telemetry import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
+TASK_NAME = "16mm-peg-in-hole"
+LANGUAGE_INSTRUCTION = "Pick up the test object"
+TASK_INSTRUCTIONS = (LANGUAGE_INSTRUCTION,)
+TASK_WEIGHTS = (1.0,)
+
+
+def RuntimeConfig(**kwargs):
+    kwargs.setdefault("task_name", TASK_NAME)
+    kwargs.setdefault("task_instructions", TASK_INSTRUCTIONS)
+    kwargs.setdefault("task_instruction_weights", TASK_WEIGHTS)
+    return RuntimeConfigClass(**kwargs)
 
 
 def test_managed_process_reports_one_fatal_per_matching_line(tmp_path):
@@ -206,7 +224,12 @@ def test_uds_client_disconnect_callback_wakes_pending_ack():
 
 
 def test_sensor_path_from_payload_allows_missing_saved_file(tmp_path):
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
+    controller = MainController(
+        RuntimeConfig(
+            repo_root=REPO_ROOT,
+            runtime_root=tmp_path,
+        )
+    )
 
     assert controller.runtime_sessions_dir == tmp_path / "runtime_sessions"
     assert controller.runtime_sessions_dir.is_dir()
@@ -340,6 +363,7 @@ def _config_args(**overrides):
     values = {
         "repo_root": None,
         "runtime_root": None,
+        "task_name": TASK_NAME,
         "zmq_connect": "tcp://127.0.0.1:6000",
         "xense_sdk_version": "2.0",
         "startup_timeout_s": 60.0,
@@ -360,7 +384,12 @@ def _config_args(**overrides):
     return argparse.Namespace(**values)
 
 
-def test_build_config_uses_explicit_repo_root(tmp_path):
+def test_build_config_uses_explicit_repo_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        main_module,
+        "load_task_instruction_config",
+        lambda repo_root, task_name: (TASK_INSTRUCTIONS, TASK_WEIGHTS),
+    )
     config = build_config(
         _config_args(
             repo_root=str(REPO_ROOT),
@@ -379,6 +408,9 @@ def test_build_config_uses_explicit_repo_root(tmp_path):
     assert config.runtime_root == (tmp_path / "runtime").resolve()
     assert config.runtime_sessions_dir == (tmp_path / "runtime" / "runtime_sessions").resolve()
     assert config.runtime_frames_dir == (tmp_path / "runtime" / "runtime_frames").resolve()
+    assert config.task_name == TASK_NAME
+    assert config.task_instructions == TASK_INSTRUCTIONS
+    assert config.task_instruction_weights == TASK_WEIGHTS
     assert config.xense_sdk_version == "1.x"
     assert config.alignment_base == "xense:pair"
     assert config.alignment_end_trim_s == 0.25
@@ -390,6 +422,11 @@ def test_build_config_uses_explicit_repo_root(tmp_path):
 
 def test_build_config_uses_build_time_hint(monkeypatch):
     monkeypatch.setattr(config_module, "build_time_repo_root_hint", lambda: REPO_ROOT)
+    monkeypatch.setattr(
+        main_module,
+        "load_task_instruction_config",
+        lambda repo_root, task_name: (TASK_INSTRUCTIONS, TASK_WEIGHTS),
+    )
 
     config = build_config(_config_args())
 
@@ -413,19 +450,201 @@ def test_sensor_apps_accept_save_dir(monkeypatch, tmp_path):
 
 
 def test_parse_args_rejects_removed_output_dir(monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["main_controller", "--output-dir", "/tmp/sessions"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main_controller",
+            "--task-name",
+            TASK_NAME,
+            "--output-dir",
+            "/tmp/sessions",
+        ],
+    )
 
     with pytest.raises(SystemExit):
         parse_args()
 
 
+def test_parse_args_requires_task_name(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["main_controller"])
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_parse_args_accepts_task_name(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["main_controller", "--task-name", TASK_NAME],
+    )
+
+    assert parse_args().task_name == TASK_NAME
+
+
+@pytest.mark.parametrize(
+    "task_name",
+    ["", ".hidden", "task/name", "task..name", "任务", "task name"],
+)
+def test_parse_args_rejects_invalid_task_name(monkeypatch, task_name):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["main_controller", "--task-name", task_name],
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            {
+                "instructions": [
+                    {"text": "first", "weight": 0.6},
+                    {"text": "second", "weight": -1},
+                ]
+            },
+            (0.6, 0.4),
+        ),
+        (
+            {
+                "instructions": [
+                    {"text": "first", "weight": 0.2},
+                    {"text": "second", "weight": -1},
+                    {"text": "third", "weight": -1},
+                ]
+            },
+            (0.2, 0.4, 0.4),
+        ),
+        (
+            {
+                "instructions": [
+                    {"text": "first", "weight": -1},
+                    {"text": "second", "weight": -1},
+                ]
+            },
+            (0.5, 0.5),
+        ),
+        (
+            {"instructions": [{"text": "only", "weight": -1}]},
+            (1.0,),
+        ),
+    ],
+)
+def test_parse_task_instruction_payload_resolves_weights(payload, expected):
+    texts, weights = parse_task_instruction_payload(payload)
+
+    assert texts == tuple(item["text"] for item in payload["instructions"])
+    assert weights == pytest.approx(expected)
+
+
+def test_parse_task_instruction_payload_accepts_explicit_sum():
+    texts, weights = parse_task_instruction_payload(
+        {
+            "instructions": [
+                {"text": "first", "weight": 0.25},
+                {"text": "second", "weight": 0.75},
+            ]
+        }
+    )
+
+    assert texts == ("first", "second")
+    assert weights == pytest.approx((0.25, 0.75))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"instructions": []},
+        {"instructions": [{"text": "first", "weight": 1.0}]},
+        {"instructions": [{"text": "", "weight": -1}]},
+        {"instructions": [{"text": "first", "weight": True}]},
+        {"instructions": [{"text": "first", "weight": float("nan")}]},
+        {"instructions": [{"text": "first", "weight": 0.6, "extra": 1}]},
+        {
+            "instructions": [
+                {"text": "first", "weight": 0.7},
+                {"text": "second", "weight": 0.4},
+                {"text": "third", "weight": -1},
+            ]
+        },
+    ],
+)
+def test_parse_task_instruction_payload_rejects_invalid_payload(payload):
+    with pytest.raises(RuntimeError):
+        parse_task_instruction_payload(payload)
+
+
+def test_load_task_instruction_config_uses_repo_root(tmp_path):
+    repo_root = tmp_path / "repo"
+    path = repo_root / "TaskInstruction" / f"{TASK_NAME}.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "instructions": [
+                    {"text": LANGUAGE_INSTRUCTION, "weight": -1}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_task_instruction_config(repo_root, TASK_NAME) == (
+        TASK_INSTRUCTIONS,
+        TASK_WEIGHTS,
+    )
+
+
+def test_load_task_instruction_config_rejects_missing_file(tmp_path):
+    with pytest.raises(RuntimeError, match="does not exist"):
+        load_task_instruction_config(tmp_path, TASK_NAME)
+
+
+@pytest.mark.parametrize(
+    ("content", "error"),
+    [
+        (b"\xff", "valid UTF-8"),
+        (b"{", "valid JSON"),
+        (json.dumps({"instructions": []}).encode("utf-8"), "non-empty array"),
+    ],
+)
+def test_load_task_instruction_config_rejects_invalid_file(
+    tmp_path,
+    content,
+    error,
+):
+    path = tmp_path / "TaskInstruction" / f"{TASK_NAME}.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(content)
+
+    with pytest.raises(RuntimeError, match=error):
+        load_task_instruction_config(tmp_path, TASK_NAME)
+
+
 def test_runtime_config_rejects_unknown_xense_sdk_version():
     with pytest.raises(ValueError, match="unsupported xense_sdk_version"):
-        RuntimeConfig(repo_root=REPO_ROOT, xense_sdk_version="3.0")
+        RuntimeConfig(
+            repo_root=REPO_ROOT,
+            xense_sdk_version="3.0",
+        )
+
+
+@pytest.mark.parametrize("task_name", [".hidden", "task..name", "task/name"])
+def test_runtime_config_rejects_invalid_task_name(task_name):
+    with pytest.raises((TypeError, ValueError), match="task_name"):
+        RuntimeConfig(repo_root=REPO_ROOT, task_name=task_name)
 
 
 def test_realsense_formal_image_requirements_are_four_cameras_eight_topics():
-    config = RuntimeConfig(repo_root=REPO_ROOT)
+    config = RuntimeConfig(
+        repo_root=REPO_ROOT,
+    )
     requirements = config.realsense_image_requirements
 
     assert config.realsense_capture_mode == "formal"
@@ -513,7 +732,10 @@ def test_realsense_image_readiness_uses_shallow_qos_and_destroys_ready_subscript
             elif self.calls == 2:
                 callbacks["/cam2/camera/color/image_raw"](FakeImage())
 
-    requirements = RuntimeConfig(repo_root=REPO_ROOT, cameras=("cam1", "cam2")).realsense_image_requirements[::2]
+    requirements = RuntimeConfig(
+        repo_root=REPO_ROOT,
+        cameras=("cam1", "cam2"),
+    ).realsense_image_requirements[::2]
     result = check_ros_image_topic_readiness(FakeNode(), FakeExecutor(), requirements, timeout_s=1.0, mode="formal")
 
     assert result.ok
@@ -523,7 +745,9 @@ def test_realsense_image_readiness_uses_shallow_qos_and_destroys_ready_subscript
 
 
 def test_realsense_rosbag_postcheck_detects_missing_and_skew(tmp_path):
-    config = RuntimeConfig(repo_root=REPO_ROOT)
+    config = RuntimeConfig(
+        repo_root=REPO_ROOT,
+    )
     requirements = config.realsense_image_requirements
     metadata = {
         requirement.topic: {"message_type": requirement.message_type, "count": 10}

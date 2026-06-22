@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from .realsense_image_guard import (
     ImageTopicRequirement,
@@ -25,6 +29,123 @@ XENSE_SDK_CONDA_ENVS = {
     '1.x': 'Xense310',
     '2.0': 'xense2',
 }
+TASK_NAME_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
+WEIGHT_SUM_ABS_TOL = 1e-9
+
+
+def validate_task_name(task_name: str) -> str:
+    """Validate and return a task name safe for use as one filename stem."""
+    if not isinstance(task_name, str):
+        raise TypeError('task_name must be a string')
+    if not TASK_NAME_PATTERN.fullmatch(task_name) or '..' in task_name:
+        raise ValueError(
+            'task_name must start with an ASCII letter or digit, contain only '
+            'ASCII letters, digits, ".", "_", or "-", and must not contain ".."'
+        )
+    return task_name
+
+
+def _instruction_text(value: Any, index: int) -> str:
+    if not isinstance(value, str):
+        raise RuntimeError(f'instructions[{index}].text must be a string')
+    text = value.strip()
+    if not text:
+        raise RuntimeError(f'instructions[{index}].text must not be empty')
+    if '\x00' in text:
+        raise RuntimeError(
+            f'instructions[{index}].text must not contain NUL characters'
+        )
+    return text
+
+
+def _instruction_weight(value: Any, index: int) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(f'instructions[{index}].weight must be a number')
+    weight = float(value)
+    if not math.isfinite(weight):
+        raise RuntimeError(f'instructions[{index}].weight must be finite')
+    if weight != -1.0 and not 0.0 < weight < 1.0:
+        raise RuntimeError(
+            f'instructions[{index}].weight must be -1 or satisfy 0 < weight < 1'
+        )
+    return weight
+
+
+def parse_task_instruction_payload(
+    payload: Any,
+) -> tuple[tuple[str, ...], tuple[float, ...]]:
+    """Validate a task instruction JSON payload and resolve automatic weights."""
+    if not isinstance(payload, dict) or set(payload) != {'instructions'}:
+        raise RuntimeError(
+            'task instruction JSON must be an object containing only "instructions"'
+        )
+    items = payload['instructions']
+    if not isinstance(items, list) or not items:
+        raise RuntimeError('task instruction "instructions" must be a non-empty array')
+
+    texts: list[str] = []
+    raw_weights: list[float] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict) or set(item) != {'text', 'weight'}:
+            raise RuntimeError(
+                f'instructions[{index}] must be an object containing only '
+                '"text" and "weight"'
+            )
+        texts.append(_instruction_text(item['text'], index))
+        raw_weights.append(_instruction_weight(item['weight'], index))
+
+    explicit_sum = sum(weight for weight in raw_weights if weight != -1.0)
+    automatic_count = sum(weight == -1.0 for weight in raw_weights)
+    if automatic_count:
+        if explicit_sum >= 1.0:
+            raise RuntimeError(
+                'explicit instruction weights must sum to less than 1 when '
+                'automatic weight entries are present'
+            )
+        automatic_weight = (1.0 - explicit_sum) / automatic_count
+        weights = tuple(
+            automatic_weight if weight == -1.0 else weight
+            for weight in raw_weights
+        )
+    else:
+        if not math.isclose(
+            explicit_sum,
+            1.0,
+            rel_tol=0.0,
+            abs_tol=WEIGHT_SUM_ABS_TOL,
+        ):
+            raise RuntimeError(
+                'explicit instruction weights must sum to 1 when no automatic '
+                'weight entries are present'
+            )
+        weights = tuple(raw_weights)
+    return tuple(texts), weights
+
+
+def load_task_instruction_config(
+    repo_root: Path,
+    task_name: str,
+) -> tuple[tuple[str, ...], tuple[float, ...]]:
+    """Load one task instruction file anchored at the integrated repo root."""
+    task_name = validate_task_name(task_name)
+    path = repo_root / 'TaskInstruction' / f'{task_name}.json'
+    if not path.exists():
+        raise RuntimeError(f'task instruction file does not exist: {path}')
+    if not path.is_file():
+        raise RuntimeError(f'task instruction path is not a file: {path}')
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(
+            f'task instruction file is not valid UTF-8: {path}'
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f'task instruction file is not valid JSON: {path}: {exc}'
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f'cannot read task instruction file {path}: {exc}') from exc
+    return parse_task_instruction_payload(payload)
 
 
 def build_time_repo_root_hint() -> Path | None:
@@ -73,6 +194,9 @@ class RateConfig:
 class RuntimeConfig:
     """Configuration values shared by controller components."""
 
+    task_name: str
+    task_instructions: tuple[str, ...]
+    task_instruction_weights: tuple[float, ...]
     repo_root: Path = field(default_factory=default_repo_root)
     runtime_root: Path | None = None
     runtime_sessions_dir: Path = field(init=False)
@@ -124,6 +248,33 @@ class RuntimeConfig:
 
     def __post_init__(self) -> None:
         """Normalize path settings after dataclass initialization."""
+        task_name = validate_task_name(self.task_name)
+        if not self.task_instructions:
+            raise ValueError('task_instructions must not be empty')
+        if len(self.task_instructions) != len(self.task_instruction_weights):
+            raise ValueError(
+                'task_instructions and task_instruction_weights must have equal length'
+            )
+        task_instructions = tuple(
+            _instruction_text(text, index)
+            for index, text in enumerate(self.task_instructions)
+        )
+        for index, weight in enumerate(self.task_instruction_weights):
+            if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+                raise TypeError(
+                    f'task_instruction_weights[{index}] must be a number'
+                )
+            if not math.isfinite(float(weight)) or float(weight) <= 0.0:
+                raise ValueError(
+                    f'task_instruction_weights[{index}] must be finite and positive'
+                )
+        if not math.isclose(
+            sum(float(weight) for weight in self.task_instruction_weights),
+            1.0,
+            rel_tol=0.0,
+            abs_tol=WEIGHT_SUM_ABS_TOL,
+        ):
+            raise ValueError('task_instruction_weights must sum to 1')
         repo_root = validate_repo_root(self.repo_root)
         if self.xense_sdk_version not in XENSE_SDK_CONDA_ENVS:
             allowed = ', '.join(sorted(XENSE_SDK_CONDA_ENVS))
@@ -132,6 +283,13 @@ class RuntimeConfig:
             repo_root
             if self.runtime_root is None
             else Path(self.runtime_root).expanduser().resolve()
+        )
+        object.__setattr__(self, 'task_name', task_name)
+        object.__setattr__(self, 'task_instructions', task_instructions)
+        object.__setattr__(
+            self,
+            'task_instruction_weights',
+            tuple(float(weight) for weight in self.task_instruction_weights),
         )
         object.__setattr__(self, 'repo_root', repo_root)
         object.__setattr__(self, 'runtime_root', runtime_root)

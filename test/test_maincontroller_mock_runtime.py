@@ -18,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
 import FT300S.protocol.messages as ft300_protocol
 from main_controller.buffers import DemoStore
-from main_controller.config import RuntimeConfig
+from main_controller.config import RuntimeConfig as RuntimeConfigClass
+import main_controller.main as main_module
 from main_controller.main import Command, ControllerState, MainController
 from main_controller.realsense_image_guard import ImageReadinessResult, ImageTopicBaseline, validate_rosbag_image_metadata
 from main_controller.realsense_metadata import RealSenseMetadataEvent
@@ -29,6 +30,15 @@ import XenseTacSensor.protocol.messages as xense_protocol
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
+TASK_NAME = '16mm-peg-in-hole'
+LANGUAGE_INSTRUCTION = 'Pick up the test object'
+
+
+def RuntimeConfig(**kwargs):
+    kwargs.setdefault('task_name', TASK_NAME)
+    kwargs.setdefault('task_instructions', (LANGUAGE_INSTRUCTION,))
+    kwargs.setdefault('task_instruction_weights', (1.0,))
+    return RuntimeConfigClass(**kwargs)
 
 
 def wait_for(predicate, timeout_s: float = 2.0) -> None:
@@ -607,6 +617,15 @@ def test_default_realsense_topics_are_four_cameras_eight_streams():
 
 
 def test_mock_runtime_start_pause_resume_done(tmp_path, monkeypatch):
+    choice_calls = []
+    monkeypatch.setattr(
+        main_module.random,
+        'choices',
+        lambda population, weights, k: (
+            choice_calls.append((tuple(population), tuple(weights), k))
+            or [LANGUAGE_INSTRUCTION]
+        ),
+    )
     with MockRuntime(tmp_path, monkeypatch) as runtime:
         controller = runtime.controller
         assert controller is not None
@@ -650,6 +669,9 @@ def test_mock_runtime_start_pause_resume_done(tmp_path, monkeypatch):
         assert manifest['status'] == 'done'
         assert manifest['run_id'] == controller.run_id
         assert manifest['xense_sdk_version'] == '2.0'
+        assert manifest['task_name'] == TASK_NAME
+        assert manifest['language_instruction'] == LANGUAGE_INSTRUCTION
+        assert choice_calls == [((LANGUAGE_INSTRUCTION,), (1.0,), 1)]
         assert controller.logger.path == (
             controller.runtime_sessions_dir / f'controller_events_{controller.run_id}.jsonl'
         )
@@ -1587,6 +1609,7 @@ def test_active_abort_allows_missing_stop_saved_file(tmp_path):
     controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
     demo_dir = tmp_path / 'demo'
     controller.demo_store = DemoStore(demo_dir)
+    controller.demo_language_instruction = LANGUAGE_INSTRUCTION
     controller.demo_store.ft300.append(frame_id=1, timestamp_ns=1, recv_time_ns=1, recv_monotonic_ns=1)
     controller.demo_started_ns = time.time_ns()
     controller.rosbag_uri = demo_dir / 'rosbag'
@@ -1618,6 +1641,7 @@ def test_active_async_fatal_writes_failed_manifest_and_stops(tmp_path, command, 
     controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
     demo_dir = tmp_path / 'demo'
     controller.demo_store = DemoStore(demo_dir)
+    controller.demo_language_instruction = LANGUAGE_INSTRUCTION
     controller.demo_store.zmq.append(source=1, seq=1, stamp_s=1.0, valid_mask=1, floats_58=tuple([0.0] * 58), gripper_gPO=0, gripper_gCU=0, recv_time_ns=1, recv_monotonic_ns=1)
     controller.demo_started_ns = time.time_ns()
     controller.rosbag_uri = demo_dir / 'rosbag'
@@ -1777,6 +1801,12 @@ def test_realsense_metadata_fatal_stops_controller_and_cleans_resources(tmp_path
 
 
 def test_mock_runtime_start_done_start_done_keeps_zmq_drain_between_demos(tmp_path, monkeypatch):
+    sampled = iter(['First instruction', 'Second instruction'])
+    monkeypatch.setattr(
+        main_module.random,
+        'choices',
+        lambda _population, weights, k: [next(sampled)],
+    )
     with MockRuntime(tmp_path, monkeypatch) as runtime:
         controller = runtime.controller
         assert controller is not None
@@ -1799,6 +1829,8 @@ def test_mock_runtime_start_done_start_done_keeps_zmq_drain_between_demos(tmp_pa
         second_manifest = json.loads((second_demo_dir / 'manifest.json').read_text(encoding='utf-8'))
         assert first_manifest['status'] == 'done'
         assert second_manifest['status'] == 'done'
+        assert first_manifest['language_instruction'] == 'First instruction'
+        assert second_manifest['language_instruction'] == 'Second instruction'
         first_zmq = np.load(first_demo_dir / 'zmq_telemetry.npz', allow_pickle=True)
         second_zmq = np.load(second_demo_dir / 'zmq_telemetry.npz', allow_pickle=True)
         assert len(first_zmq['seq']) > 0
@@ -1818,6 +1850,7 @@ def test_demo_manifest_uses_per_demo_drop_monitor_stats(tmp_path):
     controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
     first_demo = tmp_path / 'demo1'
     controller.demo_store = DemoStore(first_demo)
+    controller.demo_language_instruction = LANGUAGE_INSTRUCTION
     controller.demo_started_ns = 1
     controller.set_state(ControllerState.COLLECTING)
     controller._observe_drop('stream', 1, 1, 10.0)
@@ -1825,6 +1858,7 @@ def test_demo_manifest_uses_per_demo_drop_monitor_stats(tmp_path):
     controller._write_current_demo_manifest(status='failed', npz_paths={})
 
     controller.demo_store = DemoStore(tmp_path / 'demo2')
+    controller.demo_language_instruction = LANGUAGE_INSTRUCTION
     controller.demo_started_ns = 2
     controller.demo_drop_monitors = {}
     controller._observe_drop('stream', 4, 400_000_000, 10.0)
@@ -1838,24 +1872,31 @@ def test_demo_manifest_uses_per_demo_drop_monitor_stats(tmp_path):
     assert controller.drop_monitors['stream'].summary()['warning_count'] > 0
 
 
-def test_demo_manifest_records_xense_sdk_version_after_run_id(tmp_path):
+def test_demo_manifest_records_task_and_instruction_after_xense_sdk_version(tmp_path):
+    instruction = 'Place the object in the tray'
     controller = MainController(
         RuntimeConfig(
             repo_root=REPO_ROOT,
             runtime_root=tmp_path,
             xense_sdk_version='1.x',
+            task_instructions=(instruction,),
         )
     )
     demo_dir = tmp_path / 'demo'
     controller.demo_store = DemoStore(demo_dir)
     controller.demo_started_ns = 1
+    controller.demo_language_instruction = instruction
 
     controller._write_current_demo_manifest(status='failed', npz_paths={})
 
     manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
     keys = list(manifest)
     assert manifest['xense_sdk_version'] == '1.x'
+    assert manifest['task_name'] == TASK_NAME
+    assert manifest['language_instruction'] == instruction
     assert keys[keys.index('run_id') + 1] == 'xense_sdk_version'
+    assert keys[keys.index('xense_sdk_version') + 1] == 'task_name'
+    assert keys[keys.index('task_name') + 1] == 'language_instruction'
 
 
 def test_mock_runtime_start_discard_start_done_keeps_zmq_drain_after_discard(tmp_path, monkeypatch):
@@ -1871,6 +1912,8 @@ def test_mock_runtime_start_discard_start_done_keeps_zmq_drain_after_discard(tmp
         assert controller.demo_store is None
         discard_manifest = json.loads((discarded_demo_dir / 'manifest.json').read_text(encoding='utf-8'))
         assert discard_manifest['status'] == 'discarded'
+        assert discard_manifest['task_name'] == TASK_NAME
+        assert discard_manifest['language_instruction'] == LANGUAGE_INSTRUCTION
         assert discard_manifest['npz'] == {}
         assert discard_manifest['frame_counts']['ft300'] >= 4
         assert discard_manifest['frame_counts']['xense'] >= 1
@@ -1887,6 +1930,8 @@ def test_mock_runtime_start_discard_start_done_keeps_zmq_drain_after_discard(tmp
 
         manifest = json.loads((saved_demo_dir / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'done'
+        assert manifest['task_name'] == TASK_NAME
+        assert manifest['language_instruction'] == LANGUAGE_INSTRUCTION
         assert runtime.ft300.commands == ['START_REQ', 'DEMO_DISCARD_REQ', 'START_REQ', 'DEMO_DONE_REQ']
         assert runtime.xense.commands == ['START_REQ', 'DEMO_DISCARD_REQ', 'START_REQ', 'DEMO_DONE_REQ']
         assert runtime.rosbag.calls == [
@@ -1968,6 +2013,7 @@ def test_realsense_fatal_does_not_restart_when_auto_pause_fails(tmp_path):
     controller.rosbag = fake_rosbag
     controller.processes['realsense_camera'] = fake_process
     controller.demo_store = DemoStore(demo_dir)
+    controller.demo_language_instruction = LANGUAGE_INSTRUCTION
     controller.demo_started_ns = time.time_ns()
     controller.rosbag_uri = demo_dir / 'rosbag'
     controller.set_state(ControllerState.COLLECTING)

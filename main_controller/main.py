@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import queue
+import random
 import sys
 import threading
 import time
@@ -15,7 +16,15 @@ from pathlib import Path
 from typing import Any
 
 from .buffers import DemoStore, JsonlLogger
-from .config import RuntimeConfig, XENSE_SDK_CONDA_ENVS, ns_from_hz, validate_repo_root
+from .config import (
+    RuntimeConfig,
+    XENSE_SDK_CONDA_ENVS,
+    default_repo_root,
+    load_task_instruction_config,
+    ns_from_hz,
+    validate_repo_root,
+    validate_task_name,
+)
 from .drop_monitor import DropMonitor, DropWarning
 from .processes import ManagedProcess, bash_cmd
 from .realsense_metadata import RealSenseMetadataEvent, RealSenseMetadataMonitor
@@ -98,6 +107,7 @@ class MainController:
         self.state_lock = threading.RLock()
         self.demo_store: DemoStore | None = None
         self.demo_started_ns: int | None = None
+        self.demo_language_instruction: str | None = None
         self.queued_stop_after_finalizing = False
         self.rosbag_record_started = False
         self.rosbag_uri: Path | None = None
@@ -219,6 +229,11 @@ class MainController:
             demo_dir.mkdir(parents=True, exist_ok=True)
             self.demo_store = DemoStore(demo_dir)
             self.demo_started_ns = time.time_ns()
+            self.demo_language_instruction = random.choices(
+                self.config.task_instructions,
+                weights=self.config.task_instruction_weights,
+                k=1,
+            )[0]
             self.rosbag_record_started = False
             self.rosbag_uri = demo_dir / 'rosbag'
             self.sensor_paths = {}
@@ -228,7 +243,12 @@ class MainController:
             self.demo_drop_monitors = {}
             self.demo_realsense_restart_count = 0
             self.demo_realsense_restart_events = []
-            self.log('demo_created', demo_dir=str(demo_dir))
+            self.log(
+                'demo_created',
+                demo_dir=str(demo_dir),
+                task_name=self.config.task_name,
+                language_instruction=self.demo_language_instruction,
+            )
 
         required_sensors = [('ft300', self.ft_client), ('xense', self.xense_client)]
         rollback_target_sensors: list[tuple[str, UdsClient]] = [] if new_demo else list(required_sensors)
@@ -1080,12 +1100,16 @@ class MainController:
     ) -> Path | None:
         if self.demo_store is None:
             return None
+        if self.demo_language_instruction is None:
+            raise RuntimeError('current demo has no sampled language instruction')
         manifest = {
             'status': status,
             'started_ns': self.demo_started_ns,
             'finished_ns': time.time_ns(),
             'run_id': self.run_id,
             'xense_sdk_version': self.config.xense_sdk_version,
+            'task_name': self.config.task_name,
+            'language_instruction': self.demo_language_instruction,
             'rosbag_uri': (
                 None
                 if self.rosbag_uri is None
@@ -1291,9 +1315,22 @@ def _float_or_none(value: str) -> float | None:
     return float(value)
 
 
+def _task_name(value: str) -> str:
+    try:
+        return validate_task_name(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def parse_args() -> argparse.Namespace:
     """Parse MainController CLI arguments."""
     parser = argparse.ArgumentParser(description='MainController for multi-sensor data collection')
+    parser.add_argument(
+        '--task-name',
+        required=True,
+        type=_task_name,
+        help='Task name loaded from <repo-root>/TaskInstruction/<task-name>.json.',
+    )
     parser.add_argument('--repo-root', default=None)
     parser.add_argument('--runtime-root', default=None)
     parser.add_argument('--zmq-connect', default='tcp://127.0.0.1:6000')
@@ -1325,11 +1362,20 @@ def parse_args() -> argparse.Namespace:
 
 def build_config(args: argparse.Namespace) -> RuntimeConfig:
     """Build RuntimeConfig from CLI arguments."""
-    repo_root = validate_repo_root(Path(args.repo_root)) if args.repo_root is not None else None
-    kwargs: dict[str, Any] = {}
-    if repo_root is not None:
-        kwargs['repo_root'] = repo_root
+    repo_root = (
+        validate_repo_root(Path(args.repo_root))
+        if args.repo_root is not None
+        else default_repo_root()
+    )
+    task_instructions, task_instruction_weights = load_task_instruction_config(
+        repo_root,
+        args.task_name,
+    )
     return RuntimeConfig(
+        task_name=args.task_name,
+        task_instructions=task_instructions,
+        task_instruction_weights=task_instruction_weights,
+        repo_root=repo_root,
         runtime_root=None if args.runtime_root is None else Path(args.runtime_root),
         zmq_connect=args.zmq_connect,
         xense_sdk_version=args.xense_sdk_version,
@@ -1346,7 +1392,6 @@ def build_config(args: argparse.Namespace) -> RuntimeConfig:
         realsense_rosbag_count_skew_limit_percent=args.realsense_rosbag_count_skew_limit_percent,
         realsense_capture_mode=args.realsense_capture_mode,
         realsense_debug_image_topics=tuple(args.realsense_debug_image_topic),
-        **kwargs,
     )
 
 
