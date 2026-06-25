@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -807,6 +808,108 @@ def test_mock_runtime_auto_alignment_success_with_short_trim(tmp_path, monkeypat
             )
 
 
+def test_done_runs_gripper_plot_during_finalizing(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch, alignment_start_trim_s=0.0) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        runtime.start_and_wait_for_frames()
+        emit_realsense_metadata(controller, frame_number=1)
+        calls: list[str] = []
+
+        monkeypatch.setattr(
+            controller,
+            '_run_timestamp_alignment',
+            lambda _manifest_path: calls.append('alignment'),
+        )
+
+        def record_plot() -> None:
+            assert controller.get_state() == ControllerState.FINALIZING
+            calls.append('plot')
+
+        monkeypatch.setattr(controller, '_run_gripper_plot', record_plot)
+
+        controller.finish_demo()
+
+        assert calls == ['alignment', 'plot']
+        assert controller.get_state() == ControllerState.WAIT_START
+
+
+def test_gripper_plot_subprocess_success_logs_and_prints(tmp_path, monkeypatch, capsys):
+    controller = MainController(
+        RuntimeConfig(
+            repo_root=REPO_ROOT,
+            runtime_root=tmp_path,
+            gripper_plot_timeout_s=4.0,
+        )
+    )
+    controller.demo_store = DemoStore(tmp_path / 'demo')
+    calls: list[dict[str, Any]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append({'command': command, **kwargs})
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    'output_path': '/tmp/main_controller/gripper.png',
+                    'command_samples': 12,
+                    'feedback_samples': 7,
+                }
+            ),
+            stderr='',
+        )
+
+    monkeypatch.setattr(main_module.subprocess, 'run', fake_run)
+
+    controller._run_gripper_plot()
+
+    output = capsys.readouterr().out
+    assert '[gripper] plot saved: /tmp/main_controller/gripper.png' in output
+    assert calls[0]['command'][:3] == [
+        sys.executable,
+        '-m',
+        'main_controller.gripper_plot',
+    ]
+    assert calls[0]['timeout'] == 4.0
+    events = [
+        json.loads(line)
+        for line in controller.logger.path.read_text(encoding='utf-8').splitlines()
+    ]
+    assert events[-1]['event'] == 'gripper_plot_done'
+    assert events[-1]['command_samples'] == 12
+    assert events[-1]['feedback_samples'] == 7
+    controller.logger.close()
+
+
+def test_gripper_plot_subprocess_timeout_is_warning_only(tmp_path, monkeypatch, capsys):
+    controller = MainController(
+        RuntimeConfig(
+            repo_root=REPO_ROOT,
+            runtime_root=tmp_path,
+            gripper_plot_timeout_s=0.25,
+        )
+    )
+    controller.demo_store = DemoStore(tmp_path / 'demo')
+
+    def fake_run(command, **_kwargs):
+        raise subprocess.TimeoutExpired(command, 0.25)
+
+    monkeypatch.setattr(main_module.subprocess, 'run', fake_run)
+
+    controller._run_gripper_plot()
+
+    assert '[WARN] gripper plot failed: renderer timed out after 0.25s' in (
+        capsys.readouterr().out
+    )
+    events = [
+        json.loads(line)
+        for line in controller.logger.path.read_text(encoding='utf-8').splitlines()
+    ]
+    assert events[-1]['event'] == 'gripper_plot_failed'
+    controller.logger.close()
+
+
 def test_mock_runtime_auto_alignment_large_zmq_offset_warns(tmp_path, monkeypatch, capsys):
     with MockRuntime(
         tmp_path,
@@ -881,6 +984,12 @@ def test_mock_runtime_paused_discard_returns_to_wait_start(tmp_path, monkeypatch
         controller = runtime.controller
         assert controller is not None
         runtime.start_and_wait_for_frames()
+        plot_calls: list[bool] = []
+        monkeypatch.setattr(
+            controller,
+            '_run_gripper_plot',
+            lambda: plot_calls.append(True),
+        )
 
         assert controller.pause_demo(reason='test')
         assert controller.get_state() == ControllerState.PAUSED
@@ -891,6 +1000,7 @@ def test_mock_runtime_paused_discard_returns_to_wait_start(tmp_path, monkeypatch
         assert controller.demo_store is None
         assert runtime.ft300.commands == ['START_REQ', 'PAUSE_REQ', 'DEMO_DISCARD_REQ']
         assert runtime.xense.commands == ['START_REQ', 'PAUSE_REQ', 'DEMO_DISCARD_REQ']
+        assert plot_calls == []
 
 
 def test_uds_error_response_wakes_ack_waiter(tmp_path, monkeypatch):
@@ -1349,6 +1459,12 @@ def test_realsense_rosbag_postcheck_failure_stops_controller(tmp_path, monkeypat
         controller = runtime.controller
         assert controller is not None
         demo_dir = runtime.start_and_wait_for_frames()
+        plot_calls: list[bool] = []
+        monkeypatch.setattr(
+            controller,
+            '_run_gripper_plot',
+            lambda: plot_calls.append(True),
+        )
         requirements = controller.config.realsense_image_requirements
         runtime.rosbag.postcheck_topic_metadata = {
             requirement.topic: {'message_type': requirement.message_type, 'count': 10}
@@ -1370,6 +1486,7 @@ def test_realsense_rosbag_postcheck_failure_stops_controller(tmp_path, monkeypat
         assert manifest['realsense_rosbag_postcheck']['missing_topics'] == [requirements[-1].topic]
         assert manifest['npz']
         assert 'alignment' not in manifest
+        assert plot_calls == []
 
 
 def test_realsense_rosbag_postcheck_count_skew_reason_is_specific(tmp_path, monkeypatch):

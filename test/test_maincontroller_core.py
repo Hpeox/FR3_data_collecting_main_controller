@@ -26,6 +26,7 @@ from main_controller.config import (
 )
 import main_controller.main as main_module
 from main_controller.main import MainController, build_config, parse_args
+from main_controller.gripper_plot import load_gripper_series, render_gripper_plot
 from main_controller.processes import ManagedProcess
 from main_controller.realsense_image_guard import (
     check_ros_image_topic_readiness,
@@ -103,6 +104,55 @@ def test_zmq_unpack_frame_minimal():
     assert frame.floats_58[:3] == (0.0, 1.0, 2.0)
     assert frame.gripper_gPO == 12
     assert frame.gripper_gCU == 3
+
+
+def test_gripper_plot_uses_source_local_indices_and_command_mapping(tmp_path):
+    npz_path = tmp_path / 'zmq_telemetry.npz'
+    floats = np.full((6, 58), np.nan, dtype=np.float64)
+    floats[0, 7] = 0.0
+    floats[2, 7] = 0.25
+    floats[5, 7] = 1.0
+    np.savez(
+        npz_path,
+        source=np.array([1, 3, 1, 2, 3, 1], dtype=np.uint8),
+        floats_58=floats,
+        gripper_gPO=np.array([0, 10, 0, 0, 240, 0], dtype=np.uint8),
+        gripper_gCU=np.array([0, 1, 0, 0, 3, 0], dtype=np.uint8),
+    )
+
+    series = load_gripper_series(npz_path)
+
+    np.testing.assert_array_equal(series.command_index, [0, 1, 2])
+    np.testing.assert_allclose(series.mapped_command, [255.0, 191.25, 0.0])
+    np.testing.assert_array_equal(series.feedback_index, [0, 1])
+    np.testing.assert_array_equal(series.gpo, [10, 240])
+    np.testing.assert_array_equal(series.gcu, [1, 3])
+
+
+def test_gripper_plot_renders_png_and_atomically_overwrites(tmp_path):
+    npz_path = tmp_path / 'zmq_telemetry.npz'
+    output_path = tmp_path / 'gripper.png'
+    floats = np.full((4, 58), np.nan, dtype=np.float64)
+    floats[0, 7] = 0.2
+    floats[2, 7] = 0.8
+    np.savez(
+        npz_path,
+        source=np.array([1, 3, 1, 3], dtype=np.uint8),
+        floats_58=floats,
+        gripper_gPO=np.array([0, 20, 0, 220], dtype=np.uint8),
+        gripper_gCU=np.array([0, 1, 0, 3], dtype=np.uint8),
+    )
+    output_path.write_bytes(b'old-preview')
+
+    result = render_gripper_plot(npz_path, output_path)
+
+    assert output_path.read_bytes().startswith(b'\x89PNG\r\n\x1a\n')
+    assert result == {
+        'output_path': str(output_path),
+        'command_samples': 2,
+        'feedback_samples': 2,
+    }
+    assert not list(tmp_path.glob('.gripper.*.tmp.png'))
 
 
 def test_zmq_receiver_invalid_frame_is_nonfatal_and_receiver_continues():
@@ -375,6 +425,7 @@ def _config_args(**overrides):
         "alignment_hz": 30.0,
         "alignment_start_trim_s": 2.0,
         "alignment_end_trim_s": 0.0,
+        "gripper_plot_timeout_s": 30.0,
         "realsense_image_ready_timeout_s": 30.0,
         "realsense_rosbag_count_skew_limit_percent": 0.5,
         "realsense_capture_mode": "formal",
@@ -397,6 +448,7 @@ def test_build_config_uses_explicit_repo_root(tmp_path, monkeypatch):
             xense_sdk_version="1.x",
             alignment_base="xense:pair",
             alignment_end_trim_s=0.25,
+            gripper_plot_timeout_s=12.5,
             realsense_image_ready_timeout_s=12.0,
             realsense_rosbag_count_skew_limit_percent=0.75,
             realsense_capture_mode="debug_degraded",
@@ -414,6 +466,7 @@ def test_build_config_uses_explicit_repo_root(tmp_path, monkeypatch):
     assert config.xense_sdk_version == "1.x"
     assert config.alignment_base == "xense:pair"
     assert config.alignment_end_trim_s == 0.25
+    assert config.gripper_plot_timeout_s == 12.5
     assert config.realsense_image_ready_timeout_s == 12.0
     assert config.realsense_rosbag_count_skew_limit_percent == 0.75
     assert config.realsense_capture_mode == "debug_degraded"

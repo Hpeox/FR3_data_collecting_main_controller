@@ -51,7 +51,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
     ],
-    install_requires=['setuptools', 'numpy', 'pyzmq'],
+    install_requires=['setuptools', 'numpy', 'pyzmq', 'matplotlib'],
     zip_safe=True,
     maintainer='robot',
     maintainer_email='hpx.peipei@gmail.com',

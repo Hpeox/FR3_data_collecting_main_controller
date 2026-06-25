@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import queue
 import random
+import subprocess
 import sys
 import threading
 import time
@@ -33,6 +35,9 @@ from .timestamp_alignment import AlignmentOptions, align_demo_timestamps, failur
 from .uds_client import MAGIC as FT300_MAGIC
 from .uds_client import MsgType, UdsClient, UdsEvent
 from .zmq_telemetry import TelemetryFrame, ZmqTelemetryReceiver
+
+
+GRIPPER_PLOT_OUTPUT_PATH = Path('/tmp/main_controller/gripper.png')
 
 
 class ControllerState(Enum):
@@ -423,6 +428,7 @@ class MainController:
         manifest_path = self._save_current_demo(status=status, extra=extra)
         if status == 'done' and manifest_path is not None:
             self._run_timestamp_alignment(manifest_path)
+            self._run_gripper_plot()
         if command_failed or postcheck_failed:
             self.demo_store = None
             self.demo_started_ns = None
@@ -1160,6 +1166,84 @@ class MainController:
             self.log('timestamp_alignment_failed', **entry)
             print(f'[WARN] timestamp alignment failed: {exc}')
 
+    def _run_gripper_plot(self) -> None:
+        """Render the fixed gripper preview in an isolated Python process."""
+        if self.demo_store is None:
+            return
+        demo_dir = self.demo_store.demo_dir
+        npz_path = demo_dir / 'zmq_telemetry.npz'
+        output_path = GRIPPER_PLOT_OUTPUT_PATH
+        command = [
+            sys.executable,
+            '-m',
+            'main_controller.gripper_plot',
+            '--npz',
+            str(npz_path),
+            '--output',
+            str(output_path),
+        ]
+        env = os.environ.copy()
+        package_root = str(Path(__file__).resolve().parents[1])
+        existing_pythonpath = env.get('PYTHONPATH')
+        env['PYTHONPATH'] = (
+            package_root
+            if not existing_pythonpath
+            else f'{package_root}{os.pathsep}{existing_pythonpath}'
+        )
+        env.setdefault('MPLBACKEND', 'Agg')
+        env.setdefault('MPLCONFIGDIR', '/tmp/main-controller-matplotlib')
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=self.config.gripper_plot_timeout_s,
+                env=env,
+                check=False,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout).strip()
+                if len(detail) > 500:
+                    detail = detail[-500:]
+                raise RuntimeError(
+                    f'renderer exited with code {completed.returncode}'
+                    + (f': {detail}' if detail else '')
+                )
+            result = json.loads(completed.stdout.strip())
+            event = {
+                'demo_dir': str(demo_dir),
+                'output_path': str(output_path),
+                'command_samples': int(result['command_samples']),
+                'feedback_samples': int(result['feedback_samples']),
+            }
+            self.log('gripper_plot_done', **event)
+            print(
+                '[gripper] plot saved: '
+                f'{output_path} '
+                f"(command_samples={event['command_samples']}, "
+                f"feedback_samples={event['feedback_samples']})"
+            )
+        except subprocess.TimeoutExpired:
+            error = (
+                'renderer timed out after '
+                f'{self.config.gripper_plot_timeout_s:g}s'
+            )
+            self.log(
+                'gripper_plot_failed',
+                demo_dir=str(demo_dir),
+                output_path=str(output_path),
+                error=error,
+            )
+            print(f'[WARN] gripper plot failed: {error}')
+        except Exception as exc:
+            self.log(
+                'gripper_plot_failed',
+                demo_dir=str(demo_dir),
+                output_path=str(output_path),
+                error=str(exc),
+            )
+            print(f'[WARN] gripper plot failed: {exc}')
+
     def _run_realsense_rosbag_postcheck(self) -> dict[str, Any] | None:
         if self.rosbag is None or self.rosbag_uri is None:
             return None
@@ -1348,6 +1432,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--alignment-hz', type=float, default=30.0)
     parser.add_argument('--alignment-start-trim-s', type=float, default=2.0)
     parser.add_argument('--alignment-end-trim-s', type=float, default=0.0)
+    parser.add_argument('--gripper-plot-timeout-s', type=float, default=30.0)
     parser.add_argument('--realsense-image-ready-timeout-s', type=float, default=30.0)
     parser.add_argument('--realsense-rosbag-count-skew-limit-percent', type=float, default=0.5)
     parser.add_argument('--realsense-capture-mode', choices=['formal', 'debug_degraded'], default='formal')
@@ -1388,6 +1473,7 @@ def build_config(args: argparse.Namespace) -> RuntimeConfig:
         alignment_hz=args.alignment_hz,
         alignment_start_trim_s=args.alignment_start_trim_s,
         alignment_end_trim_s=args.alignment_end_trim_s,
+        gripper_plot_timeout_s=args.gripper_plot_timeout_s,
         realsense_image_ready_timeout_s=args.realsense_image_ready_timeout_s,
         realsense_rosbag_count_skew_limit_percent=args.realsense_rosbag_count_skew_limit_percent,
         realsense_capture_mode=args.realsense_capture_mode,

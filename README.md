@@ -6,7 +6,7 @@ MainController 是本项目的数据采集主控包。它作为 ROS2 `ament_pyth
 
 - 在 ROS2 Python 环境下运行；如果当前 shell 处于 conda 环境中，先执行 `conda deactivate`。
 - 系统 Python 需要可导入 `rclpy`、`rosbag2_interfaces`、`rosidl_runtime_py`、
-  `sensor_msgs`、`realsense2_camera_msgs`、`zmq`、`numpy`。
+  `sensor_msgs`、`realsense2_camera_msgs`、`zmq`、`numpy`、`matplotlib`。
 - ZMQ telemetry 是必需输入，默认连接地址为 `tcp://127.0.0.1:6000`。
 - FT300S 和 Xense 由主控启动对应 conda 环境进程；RealSense 和 rosbag2 由主控启动 ROS2 launch。
 - 启动阶段会先等待 FT300S / XenseTacSensor 完成 UDS 连接并发送 `INIT_READY`，
@@ -83,7 +83,8 @@ XenseTacSensor。
 - `d`：结束并保存当前 demo；主控会同时发送两个传感器 `DEMO_DONE_REQ` 并调用
   rosbag2 `stop`，随后等待传感器 flush ACK / `saved_file` 和 rosbag stop 结果。
   传感器 flush 默认有有限 timeout。采集保存完成后，
-  主控会自动生成对齐配置、索引和报告；对齐结束前不能开始下一次采集。操作者可用
+  主控会自动生成对齐配置、索引和报告，并从保存的 `zmq_telemetry.npz` 生成 gripper
+  预览图；对齐和绘图结束前不能开始下一次采集。操作者可用
   `--sensor-flush-timeout-s none` 或 `--sensor-flush-timeout-s unbounded`
   显式切到无界等待；这是为现场确实可能超长 flush 的传感器保留的预期模式，
   选择该模式即接受主控会一直等待对应 ACK / disconnect / ERROR 的行为。
@@ -138,6 +139,11 @@ rosbag record/resume 失败，MainController 会写入 `status: "failed"` 的轻
   缺少该字段，会保存为空值并在 log/report 中告警，不会导致采集失败。
 - `manifest.json`：demo 保存摘要、`run_id`、`xense_sdk_version`、`task_name`、`language_instruction`、相对 demo 目录的 `.npz` / `rosbag_uri` 路径、相对 runtime root 的 `sensor_paths`（例如 `runtime_frames/<saved_file>`）、`frame_counts`、本 demo 丢帧统计、RealSense image readiness / rosbag post-check 和本 demo RealSense 重启记录。任务字段顺序为 `xense_sdk_version`、`task_name`、`language_instruction`；instruction 是该 demo 创建时的抽样结果。用户成功 discard 会写 lightweight manifest，`status: "discarded"` 且 `npz` 为空，不保存高频 `.npz`。active-demo abort 会写 `status: "failed"` 并保存已有 `.npz`。
 - `demos/demo_YYYYmmdd_HHMMSS/aligned/`：主控自动对齐输出目录，默认包含 `alignment_config.json`、`aligned_index.npz`、`aligned_manifest.json` 和 `alignment_report.md`。自动对齐不生成 `aligned_numeric.npz` 等实际训练数据文件。
+- `/tmp/main_controller/gripper.png`：最近一个成功完成 demo 的 gripper 预览图。command
+  和反馈序列分别使用各自过滤后的局部 sample index；下一次成功 demo 会覆盖该文件。
+  绘图由独立 Python 子进程同步完成，默认 timeout 为 30 秒，可通过
+  `--gripper-plot-timeout-s` 调整。绘图失败只会在终端和 controller event log 中告警，
+  不会把已完成采集的 `done` 状态改为 `failed`。
 
 MainController 自动对齐使用显式 `--alignment-base`，默认 `realsense:bundle`。
 支持 `realsense:bundle`、`realsense:<topic>`、`xense:pair`、`robot` 和 `grid`。
