@@ -176,7 +176,7 @@ class MainController:
             self._wait_startup_ready()
             self.set_state(ControllerState.WAIT_START)
             self.log('ready')
-            print('MainController ready.')
+            self._print('MainController ready.')
         except Exception as exc:
             self.log('startup_failed', error=str(exc), stage=self.get_state().name)
             if self.get_state() != ControllerState.ERROR:
@@ -310,7 +310,7 @@ class MainController:
                 self.rosbag.resume(timeout_s=self.config.rosbag_timeout_s)
         except Exception as exc:
             self.log('rosbag_start_failed', action=rosbag_action, error=str(exc))
-            print(f'[ERROR] rosbag start/resume failed: {exc}')
+            self._print(f'[ERROR] rosbag start/resume failed: {exc}')
             self._fail_start_resume_transaction(
                 new_demo=new_demo,
                 failure_stage=f'rosbag_{rosbag_action or "start"}',
@@ -593,7 +593,7 @@ class MainController:
             self.log('realsense_restart_skipped', reason='stale_fatal_after_restart', **payload)
             return
         self.log('realsense_fatal_detected', **payload)
-        print(f"[WARN] RealSense fatal output: {payload.get('line')}")
+        self._print(f"[WARN] RealSense fatal output: {payload.get('line')}")
         if self.get_state() == ControllerState.COLLECTING:
             if not self.pause_demo(reason='realsense_fatal'):
                 self.log('realsense_restart_skipped', reason='auto_pause_failed')
@@ -636,7 +636,7 @@ class MainController:
     def handle_realsense_metadata_fatal(self, payload: dict[str, Any]) -> None:
         """Treat metadata receiver termination as an unrecoverable error."""
         self.log('realsense_metadata_fatal_detected', **payload)
-        print(f"[ERROR] RealSense metadata monitor fatal: {payload.get('message')}")
+        self._print(f"[ERROR] RealSense metadata monitor fatal: {payload.get('message')}")
         self._handle_unrecoverable_fatal(
             failure_stage='realsense_metadata_fatal',
             failure_reason=str(payload.get('message') or 'RealSense metadata monitor fatal'),
@@ -646,7 +646,7 @@ class MainController:
     def handle_zmq_fatal(self, payload: dict[str, Any]) -> None:
         """Treat receiver-loop termination as an unrecoverable controller error."""
         self.log('zmq_fatal_detected', **payload)
-        print(f"[ERROR] ZMQ receiver fatal: {payload.get('message')}")
+        self._print(f"[ERROR] ZMQ receiver fatal: {payload.get('message')}")
         self._handle_unrecoverable_fatal(
             failure_stage='zmq_fatal',
             failure_reason=str(payload.get('message') or 'ZMQ receiver fatal'),
@@ -885,7 +885,7 @@ class MainController:
     def _on_uds_event(self, event: UdsEvent) -> None:
         if event.msg_type == MsgType.ERROR:
             self.log('uds_error', sensor=event.client_name, frame_id=event.frame_id, payload=event.payload)
-            print(f'[WARN] {event.client_name} ERROR: {event.payload}')
+            self._print(f'[WARN] {event.client_name} ERROR: {event.payload}')
             return
         if event.msg_type != MsgType.FRAME_READY:
             self.log('uds_event', sensor=event.client_name, msg_type=event.msg_type.name, frame_id=event.frame_id, payload=event.payload)
@@ -911,7 +911,7 @@ class MainController:
 
     def _on_zmq_error(self, message: str) -> None:
         self.log('zmq_error', message=message)
-        print(f'[WARN] {message}')
+        self._print(f'[WARN] {message}')
 
     def _on_zmq_fatal(self, message: str) -> None:
         self.commands.put(Command('zmq_fatal', {'message': message, 'time_ns': time.time_ns()}))
@@ -951,7 +951,11 @@ class MainController:
     def _emit_drop_warning(self, warning: DropWarning) -> None:
         payload = warning.__dict__
         self.log('drop_warning', **payload)
-        print(f"[DROP] {warning.stream} {warning.reason} key={warning.previous_key}->{warning.current_key} interval_ns={warning.interval_ns}")
+        self._print(
+            f"[DROP] {warning.stream} {warning.reason} "
+            f"key={warning.previous_key}->{warning.current_key} "
+            f"interval_ns={warning.interval_ns}"
+        )
 
     def _sensor_command(self, client: UdsClient, msg_type: MsgType, cmd_name: str, timeout_s: float | None) -> dict[str, Any] | None:
         payload = client.send_and_wait_ack(msg_type, cmd_name, timeout_s)
@@ -1159,12 +1163,12 @@ class MainController:
             self.log('timestamp_alignment_done', **entry)
             for warning in entry.get('warnings', []):
                 if isinstance(warning, str) and warning.startswith('ZMQ source ') and ' clock offset ' in warning:
-                    print(f'[WARN] {warning}')
+                    self._print(f'[WARN] {warning}')
         except Exception as exc:
             entry = failure_manifest_entry(started_ns, exc)
             update_manifest_alignment(manifest_path, entry)
             self.log('timestamp_alignment_failed', **entry)
-            print(f'[WARN] timestamp alignment failed: {exc}')
+            self._print(f'[WARN] timestamp alignment failed: {exc}')
 
     def _run_gripper_plot(self) -> None:
         """Render the fixed gripper preview in an isolated Python process."""
@@ -1217,7 +1221,7 @@ class MainController:
                 'feedback_samples': int(result['feedback_samples']),
             }
             self.log('gripper_plot_done', **event)
-            print(
+            self._print(
                 '[gripper] plot saved: '
                 f'{output_path} '
                 f"(command_samples={event['command_samples']}, "
@@ -1234,7 +1238,7 @@ class MainController:
                 output_path=str(output_path),
                 error=error,
             )
-            print(f'[WARN] gripper plot failed: {error}')
+            self._print(f'[WARN] gripper plot failed: {error}')
         except Exception as exc:
             self.log(
                 'gripper_plot_failed',
@@ -1242,7 +1246,7 @@ class MainController:
                 output_path=str(output_path),
                 error=str(exc),
             )
-            print(f'[WARN] gripper plot failed: {exc}')
+            self._print(f'[WARN] gripper plot failed: {exc}')
 
     def _run_realsense_rosbag_postcheck(self) -> dict[str, Any] | None:
         if self.rosbag is None or self.rosbag_uri is None:
@@ -1351,11 +1355,15 @@ class MainController:
     def reject_command(self, command: str, state: ControllerState) -> None:
         """Log and print an invalid command for the current state."""
         self.log('command_rejected', command=command, state=state.name)
-        print(f'[WARN] command {command!r} ignored in state {state.name}')
+        self._print(f'[WARN] command {command!r} ignored in state {state.name}')
 
     def log(self, event_type: str, **payload: Any) -> None:
         """Write one controller event."""
         self.logger.event(event_type, state=self.get_state().name, **payload)
+
+    def _print(self, message: str) -> None:
+        """Print one controller message with the current state."""
+        print(f'[{self.get_state().name}] {message}')
 
     def set_state(self, state: ControllerState) -> None:
         """Set controller state and log transition."""
@@ -1364,7 +1372,7 @@ class MainController:
             self.state = state
         if previous != state:
             self.logger.event('state_transition', previous=previous.name, current=state.name)
-            print(f'[state] {previous.name} -> {state.name}')
+            self._print(f'[state] {previous.name} -> {state.name}')
 
     def get_state(self) -> ControllerState:
         """Return current controller state."""

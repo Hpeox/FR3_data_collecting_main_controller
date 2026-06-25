@@ -865,7 +865,7 @@ def test_gripper_plot_subprocess_success_logs_and_prints(tmp_path, monkeypatch, 
     controller._run_gripper_plot()
 
     output = capsys.readouterr().out
-    assert '[gripper] plot saved: /tmp/main_controller/gripper.png' in output
+    assert '[BOOT] [gripper] plot saved: /tmp/main_controller/gripper.png' in output
     assert calls[0]['command'][:3] == [
         sys.executable,
         '-m',
@@ -899,7 +899,7 @@ def test_gripper_plot_subprocess_timeout_is_warning_only(tmp_path, monkeypatch, 
 
     controller._run_gripper_plot()
 
-    assert '[WARN] gripper plot failed: renderer timed out after 0.25s' in (
+    assert '[BOOT] [WARN] gripper plot failed: renderer timed out after 0.25s' in (
         capsys.readouterr().out
     )
     events = [
@@ -907,6 +907,24 @@ def test_gripper_plot_subprocess_timeout_is_warning_only(tmp_path, monkeypatch, 
         for line in controller.logger.path.read_text(encoding='utf-8').splitlines()
     ]
     assert events[-1]['event'] == 'gripper_plot_failed'
+    controller.logger.close()
+
+
+def test_controller_console_output_includes_current_state(tmp_path, capsys):
+    controller = MainController(
+        RuntimeConfig(
+            repo_root=REPO_ROOT,
+            runtime_root=tmp_path,
+        )
+    )
+
+    controller._print('[WARN] example warning')
+    controller.set_state(ControllerState.WAIT_START)
+
+    assert capsys.readouterr().out.splitlines() == [
+        '[BOOT] [WARN] example warning',
+        '[WAIT_START] [state] BOOT -> WAIT_START',
+    ]
     controller.logger.close()
 
 
@@ -933,7 +951,7 @@ def test_mock_runtime_auto_alignment_large_zmq_offset_warns(tmp_path, monkeypatc
             if 'ZMQ source 1 clock offset' in line and 'chronyc sources -v' in line
         ]
         assert len(warning_lines) == 1
-        assert warning_lines[0].startswith('[WARN] ')
+        assert warning_lines[0].startswith('[FINALIZING] [WARN] ')
         assert '^*192.168.10.1' in warning_lines[0]
 
         manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
@@ -944,7 +962,7 @@ def test_mock_runtime_auto_alignment_large_zmq_offset_warns(tmp_path, monkeypatc
         assert offset['offset_ms'] > 100.0
         assert offset['frame_count'] > 0
         assert manifest['alignment']['warnings'] == [
-            warning_lines[0].removeprefix('[WARN] ')
+            warning_lines[0].removeprefix('[FINALIZING] [WARN] ')
         ]
 
 
