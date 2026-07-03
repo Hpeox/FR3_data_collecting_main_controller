@@ -26,7 +26,7 @@ from main_controller.config import (
 )
 import main_controller.main as main_module
 from main_controller.main import MainController, build_config, parse_args
-from main_controller.gripper_plot import load_gripper_series, render_gripper_plot
+from main_controller.gripper_plot import load_gripper_series, load_tactile_preview, render_gripper_plot
 from main_controller.processes import ManagedProcess
 from main_controller.realsense_image_guard import (
     check_ros_image_topic_readiness,
@@ -147,12 +147,73 @@ def test_gripper_plot_renders_png_and_atomically_overwrites(tmp_path):
     result = render_gripper_plot(npz_path, output_path)
 
     assert output_path.read_bytes().startswith(b'\x89PNG\r\n\x1a\n')
-    assert result == {
-        'output_path': str(output_path),
-        'command_samples': 2,
-        'feedback_samples': 2,
-    }
+    assert result['output_path'] == str(output_path)
+    assert result['command_samples'] == 2
+    assert result['feedback_samples'] == 2
+    assert result['tactile_preview_ok'] is False
     assert not list(tmp_path.glob('.gripper.*.tmp.png'))
+
+
+def test_gripper_plot_renders_tactile_preview_and_deletes_preview(tmp_path):
+    npz_path = tmp_path / 'zmq_telemetry.npz'
+    output_path = tmp_path / 'gripper.png'
+    preview_path = tmp_path / 'tactile_preview.npz'
+    floats = np.full((4, 58), np.nan, dtype=np.float64)
+    floats[0, 7] = 0.2
+    floats[2, 7] = 0.8
+    np.savez(
+        npz_path,
+        source=np.array([1, 3, 1, 3], dtype=np.uint8),
+        floats_58=floats,
+        gripper_gPO=np.array([0, 20, 0, 220], dtype=np.uint8),
+        gripper_gCU=np.array([0, 1, 0, 3], dtype=np.uint8),
+    )
+    force_resultant = np.zeros((2, 3, 6), dtype=np.float64)
+    force_resultant[0, :, 0] = [0.1, 0.2, 0.3]
+    force_resultant[1, :, 5] = [1.0, 1.1, 1.2]
+    np.savez(
+        preview_path,
+        sensor_ids=np.array(['OG000544', 'OG001009']),
+        frame_index=np.arange(3, dtype=np.int64),
+        force_resultant=force_resultant,
+        edge_warning=np.array([False, True]),
+        edge_max=np.array([0.3, 1.2]),
+    )
+
+    loaded = load_tactile_preview(preview_path)
+    assert loaded.sensor_ids == ('OG000544', 'OG001009')
+
+    result = render_gripper_plot(npz_path, output_path, preview_path)
+
+    assert output_path.read_bytes().startswith(b'\x89PNG\r\n\x1a\n')
+    assert result['tactile_preview_ok'] is True
+    assert result['tactile_samples'] == 3
+    assert result['tactile_sensor_ids'] == ['OG000544', 'OG001009']
+    assert not preview_path.exists()
+
+
+def test_gripper_plot_bad_tactile_preview_falls_back_and_deletes_preview(tmp_path):
+    npz_path = tmp_path / 'zmq_telemetry.npz'
+    output_path = tmp_path / 'gripper.png'
+    preview_path = tmp_path / 'bad_preview.npz'
+    floats = np.full((4, 58), np.nan, dtype=np.float64)
+    floats[0, 7] = 0.2
+    floats[2, 7] = 0.8
+    np.savez(
+        npz_path,
+        source=np.array([1, 3, 1, 3], dtype=np.uint8),
+        floats_58=floats,
+        gripper_gPO=np.array([0, 20, 0, 220], dtype=np.uint8),
+        gripper_gCU=np.array([0, 1, 0, 3], dtype=np.uint8),
+    )
+    preview_path.write_bytes(b'not an npz')
+
+    result = render_gripper_plot(npz_path, output_path, preview_path)
+
+    assert output_path.read_bytes().startswith(b'\x89PNG\r\n\x1a\n')
+    assert result['tactile_preview_ok'] is False
+    assert 'tactile_preview_error' in result
+    assert not preview_path.exists()
 
 
 def test_zmq_receiver_invalid_frame_is_nonfatal_and_receiver_continues():
