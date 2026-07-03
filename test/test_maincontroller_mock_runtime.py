@@ -669,7 +669,7 @@ def test_mock_runtime_start_pause_resume_done(tmp_path, monkeypatch):
         manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'done'
         assert manifest['run_id'] == controller.run_id
-        assert manifest['xense_sdk_version'] == '2.0'
+        assert manifest['xense_sdk_version'] == '2.0.1'
         assert manifest['task_name'] == TASK_NAME
         assert manifest['language_instruction'] == LANGUAGE_INSTRUCTION
         assert choice_calls == [((LANGUAGE_INSTRUCTION,), (1.0,), 1)]
@@ -1281,6 +1281,57 @@ def test_start_processes_maps_xense_sdk_1x_to_xense310(tmp_path, monkeypatch):
     controller._start_processes()
 
     assert controller.processes['xense'].cmd[:4] == ['conda', 'run', '-n', 'Xense310']
+
+
+def test_start_processes_maps_xense_sdk_20_to_xense2_bak(tmp_path, monkeypatch):
+    from main_controller import main as main_module
+
+    class FakeStartedUdsClient:
+        def is_started(self) -> bool:
+            return True
+
+        def wait_connected(self, _timeout_s: float) -> bool:
+            return True
+
+        def wait_init_ready(self, _timeout_s: float) -> bool:
+            return True
+
+    class FakeManagedProcess:
+        def __init__(
+            self,
+            name,
+            cmd,
+            cwd,
+            log_path,
+            fatal_patterns=(),
+            on_fatal=None,
+            on_exit=None,
+        ):
+            self.name = name
+            self.cmd = cmd
+            self.cwd = cwd
+            self.log_path = log_path
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(main_module, 'ManagedProcess', FakeManagedProcess)
+    controller = MainController(
+        RuntimeConfig(
+            repo_root=REPO_ROOT,
+            runtime_root=tmp_path,
+            xense_sdk_version='2.0',
+        )
+    )
+    controller.ft_client = FakeStartedUdsClient()
+    controller.xense_client = FakeStartedUdsClient()
+
+    controller._start_processes()
+
+    assert controller.processes['xense'].cmd[:4] == ['conda', 'run', '-n', 'xense2_bak']
 
 
 def test_realsense_nodes_up_wait_reads_all_camera_ready_lines(tmp_path):

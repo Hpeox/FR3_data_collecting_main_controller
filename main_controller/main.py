@@ -1427,7 +1427,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--runtime-root', default=None)
     parser.add_argument('--zmq-connect', default='tcp://127.0.0.1:6000')
     parser.add_argument('--startup-timeout-s', type=float, default=60.0)
-    parser.add_argument('--xense-sdk-version', choices=sorted(XENSE_SDK_CONDA_ENVS), default='2.0')
+    parser.add_argument('--xense-sdk-version', choices=sorted(XENSE_SDK_CONDA_ENVS), default='2.0.1')
     parser.add_argument('--ack-timeout-s', type=float, default=2.0)
     parser.add_argument('--sensor-flush-timeout-s', type=_float_or_none, default=300.0)
     parser.add_argument('--progress-log-period-s', type=float, default=5.0)

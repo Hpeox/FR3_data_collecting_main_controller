@@ -415,7 +415,7 @@ def _config_args(**overrides):
         "runtime_root": None,
         "task_name": TASK_NAME,
         "zmq_connect": "tcp://127.0.0.1:6000",
-        "xense_sdk_version": "2.0",
+        "xense_sdk_version": "2.0.1",
         "startup_timeout_s": 60.0,
         "ack_timeout_s": 2.0,
         "sensor_flush_timeout_s": 300.0,
@@ -487,7 +487,7 @@ def test_build_config_uses_build_time_hint(monkeypatch):
     assert config.runtime_root == REPO_ROOT
     assert config.runtime_sessions_dir == REPO_ROOT / "runtime_sessions"
     assert config.runtime_frames_dir == REPO_ROOT / "runtime_frames"
-    assert config.xense_sdk_version == "2.0"
+    assert config.xense_sdk_version == "2.0.1"
 
 
 def test_sensor_apps_accept_save_dir(monkeypatch, tmp_path):

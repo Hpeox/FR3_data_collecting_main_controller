@@ -27,7 +27,8 @@ REQUIRED_REALSENSE_LAUNCHES = (
 )
 XENSE_SDK_CONDA_ENVS = {
     '1.x': 'Xense310',
-    '2.0': 'xense2',
+    '2.0': 'xense2_bak',
+    '2.0.1': 'xense2',
 }
 TASK_NAME_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
 WEIGHT_SUM_ABS_TOL = 1e-9
@@ -208,7 +209,7 @@ class RuntimeConfig:
     xense_shm_name: str = 'xense_sensor_frame'
     ft_fps: float = 100.0
     xense_fps: float = 30.0
-    xense_sdk_version: str = '2.0'
+    xense_sdk_version: str = '2.0.1'
     startup_timeout_s: float = 60.0
     init_timeout_s: float = 15.0
     ack_timeout_s: float = 2.0
