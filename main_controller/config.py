@@ -221,6 +221,9 @@ class RuntimeConfig:
     alignment_start_trim_s: float = 2.0
     alignment_end_trim_s: float = 0.0
     gripper_plot_timeout_s: float = 30.0
+    xense_tactile_zero_force_mean_tolerance: float = 0.1
+    xense_tactile_edge_warning_threshold: float = 0.5
+    xense_tactile_edge_window_samples: int = 15
     zmq_first_frame_timeout_s: float = 5.0
     rosbag_timeout_s: float = 15.0
     realsense_image_ready_timeout_s: float = 30.0

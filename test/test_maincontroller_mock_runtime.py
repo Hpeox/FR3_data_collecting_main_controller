@@ -78,6 +78,7 @@ class MockUdsSensor:
         self.no_ack_commands: set[str] = set()
         self.close_commands: set[str] = set()
         self.ack_delay_s: dict[str, float] = {}
+        self.ack_extra: dict[str, dict[str, Any]] = {}
         self.ack_sent_times: dict[str, float] = {}
         self.received_magics: list[bytes] = []
         self.frames_sent = 0
@@ -180,7 +181,11 @@ class MockUdsSensor:
                 return
             self._collecting.clear()
             self.has_demo_data = False
-            self._send_ack('DEMO_DONE_REQ', saved_file=self.saved_file)
+            self._send_ack(
+                'DEMO_DONE_REQ',
+                saved_file=self.saved_file,
+                **self.ack_extra.get('DEMO_DONE_REQ', {}),
+            )
             return
         if msg_type == protocol_msg.DEMO_DISCARD_REQ:
             self.commands.append('DEMO_DISCARD_REQ')
@@ -834,6 +839,86 @@ def test_done_runs_gripper_plot_during_finalizing(tmp_path, monkeypatch):
         assert controller.get_state() == ControllerState.WAIT_START
 
 
+def test_xense_tactile_warning_keeps_done_and_plot_uses_preview_payload(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch, alignment_start_trim_s=0.0) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+        runtime.xense.ack_extra['DEMO_DONE_REQ'] = {
+            'xense_tactile_postcheck': {
+                'ok': True,
+                'has_warning': True,
+                'warnings': ['OG001009 tactile edge warning'],
+                'sensors': [
+                    {'sensor_id': 'OG000544', 'zero_force': False, 'edge_warning': False},
+                    {'sensor_id': 'OG001009', 'zero_force': False, 'edge_warning': True},
+                ],
+            },
+            'xense_tactile_preview': {
+                'ok': True,
+                'path': '/tmp/main_controller/xense_tactile_preview/mock_force_resultant.npz',
+                'error': None,
+            },
+        }
+        calls: list[str] = []
+        monkeypatch.setattr(controller, '_run_timestamp_alignment', lambda _manifest_path: calls.append('alignment'))
+
+        def record_plot() -> None:
+            assert controller.xense_tactile_preview_manifest == runtime.xense.ack_extra['DEMO_DONE_REQ']['xense_tactile_preview']
+            calls.append('plot')
+
+        monkeypatch.setattr(controller, '_run_gripper_plot', record_plot)
+
+        controller.finish_demo()
+
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'done'
+        assert manifest['xense_tactile_postcheck']['has_warning'] is True
+        assert manifest['xense_tactile_preview']['path'].endswith('mock_force_resultant.npz')
+        assert calls == ['alignment', 'plot']
+
+
+def test_xense_tactile_postcheck_failure_marks_failed_and_skips_alignment_plot(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch, alignment_start_trim_s=0.0) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+        runtime.xense.ack_extra['DEMO_DONE_REQ'] = {
+            'xense_tactile_postcheck': {
+                'ok': False,
+                'has_warning': False,
+                'warnings': ['exactly one tactile sensor is zero-force'],
+                'sensors': [
+                    {'sensor_id': 'OG000544', 'zero_force': True, 'edge_warning': False},
+                    {'sensor_id': 'OG001009', 'zero_force': False, 'edge_warning': False},
+                ],
+            },
+            'xense_tactile_preview': {
+                'ok': True,
+                'path': '/tmp/main_controller/xense_tactile_preview/mock_force_resultant.npz',
+                'error': None,
+            },
+        }
+        calls: list[str] = []
+        monkeypatch.setattr(controller, '_run_timestamp_alignment', lambda _manifest_path: calls.append('alignment'))
+        monkeypatch.setattr(controller, '_run_gripper_plot', lambda: calls.append('plot'))
+        monkeypatch.setattr(
+            controller,
+            '_run_realsense_rosbag_postcheck',
+            lambda: pytest.fail('RealSense rosbag postcheck should be skipped after Xense tactile failure'),
+        )
+
+        controller.finish_demo()
+
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'failed'
+        assert manifest['failure_stage'] == 'xense_tactile_postcheck'
+        assert manifest['failure_reason'] == 'exactly one tactile sensor is zero-force: OG000544'
+        assert manifest['xense_tactile_postcheck']['ok'] is False
+        assert calls == []
+        assert controller.get_state() == ControllerState.STOPPED
+
+
 def test_gripper_plot_subprocess_success_logs_and_prints(tmp_path, monkeypatch, capsys):
     controller = MainController(
         RuntimeConfig(
@@ -871,6 +956,7 @@ def test_gripper_plot_subprocess_success_logs_and_prints(tmp_path, monkeypatch, 
         '-m',
         'main_controller.gripper_plot',
     ]
+    assert '--tactile-preview-npz' not in calls[0]['command']
     assert calls[0]['timeout'] == 4.0
     events = [
         json.loads(line)
@@ -879,6 +965,49 @@ def test_gripper_plot_subprocess_success_logs_and_prints(tmp_path, monkeypatch, 
     assert events[-1]['event'] == 'gripper_plot_done'
     assert events[-1]['command_samples'] == 12
     assert events[-1]['feedback_samples'] == 7
+    assert events[-1]['tactile_preview_ok'] is False
+    controller.logger.close()
+
+
+def test_gripper_plot_subprocess_passes_tactile_preview_path(tmp_path, monkeypatch):
+    controller = MainController(
+        RuntimeConfig(
+            repo_root=REPO_ROOT,
+            runtime_root=tmp_path,
+            gripper_plot_timeout_s=4.0,
+        )
+    )
+    controller.demo_store = DemoStore(tmp_path / 'demo')
+    controller.xense_tactile_preview_manifest = {
+        'ok': False,
+        'path': '/tmp/main_controller/xense_tactile_preview/mock_force_resultant.npz',
+        'error': 'injected preview write failure',
+    }
+    calls: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    'output_path': '/tmp/main_controller/gripper.png',
+                    'command_samples': 12,
+                    'feedback_samples': 7,
+                    'tactile_preview_ok': False,
+                    'tactile_preview_error': 'missing preview',
+                }
+            ),
+            stderr='',
+        )
+
+    monkeypatch.setattr(main_module.subprocess, 'run', fake_run)
+
+    controller._run_gripper_plot()
+
+    assert '--tactile-preview-npz' in calls[0]
+    assert calls[0][calls[0].index('--tactile-preview-npz') + 1].endswith('mock_force_resultant.npz')
     controller.logger.close()
 
 
@@ -1170,7 +1299,10 @@ def test_start_processes_stops_earlier_processes_on_later_failure(tmp_path, monk
     )
     assert by_name['xense'].cmd[:4] == ['conda', 'run', '-n', 'xense2']
     assert by_name['ft300'].cmd[-2:] == ['--save-dir', str(tmp_path / 'runtime_frames')]
-    assert by_name['xense'].cmd[-2:] == ['--save-dir', str(tmp_path / 'runtime_frames')]
+    assert by_name['xense'].cmd[by_name['xense'].cmd.index('--save-dir') + 1] == str(tmp_path / 'runtime_frames')
+    assert '--xense-tactile-zero-force-mean-tolerance' in by_name['xense'].cmd
+    assert '--xense-tactile-edge-warning-threshold' in by_name['xense'].cmd
+    assert '--xense-tactile-edge-window-samples' in by_name['xense'].cmd
     assert by_name['ft300'].stop_count == 1
     assert by_name['xense'].stop_count == 0
     assert by_name['realsense_camera'].stop_count == 0

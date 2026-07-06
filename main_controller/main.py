@@ -123,6 +123,8 @@ class MainController:
         self.demo_realsense_restart_events: list[dict[str, Any]] = []
         self.realsense_readiness_manifest: dict[str, Any] | None = None
         self.realsense_postcheck_manifest: dict[str, Any] | None = None
+        self.xense_tactile_postcheck_manifest: dict[str, Any] | None = None
+        self.xense_tactile_preview_manifest: dict[str, Any] | None = None
         self.realsense_clock_domain_missing_topics: set[str] = set()
         self.realsense_fatal_ignore_until_ns = 0
 
@@ -244,6 +246,8 @@ class MainController:
             self.sensor_paths = {}
             self.realsense_readiness_manifest = None
             self.realsense_postcheck_manifest = None
+            self.xense_tactile_postcheck_manifest = None
+            self.xense_tactile_preview_manifest = None
             self.realsense_clock_domain_missing_topics = set()
             self.demo_drop_monitors = {}
             self.demo_realsense_restart_count = 0
@@ -397,32 +401,49 @@ class MainController:
 
         command_failed = not ft_result['ok'] or not xense_result['ok'] or not rosbag_stop_result['ok']
         postcheck_failed = False
+        failure_stage: str | None = None
+        failure_reason: str | None = None
         if command_failed:
             self.realsense_postcheck_manifest = None
+            self.xense_tactile_postcheck_manifest = None
+            self.xense_tactile_preview_manifest = None
             status = 'failed'
-        else:
-            self.realsense_postcheck_manifest = self._run_realsense_rosbag_postcheck()
-            status = 'done'
-        if not command_failed and self.realsense_postcheck_manifest is not None and not self.realsense_postcheck_manifest.get('ok', False):
-            postcheck_failed = True
-            status = 'failed'
-        extra = None
-        if command_failed:
             if not rosbag_stop_result['ok']:
                 failure_stage = 'rosbag_stop'
                 failure_reason = 'rosbag stop failed'
             else:
                 failure_stage = 'finish_command'
                 failure_reason = 'required sensor DEMO_DONE_REQ failed'
+        else:
+            xense_payload = xense_result.get('payload') or {}
+            self.xense_tactile_postcheck_manifest = self._xense_tactile_postcheck_from_payload(xense_payload)
+            self.xense_tactile_preview_manifest = self._xense_tactile_preview_from_payload(xense_payload)
+            if self.xense_tactile_postcheck_manifest is not None:
+                self.log('xense_tactile_postcheck', **self.xense_tactile_postcheck_manifest)
+                for warning in self.xense_tactile_postcheck_manifest.get('warnings', []):
+                    self._print(f'[WARN] Xense tactile post-check: {warning}')
+            if (
+                self.xense_tactile_postcheck_manifest is not None
+                and not self.xense_tactile_postcheck_manifest.get('ok', False)
+            ):
+                self.realsense_postcheck_manifest = None
+                postcheck_failed = True
+                failure_stage = 'xense_tactile_postcheck'
+                failure_reason = self._xense_tactile_postcheck_failure_reason()
+                status = 'failed'
+            else:
+                self.realsense_postcheck_manifest = self._run_realsense_rosbag_postcheck()
+                status = 'done'
+                if self.realsense_postcheck_manifest is not None and not self.realsense_postcheck_manifest.get('ok', False):
+                    postcheck_failed = True
+                    failure_stage = 'realsense_rosbag_postcheck'
+                    failure_reason = self._realsense_postcheck_failure_reason()
+                    status = 'failed'
+        extra = None
+        if command_failed or postcheck_failed:
             extra = {
                 'failure_stage': failure_stage,
                 'failure_reason': failure_reason,
-                'command_results': {'ft300': ft_result, 'xense': xense_result, 'rosbag_stop': rosbag_stop_result},
-            }
-        elif postcheck_failed:
-            extra = {
-                'failure_stage': 'realsense_rosbag_postcheck',
-                'failure_reason': self._realsense_postcheck_failure_reason(),
                 'command_results': {'ft300': ft_result, 'xense': xense_result, 'rosbag_stop': rosbag_stop_result},
             }
         manifest_path = self._save_current_demo(status=status, extra=extra)
@@ -714,7 +735,29 @@ class MainController:
         )
         self.processes['xense'] = ManagedProcess(
             'xense',
-            ['conda', 'run', '-n', xense_conda_env, 'python', '-m', 'XenseTacSensor.app', '--uds-path', self.config.xense_uds_path, '--shm-name', self.config.xense_shm_name, '--fps', str(self.config.xense_fps), '--save-dir', str(self.config.runtime_frames_dir)],
+            [
+                'conda',
+                'run',
+                '-n',
+                xense_conda_env,
+                'python',
+                '-m',
+                'XenseTacSensor.app',
+                '--uds-path',
+                self.config.xense_uds_path,
+                '--shm-name',
+                self.config.xense_shm_name,
+                '--fps',
+                str(self.config.xense_fps),
+                '--save-dir',
+                str(self.config.runtime_frames_dir),
+                '--xense-tactile-zero-force-mean-tolerance',
+                str(self.config.xense_tactile_zero_force_mean_tolerance),
+                '--xense-tactile-edge-warning-threshold',
+                str(self.config.xense_tactile_edge_warning_threshold),
+                '--xense-tactile-edge-window-samples',
+                str(self.config.xense_tactile_edge_window_samples),
+            ],
             root,
             logs / 'xense.log',
             on_exit=self._on_process_exit,
@@ -1090,6 +1133,8 @@ class MainController:
         self.sensor_paths = {}
         self.realsense_readiness_manifest = None
         self.realsense_postcheck_manifest = None
+        self.xense_tactile_postcheck_manifest = None
+        self.xense_tactile_preview_manifest = None
         if cleanup_unconfirmed:
             self.set_state(ControllerState.ERROR)
             self.stop_all()
@@ -1135,6 +1180,8 @@ class MainController:
             'run_realsense_restart_events': self.realsense_restart_events,
             'realsense_image_readiness': self.realsense_readiness_manifest,
             'realsense_rosbag_postcheck': self.realsense_postcheck_manifest,
+            'xense_tactile_postcheck': self.xense_tactile_postcheck_manifest,
+            'xense_tactile_preview': self.xense_tactile_preview_manifest,
         }
         if extra is not None:
             manifest.update(extra)
@@ -1186,6 +1233,13 @@ class MainController:
             '--output',
             str(output_path),
         ]
+        tactile_preview_path = None
+        if self.xense_tactile_preview_manifest is not None:
+            candidate = self.xense_tactile_preview_manifest.get('path')
+            if isinstance(candidate, str) and candidate:
+                tactile_preview_path = candidate
+        if tactile_preview_path is not None:
+            command.extend(['--tactile-preview-npz', tactile_preview_path])
         env = os.environ.copy()
         package_root = str(Path(__file__).resolve().parents[1])
         existing_pythonpath = env.get('PYTHONPATH')
@@ -1219,7 +1273,12 @@ class MainController:
                 'output_path': str(output_path),
                 'command_samples': int(result['command_samples']),
                 'feedback_samples': int(result['feedback_samples']),
+                'tactile_preview_ok': bool(result.get('tactile_preview_ok', False)),
             }
+            if result.get('tactile_preview_error'):
+                event['tactile_preview_error'] = str(result['tactile_preview_error'])
+            if result.get('tactile_samples') is not None:
+                event['tactile_samples'] = int(result['tactile_samples'])
             self.log('gripper_plot_done', **event)
             self._print(
                 '[gripper] plot saved: '
@@ -1227,6 +1286,8 @@ class MainController:
                 f"(command_samples={event['command_samples']}, "
                 f"feedback_samples={event['feedback_samples']})"
             )
+            if not event['tactile_preview_ok'] and event.get('tactile_preview_error'):
+                self._print(f"[WARN] tactile preview not rendered: {event['tactile_preview_error']}")
         except subprocess.TimeoutExpired:
             error = (
                 'renderer timed out after '
@@ -1299,6 +1360,31 @@ class MainController:
                 if skew_value > limit_value:
                     return f'RealSense rosbag count skew {skew_value} exceeds limit {limit_value:.3f}'
         return 'RealSense rosbag post-check failed'
+
+    @staticmethod
+    def _xense_tactile_postcheck_from_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+        manifest = payload.get('xense_tactile_postcheck')
+        return manifest if isinstance(manifest, dict) else None
+
+    @staticmethod
+    def _xense_tactile_preview_from_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+        manifest = payload.get('xense_tactile_preview')
+        return manifest if isinstance(manifest, dict) else None
+
+    def _xense_tactile_postcheck_failure_reason(self) -> str:
+        manifest = self.xense_tactile_postcheck_manifest or {}
+        if manifest.get('error'):
+            return str(manifest['error'])
+        sensors = manifest.get('sensors') or []
+        if isinstance(sensors, list):
+            zero_force = [
+                str(sensor.get('sensor_id'))
+                for sensor in sensors
+                if isinstance(sensor, dict) and sensor.get('zero_force') is True
+            ]
+            if len(zero_force) == 1:
+                return f'exactly one tactile sensor is zero-force: {zero_force[0]}'
+        return 'Xense tactile post-check failed'
 
     def _new_demo_dir(self) -> Path:
         """Return a unique demo directory path for rapid repeated captures."""
@@ -1441,6 +1527,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--alignment-start-trim-s', type=float, default=2.0)
     parser.add_argument('--alignment-end-trim-s', type=float, default=0.0)
     parser.add_argument('--gripper-plot-timeout-s', type=float, default=30.0)
+    parser.add_argument('--xense-tactile-zero-force-mean-tolerance', type=float, default=0.1)
+    parser.add_argument('--xense-tactile-edge-warning-threshold', type=float, default=0.5)
+    parser.add_argument('--xense-tactile-edge-window-samples', type=int, default=15)
     parser.add_argument('--realsense-image-ready-timeout-s', type=float, default=30.0)
     parser.add_argument('--realsense-rosbag-count-skew-limit-percent', type=float, default=0.5)
     parser.add_argument('--realsense-capture-mode', choices=['formal', 'debug_degraded'], default='formal')
@@ -1482,6 +1571,9 @@ def build_config(args: argparse.Namespace) -> RuntimeConfig:
         alignment_start_trim_s=args.alignment_start_trim_s,
         alignment_end_trim_s=args.alignment_end_trim_s,
         gripper_plot_timeout_s=args.gripper_plot_timeout_s,
+        xense_tactile_zero_force_mean_tolerance=args.xense_tactile_zero_force_mean_tolerance,
+        xense_tactile_edge_warning_threshold=args.xense_tactile_edge_warning_threshold,
+        xense_tactile_edge_window_samples=args.xense_tactile_edge_window_samples,
         realsense_image_ready_timeout_s=args.realsense_image_ready_timeout_s,
         realsense_rosbag_count_skew_limit_percent=args.realsense_rosbag_count_skew_limit_percent,
         realsense_capture_mode=args.realsense_capture_mode,
