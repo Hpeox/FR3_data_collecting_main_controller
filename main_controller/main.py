@@ -19,6 +19,7 @@ from typing import Any
 
 from .buffers import DemoStore, JsonlLogger
 from .config import (
+    MOCKABLE_COMPONENTS,
     RuntimeConfig,
     XENSE_SDK_CONDA_ENVS,
     default_repo_root,
@@ -753,31 +754,34 @@ class MainController:
             logs / 'ft300.log',
             on_exit=self._on_process_exit,
         )
+        xense_cmd = [
+            'conda',
+            'run',
+            '-n',
+            xense_conda_env,
+            'python',
+            '-m',
+            'XenseTacSensor.app',
+            '--uds-path',
+            self.config.xense_uds_path,
+            '--shm-name',
+            self.config.xense_shm_name,
+            '--fps',
+            str(self.config.xense_fps),
+            '--save-dir',
+            str(self.config.runtime_frames_dir),
+            '--xense-tactile-zero-force-mean-tolerance',
+            str(self.config.xense_tactile_zero_force_mean_tolerance),
+            '--xense-tactile-edge-warning-threshold',
+            str(self.config.xense_tactile_edge_warning_threshold),
+            '--xense-tactile-edge-window-samples',
+            str(self.config.xense_tactile_edge_window_samples),
+        ]
+        if 'xense' in self.config.mock_components:
+            xense_cmd.append('--mock')
         self.processes['xense'] = ManagedProcess(
             'xense',
-            [
-                'conda',
-                'run',
-                '-n',
-                xense_conda_env,
-                'python',
-                '-m',
-                'XenseTacSensor.app',
-                '--uds-path',
-                self.config.xense_uds_path,
-                '--shm-name',
-                self.config.xense_shm_name,
-                '--fps',
-                str(self.config.xense_fps),
-                '--save-dir',
-                str(self.config.runtime_frames_dir),
-                '--xense-tactile-zero-force-mean-tolerance',
-                str(self.config.xense_tactile_zero_force_mean_tolerance),
-                '--xense-tactile-edge-warning-threshold',
-                str(self.config.xense_tactile_edge_warning_threshold),
-                '--xense-tactile-edge-window-samples',
-                str(self.config.xense_tactile_edge_window_samples),
-            ],
+            xense_cmd,
             root,
             logs / 'xense.log',
             on_exit=self._on_process_exit,
@@ -1426,7 +1430,8 @@ class MainController:
 
     def _new_demo_dir(self) -> Path:
         """Return a unique demo directory path for rapid repeated captures."""
-        base = time.strftime('demo_%Y%m%d_%H%M%S')
+        prefix = 'mock_demo' if self.config.mock_components else 'demo'
+        base = time.strftime(f'{prefix}_%Y%m%d_%H%M%S')
         demos_dir = self.runtime_sessions_dir / 'demos'
         candidate = demos_dir / base
         if not candidate.exists():
@@ -1552,6 +1557,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--zmq-connect', default='tcp://127.0.0.1:6000')
     parser.add_argument('--startup-timeout-s', type=float, default=60.0)
     parser.add_argument('--xense-sdk-version', choices=sorted(XENSE_SDK_CONDA_ENVS), default='2.0.1')
+    parser.add_argument(
+        '--mock',
+        action='append',
+        choices=sorted(MOCKABLE_COMPONENTS),
+        default=[],
+        metavar='COMPONENT',
+        help='Mock one component; repeat for multiple supported components.',
+    )
     parser.add_argument('--ack-timeout-s', type=float, default=2.0)
     parser.add_argument('--sensor-flush-timeout-s', type=_float_or_none, default=300.0)
     parser.add_argument('--progress-log-period-s', type=float, default=5.0)
@@ -1599,6 +1612,7 @@ def build_config(args: argparse.Namespace) -> RuntimeConfig:
         runtime_root=None if args.runtime_root is None else Path(args.runtime_root),
         zmq_connect=args.zmq_connect,
         xense_sdk_version=args.xense_sdk_version,
+        mock_components=frozenset(args.mock),
         startup_timeout_s=args.startup_timeout_s,
         ack_timeout_s=args.ack_timeout_s,
         sensor_flush_timeout_s=args.sensor_flush_timeout_s,

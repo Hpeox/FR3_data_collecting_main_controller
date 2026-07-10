@@ -847,6 +847,80 @@ def test_mock_runtime_auto_alignment_success_with_short_trim(tmp_path, monkeypat
             )
 
 
+def test_xense_mock_demo_finalizes_with_tactile_qc_preview_and_alignment(tmp_path, monkeypatch):
+    with MockRuntime(
+        tmp_path,
+        monkeypatch,
+        alignment_start_trim_s=0.0,
+        mock_components=frozenset({'xense'}),
+    ) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        demo_dir = runtime.start_and_wait_for_frames()
+        assert demo_dir.name.startswith('mock_demo_')
+        runtime.xense.ack_extra['DEMO_DONE_REQ'] = {
+            'xense_tactile_postcheck': {
+                'ok': True,
+                'has_warning': False,
+                'warnings': [],
+                'sensors': [
+                    {'sensor_id': 'OG000544', 'zero_force': True, 'edge_warning': False},
+                    {'sensor_id': 'OG001009', 'zero_force': True, 'edge_warning': False},
+                ],
+            },
+            'xense_tactile_preview': {
+                'ok': True,
+                'path': '/tmp/main_controller/xense_tactile_preview/mock_force_resultant.npz',
+                'error': None,
+            },
+        }
+        emit_realsense_metadata(controller, frame_number=1)
+        time.sleep(0.05)
+        emit_realsense_metadata(controller, frame_number=2)
+        time.sleep(0.1)
+        plotted: list[dict[str, Any] | None] = []
+        monkeypatch.setattr(
+            controller,
+            '_run_gripper_plot',
+            lambda: plotted.append(controller.xense_tactile_preview_manifest),
+        )
+
+        controller.finish_demo()
+
+        manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
+        assert manifest['status'] == 'done'
+        assert 'mock_components' not in manifest
+        assert manifest['sensor_paths']['xense'] == f'runtime_frames/{runtime.xense.saved_file}'
+        assert manifest['xense_tactile_postcheck']['ok'] is True
+        assert manifest['xense_tactile_preview']['ok'] is True
+        assert manifest['realsense_rosbag_postcheck']['ok'] is True
+        assert manifest['alignment']['status'] == 'done'
+        assert plotted == [runtime.xense.ack_extra['DEMO_DONE_REQ']['xense_tactile_preview']]
+
+
+def test_mock_demo_dir_uses_existing_collision_suffixes(tmp_path, monkeypatch):
+    controller = MainController(
+        RuntimeConfig(
+            repo_root=REPO_ROOT,
+            runtime_root=tmp_path,
+            mock_components=frozenset({'xense'}),
+        )
+    )
+    monkeypatch.setattr(
+        main_module.time,
+        'strftime',
+        lambda format_string: format_string.replace('%Y%m%d_%H%M%S', '20260710_120000'),
+    )
+
+    first = controller._new_demo_dir()
+    first.mkdir(parents=True)
+    second = controller._new_demo_dir()
+
+    assert first.name == 'mock_demo_20260710_120000'
+    assert second.name == 'mock_demo_20260710_120000_001'
+    controller.logger.close()
+
+
 def test_done_runs_gripper_plot_during_finalizing(tmp_path, monkeypatch):
     with MockRuntime(tmp_path, monkeypatch, alignment_start_trim_s=0.0) as runtime:
         controller = runtime.controller
@@ -1404,10 +1478,60 @@ def test_start_processes_stops_earlier_processes_on_later_failure(tmp_path, monk
     assert '--xense-tactile-zero-force-mean-tolerance' in by_name['xense'].cmd
     assert '--xense-tactile-edge-warning-threshold' in by_name['xense'].cmd
     assert '--xense-tactile-edge-window-samples' in by_name['xense'].cmd
+    assert '--mock' not in by_name['xense'].cmd
     assert by_name['ft300'].stop_count == 1
     assert by_name['xense'].stop_count == 0
     assert by_name['realsense_camera'].stop_count == 0
     assert by_name['rosbag_recorder'].stop_count == 0
+
+
+def test_start_processes_passes_mock_flag_only_for_mock_xense(tmp_path, monkeypatch):
+    from main_controller import main as main_module
+
+    instances: list[Any] = []
+
+    class FakeStartedUdsClient:
+        def is_started(self) -> bool:
+            return True
+
+        def wait_connected(self, _timeout_s: float) -> bool:
+            return True
+
+        def wait_init_ready(self, _timeout_s: float) -> bool:
+            return True
+
+    class FakeManagedProcess:
+        def __init__(self, name, cmd, cwd, log_path, fatal_patterns=(), on_fatal=None, on_exit=None):
+            self.name = name
+            self.cmd = cmd
+            self.cwd = cwd
+            self.log_path = log_path
+            instances.append(self)
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(main_module, 'ManagedProcess', FakeManagedProcess)
+    controller = MainController(
+        RuntimeConfig(
+            repo_root=REPO_ROOT,
+            runtime_root=tmp_path,
+            mock_components=frozenset({'xense'}),
+        )
+    )
+    controller.ft_client = FakeStartedUdsClient()
+    controller.xense_client = FakeStartedUdsClient()
+
+    controller._start_processes()
+
+    by_name = {process.name: process for process in instances}
+    assert by_name['xense'].cmd[-1] == '--mock'
+    assert '--mock' not in by_name['ft300'].cmd
+    assert '--mock' not in by_name['realsense_camera'].cmd
+    assert '--mock' not in by_name['rosbag_recorder'].cmd
 
 
 def test_start_processes_waits_for_xense_init_before_realsense(tmp_path, monkeypatch):

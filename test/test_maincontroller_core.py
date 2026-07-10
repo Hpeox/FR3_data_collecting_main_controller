@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from main_controller.drop_monitor import DropMonitor
 import main_controller.config as config_module
 from main_controller.config import (
+    MOCKABLE_COMPONENTS,
     RuntimeConfig as RuntimeConfigClass,
     load_task_instruction_config,
     parse_task_instruction_payload,
@@ -574,6 +575,7 @@ def _config_args(**overrides):
         "task_name": TASK_NAME,
         "zmq_connect": "tcp://127.0.0.1:6000",
         "xense_sdk_version": "2.0.1",
+        "mock": [],
         "startup_timeout_s": 60.0,
         "ack_timeout_s": 2.0,
         "sensor_flush_timeout_s": 300.0,
@@ -607,6 +609,7 @@ def test_build_config_uses_explicit_repo_root(tmp_path, monkeypatch):
             repo_root=str(REPO_ROOT),
             runtime_root=str(tmp_path / "runtime"),
             xense_sdk_version="1.x",
+            mock=["xense", "xense"],
             alignment_base="xense:pair",
             alignment_end_trim_s=0.25,
             gripper_plot_timeout_s=12.5,
@@ -625,6 +628,7 @@ def test_build_config_uses_explicit_repo_root(tmp_path, monkeypatch):
     assert config.task_instructions == TASK_INSTRUCTIONS
     assert config.task_instruction_weights == TASK_WEIGHTS
     assert config.xense_sdk_version == "1.x"
+    assert config.mock_components == frozenset({"xense"})
     assert config.alignment_base == "xense:pair"
     assert config.alignment_end_trim_s == 0.25
     assert config.gripper_plot_timeout_s == 12.5
@@ -649,6 +653,7 @@ def test_build_config_uses_build_time_hint(monkeypatch):
     assert config.runtime_sessions_dir == REPO_ROOT / "runtime_sessions"
     assert config.runtime_frames_dir == REPO_ROOT / "runtime_frames"
     assert config.xense_sdk_version == "2.0.1"
+    assert config.mock_components == frozenset()
 
 
 def test_sensor_apps_accept_save_dir(monkeypatch, tmp_path):
@@ -661,6 +666,9 @@ def test_sensor_apps_accept_save_dir(monkeypatch, tmp_path):
 
     monkeypatch.setattr(sys, "argv", ["xense", "--save-dir", str(save_dir)])
     assert parse_xense_args().save_dir == save_dir
+
+    monkeypatch.setattr(sys, "argv", ["xense", "--mock"])
+    assert parse_xense_args().mock is True
 
 
 def test_parse_args_rejects_removed_output_dir(monkeypatch):
@@ -695,6 +703,34 @@ def test_parse_args_accepts_task_name(monkeypatch):
     )
 
     assert parse_args().task_name == TASK_NAME
+
+
+def test_parse_args_accepts_repeatable_xense_mock(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["main_controller", "--task-name", TASK_NAME, "--mock", "xense", "--mock", "xense"],
+    )
+
+    assert parse_args().mock == ["xense", "xense"]
+
+
+def test_parse_args_rejects_unknown_mock_component(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["main_controller", "--task-name", TASK_NAME, "--mock", "ft300"],
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_runtime_config_rejects_unknown_mock_component():
+    with pytest.raises(ValueError, match="unsupported mock components"):
+        RuntimeConfig(repo_root=REPO_ROOT, mock_components=frozenset({"ft300"}))
+
+    assert MOCKABLE_COMPONENTS == frozenset({"xense"})
 
 
 @pytest.mark.parametrize(
