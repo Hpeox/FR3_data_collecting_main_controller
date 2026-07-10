@@ -21,7 +21,7 @@ import FT300S.protocol.messages as ft300_protocol
 from main_controller.buffers import DemoStore
 from main_controller.config import RuntimeConfig as RuntimeConfigClass
 import main_controller.main as main_module
-from main_controller.main import Command, ControllerState, MainController
+from main_controller.main import Command, ControllerState, MainController, RosbagBootstrapStopState
 from main_controller.realsense_image_guard import ImageReadinessResult, ImageTopicBaseline, validate_rosbag_image_metadata
 from main_controller.realsense_metadata import RealSenseMetadataEvent
 import main_controller.timestamp_alignment as timestamp_alignment_module
@@ -356,6 +356,7 @@ class FakeRosbagControl:
     def __init__(self):
         self.calls: list[tuple[str, str | None]] = []
         self.fail_methods: set[str] = set()
+        self.stop_attempt_count = 0
         self.readiness_missing_topics: tuple[str, ...] = ()
         self.postcheck_topic_metadata: dict[str, dict[str, Any]] | None = None
         self.readiness_requirements: tuple[Any, ...] = ()
@@ -381,10 +382,11 @@ class FakeRosbagControl:
         self.calls.append(('pause', None))
 
     def stop(self, timeout_s: float) -> None:
+        self.stop_attempt_count += 1
         self.stop_time = time.monotonic()
+        self.calls.append(('stop', None))
         if 'stop' in self.fail_methods:
             raise RuntimeError('injected rosbag stop failure')
-        self.calls.append(('stop', None))
 
     def check_image_readiness(self, requirements, timeout_s: float, mode: str):
         self.readiness_requirements = requirements
@@ -440,6 +442,12 @@ class FakeSensorClient:
         self.commands.append(cmd_name)
         return {'cmd': cmd_name}
 
+    def wait_connected(self, _timeout_s: float) -> bool:
+        return True
+
+    def wait_init_ready(self, _timeout_s: float) -> bool:
+        return True
+
     def stop(self) -> None:
         self.stop_count += 1
 
@@ -467,6 +475,9 @@ class FakeProcess:
 class FakeReceiver:
     def __init__(self):
         self.stop_count = 0
+
+    def wait_first_frame(self, _timeout_s: float) -> bool:
+        return True
 
     def stop(self) -> None:
         self.stop_count += 1
@@ -606,6 +617,18 @@ def assert_npz_fields_same_length(npz) -> int:
     return expected
 
 
+def assert_startup_bootstrap_stop(runtime: "MockRuntime") -> None:
+    assert runtime.rosbag.calls[:1] == [('stop', None)]
+    assert runtime.rosbag.stop_attempt_count >= 1
+    assert runtime.controller is not None
+    assert runtime.controller.rosbag_bootstrap_stop_state == RosbagBootstrapStopState.SUCCEEDED
+
+
+def demo_rosbag_calls(runtime: "MockRuntime") -> list[tuple[str, str | None]]:
+    assert_startup_bootstrap_stop(runtime)
+    return runtime.rosbag.calls[1:]
+
+
 def test_default_realsense_topics_are_four_cameras_eight_streams():
     topics = RuntimeConfig(repo_root=REPO_ROOT).realsense_metadata_topics
 
@@ -620,6 +643,16 @@ def test_default_realsense_topics_are_four_cameras_eight_streams():
         '/cam4/camera/color/metadata',
         '/cam4/camera/depth/metadata',
     )
+
+
+def test_mock_runtime_startup_stops_rosbag_bootstrap_once(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        assert controller.get_state() == ControllerState.WAIT_START
+        assert controller.rosbag_bootstrap_stop_state == RosbagBootstrapStopState.SUCCEEDED
+        assert runtime.rosbag.calls == [('stop', None)]
+        assert runtime.rosbag.stop_attempt_count == 1
 
 
 def test_mock_runtime_start_pause_resume_done(tmp_path, monkeypatch):
@@ -658,7 +691,8 @@ def test_mock_runtime_start_pause_resume_done(tmp_path, monkeypatch):
         controller.finish_demo()
 
         assert controller.get_state() == ControllerState.WAIT_START
-        assert runtime.rosbag.calls[:5] == [
+        assert runtime.rosbag.calls[:6] == [
+            ('stop', None),
             ('record', str(demo_dir / 'rosbag')),
             ('resume', None),
             ('pause', None),
@@ -1126,6 +1160,21 @@ def test_finish_sends_rosbag_stop_without_waiting_for_sensor_flush(tmp_path, mon
         assert runtime.rosbag.stop_time < runtime.xense.ack_sent_times['DEMO_DONE_REQ']
 
 
+def test_bootstrap_state_does_not_suppress_real_demo_finish_stop(tmp_path, monkeypatch):
+    with MockRuntime(tmp_path, monkeypatch) as runtime:
+        controller = runtime.controller
+        assert controller is not None
+        runtime.start_and_wait_for_frames()
+        stop_attempts_before_finish = runtime.rosbag.stop_attempt_count
+        controller.rosbag_bootstrap_stop_state = RosbagBootstrapStopState.FAILED
+
+        controller.finish_demo()
+
+        assert controller.get_state() == ControllerState.WAIT_START
+        assert runtime.rosbag.stop_attempt_count == stop_attempts_before_finish + 1
+        assert runtime.rosbag.calls[1:][-1] == ('stop', None)
+
+
 def test_mock_runtime_paused_discard_returns_to_wait_start(tmp_path, monkeypatch):
     with MockRuntime(tmp_path, monkeypatch) as runtime:
         controller = runtime.controller
@@ -1219,6 +1268,58 @@ def test_startup_failure_cleans_started_resources_and_reraises(tmp_path, monkeyp
     transitions = [event for event in events if event['event'] == 'state_transition']
     assert any(event.get('current') == 'ERROR' for event in transitions)
     assert any(event.get('current') == 'STOPPED' for event in transitions)
+
+
+def test_startup_bootstrap_stop_failure_cleans_without_retrying_stop(tmp_path, monkeypatch):
+    controller = MainController(
+        RuntimeConfig(
+            repo_root=REPO_ROOT,
+            runtime_root=tmp_path,
+            ack_timeout_s=0.01,
+            rosbag_timeout_s=0.01,
+        )
+    )
+    fake_process = FakeProcess()
+    fake_receiver = FakeReceiver()
+    fake_monitor = FakeRealSenseMetadataMonitor((), lambda _event: None)
+    fake_rosbag = FakeRosbagControl()
+    fake_rosbag.fail_methods.add('stop')
+    controller.ft_client = FakeSensorClient('ft300')
+    controller.xense_client = FakeSensorClient('xense')
+
+    def start_processes() -> None:
+        controller.processes['rosbag_recorder'] = fake_process
+
+    def start_base_receivers() -> None:
+        controller.zmq_receiver = fake_receiver
+
+    def start_ros_receivers() -> None:
+        controller.realsense_monitor = fake_monitor
+        controller.rosbag = fake_rosbag
+
+    monkeypatch.setattr(controller, '_start_processes', start_processes)
+    monkeypatch.setattr(controller, '_start_base_receivers', start_base_receivers)
+    monkeypatch.setattr(controller, '_start_ros_receivers', start_ros_receivers)
+
+    with pytest.raises(RuntimeError, match='injected rosbag stop failure'):
+        controller.startup()
+
+    assert controller.get_state() == ControllerState.STOPPED
+    assert controller.rosbag_bootstrap_stop_state == RosbagBootstrapStopState.FAILED
+    assert fake_rosbag.calls == [('stop', None), ('close', None)]
+    assert fake_rosbag.stop_attempt_count == 1
+    assert fake_receiver.stop_count == 1
+    assert fake_monitor.stopped
+    assert controller.ft_client.stop_count == 1
+    assert controller.xense_client.stop_count == 1
+    assert fake_process.stop_count == 1
+
+    events = [
+        json.loads(line)
+        for line in controller.logger.path.read_text(encoding='utf-8').splitlines()
+    ]
+    assert any(event['event'] == 'rosbag_bootstrap_stop_failed' for event in events)
+    assert any(event['event'] == 'startup_failed' for event in events)
 
 
 def test_startup_ready_requires_realsense_metadata_monitor(tmp_path):
@@ -1625,7 +1726,7 @@ def test_rosbag_resume_failure_rolls_back_started_sensors_and_writes_failed_mani
         assert manifest['rosbag_record_resume']['failed_action'] == 'resume'
         assert manifest['rosbag_record_resume']['stop']['ok'] is True
         assert manifest['npz'] == {}
-        assert runtime.rosbag.calls == [
+        assert demo_rosbag_calls(runtime) == [
             ('record', str(demo_dirs[0] / 'rosbag')),
             ('stop', None),
         ]
@@ -1652,7 +1753,7 @@ def test_realsense_readiness_failure_blocks_formal_recording(tmp_path, monkeypat
         assert readiness['ok'] is False
         assert readiness['mode'] == 'formal'
         assert readiness['missing_topics'] == [missing_topic]
-        assert runtime.rosbag.calls == []
+        assert demo_rosbag_calls(runtime) == []
 
 
 def test_realsense_rosbag_postcheck_failure_stops_controller(tmp_path, monkeypatch):
@@ -2154,7 +2255,7 @@ def test_mock_runtime_start_done_start_done_keeps_zmq_drain_between_demos(tmp_pa
         assert len(first_zmq['seq']) > 0
         assert len(second_zmq['seq']) > 0
         assert int(second_zmq['seq'][0]) > int(first_zmq['seq'][-1])
-        assert runtime.rosbag.calls == [
+        assert demo_rosbag_calls(runtime) == [
             ('record', str(first_demo_dir / 'rosbag')),
             ('resume', None),
             ('stop', None),
@@ -2252,7 +2353,7 @@ def test_mock_runtime_start_discard_start_done_keeps_zmq_drain_after_discard(tmp
         assert manifest['language_instruction'] == LANGUAGE_INSTRUCTION
         assert runtime.ft300.commands == ['START_REQ', 'DEMO_DISCARD_REQ', 'START_REQ', 'DEMO_DONE_REQ']
         assert runtime.xense.commands == ['START_REQ', 'DEMO_DISCARD_REQ', 'START_REQ', 'DEMO_DONE_REQ']
-        assert runtime.rosbag.calls == [
+        assert demo_rosbag_calls(runtime) == [
             ('record', str(discarded_demo_dir / 'rosbag')),
             ('resume', None),
             ('stop', None),
