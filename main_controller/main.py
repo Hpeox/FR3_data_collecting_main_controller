@@ -57,6 +57,15 @@ class ControllerState(Enum):
     ERROR = auto()
 
 
+class RosbagBootstrapStopState(Enum):
+    """Startup bootstrap recording stop state."""
+
+    NOT_ATTEMPTED = auto()
+    ATTEMPTING = auto()
+    SUCCEEDED = auto()
+    FAILED = auto()
+
+
 @dataclass(frozen=True)
 class Command:
     """Command queued into the controller loop."""
@@ -134,6 +143,7 @@ class MainController:
         self.processes: dict[str, ManagedProcess] = {}
         self.expected_process_exits: set[str] = set()
         self.rosbag: RosbagControl | None = None
+        self.rosbag_bootstrap_stop_state = RosbagBootstrapStopState.NOT_ATTEMPTED
         self.realsense_monitor: RealSenseMetadataMonitor | None = None
         self.zmq_receiver: ZmqTelemetryReceiver | None = None
         self.ft_client = UdsClient('ft300', config.ft_uds_path, self._on_uds_event, magic=FT300_MAGIC, on_disconnect=self._on_uds_disconnect)
@@ -184,7 +194,8 @@ class MainController:
             self.log('startup_failed', error=str(exc), stage=self.get_state().name)
             if self.get_state() != ControllerState.ERROR:
                 self.set_state(ControllerState.ERROR)
-            self.stop_all()
+            stop_rosbag = not self._startup_failure_should_skip_rosbag_stop_retry()
+            self._stop_runtime_resources(stop_rosbag=stop_rosbag, send_sensor_stop=True)
             raise
 
     def handle_command(self, command: Command) -> None:
@@ -516,6 +527,15 @@ class MainController:
     def stop_all(self) -> None:
         """Stop sensors, receivers, ROS helpers, and subprocesses."""
         self._stop_runtime_resources(stop_rosbag=True, send_sensor_stop=True)
+
+    def _startup_failure_should_skip_rosbag_stop_retry(self) -> bool:
+        """Return whether startup cleanup should skip retrying bootstrap stop."""
+        return (
+            self.rosbag_bootstrap_stop_state == RosbagBootstrapStopState.FAILED
+            and self.demo_store is None
+            and not self.rosbag_record_started
+            and self.rosbag_uri is None
+        )
 
     def _stop_runtime_resources(self, *, stop_rosbag: bool, send_sensor_stop: bool) -> None:
         """Stop runtime resources without writing demo manifests."""
@@ -867,8 +887,26 @@ class MainController:
             raise RuntimeError(error)
         if self.rosbag is not None and not self.rosbag.wait_ready(self.config.startup_timeout_s):
             raise RuntimeError('rosbag2 recorder services did not become ready')
+        self._stop_rosbag_bootstrap_recording()
         self._wait_realsense_nodes_up_before_image_readiness()
         self._wait_realsense_images_ready('realsense_startup_image_readiness')
+
+    def _stop_rosbag_bootstrap_recording(self) -> None:
+        """Stop the native recorder node's initial bootstrap recording once."""
+        if self.rosbag is None:
+            return
+        if self.rosbag_bootstrap_stop_state != RosbagBootstrapStopState.NOT_ATTEMPTED:
+            return
+        self.rosbag_bootstrap_stop_state = RosbagBootstrapStopState.ATTEMPTING
+        self.log('rosbag_bootstrap_stop_started')
+        try:
+            self.rosbag.stop(timeout_s=self.config.rosbag_timeout_s)
+        except Exception as exc:
+            self.rosbag_bootstrap_stop_state = RosbagBootstrapStopState.FAILED
+            self.log('rosbag_bootstrap_stop_failed', error=str(exc))
+            raise
+        self.rosbag_bootstrap_stop_state = RosbagBootstrapStopState.SUCCEEDED
+        self.log('rosbag_bootstrap_stop_done')
 
     def _wait_realsense_nodes_up_before_image_readiness(self, *, start_position: int = 0) -> None:
         """Wait for each RealSense node to report SDK readiness in its launch log."""

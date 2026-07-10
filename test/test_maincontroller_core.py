@@ -35,6 +35,7 @@ from main_controller.realsense_image_guard import (
     validate_rosbag_image_metadata,
 )
 from main_controller.realsense_metadata import RealSenseMetadataMonitor, metadata_int, metadata_ms_to_ns, metadata_str
+from main_controller.rosbag_control import RosbagControl
 import main_controller.timestamp_alignment as timestamp_alignment_module
 from main_controller.timestamp_alignment import AlignmentOptions, align_demo_timestamps
 from main_controller.uds_client import UdsClient
@@ -60,6 +61,51 @@ def RuntimeConfig(**kwargs):
     kwargs.setdefault("task_instructions", TASK_INSTRUCTIONS)
     kwargs.setdefault("task_instruction_weights", TASK_WEIGHTS)
     return RuntimeConfigClass(**kwargs)
+
+
+class FakeRosbagFuture:
+    def __init__(
+        self,
+        *,
+        result=object(),
+        exception: Exception | None = None,
+        done: bool = True,
+        result_exception: Exception | None = None,
+    ):
+        self._result = result
+        self._exception = exception
+        self._done = done
+        self._result_exception = result_exception
+
+    def done(self):
+        return self._done
+
+    def exception(self):
+        return self._exception
+
+    def result(self):
+        if self._result_exception is not None:
+            raise self._result_exception
+        return self._result
+
+
+class FakeRosbagClient:
+    def __init__(self, future: FakeRosbagFuture, srv_name: str = "/rosbag2_recorder/record"):
+        self.future = future
+        self.srv_name = srv_name
+        self.requests = []
+
+    def call_async(self, request):
+        self.requests.append(request)
+        return self.future
+
+
+def rosbag_control_for_call_tests() -> RosbagControl:
+    control = RosbagControl.__new__(RosbagControl)
+    control.executor = types.SimpleNamespace(
+        spin_until_future_complete=lambda _future, timeout_sec: None
+    )
+    return control
 
 
 def test_managed_process_reports_one_fatal_per_matching_line(tmp_path):
@@ -88,6 +134,57 @@ def test_managed_process_reports_one_fatal_per_matching_line(tmp_path):
     process._read_output(io.StringIO())
 
     assert calls == [('realsense_camera', 'Depth stream start failure, Hardware Error')]
+
+
+def test_rosbag_call_accepts_successful_record_return_code():
+    control = rosbag_control_for_call_tests()
+    response = types.SimpleNamespace(return_code=0, error_string="")
+    client = FakeRosbagClient(FakeRosbagFuture(result=response))
+
+    control._call(client, object(), timeout_s=1.0, check_return_code=True)
+
+    assert len(client.requests) == 1
+
+
+def test_rosbag_call_rejects_failed_record_return_code():
+    control = rosbag_control_for_call_tests()
+    response = types.SimpleNamespace(return_code=1, error_string="already recording")
+    client = FakeRosbagClient(FakeRosbagFuture(result=response))
+
+    with pytest.raises(RuntimeError, match="return_code=1: already recording"):
+        control._call(client, object(), timeout_s=1.0, check_return_code=True)
+
+
+def test_rosbag_call_wraps_future_exception_with_service_context():
+    control = rosbag_control_for_call_tests()
+    client = FakeRosbagClient(
+        FakeRosbagFuture(exception=RuntimeError("transport failed")),
+        srv_name="/rosbag2_recorder/resume",
+    )
+
+    with pytest.raises(RuntimeError, match="/rosbag2_recorder/resume: transport failed"):
+        control._call(client, object(), timeout_s=1.0)
+
+
+def test_rosbag_call_rejects_none_result():
+    control = rosbag_control_for_call_tests()
+    client = FakeRosbagClient(
+        FakeRosbagFuture(result=None),
+        srv_name="/rosbag2_recorder/pause",
+    )
+
+    with pytest.raises(RuntimeError, match="/rosbag2_recorder/pause"):
+        control._call(client, object(), timeout_s=1.0)
+
+
+def test_rosbag_call_allows_empty_stop_response_without_success_field():
+    control = rosbag_control_for_call_tests()
+    client = FakeRosbagClient(
+        FakeRosbagFuture(result=types.SimpleNamespace()),
+        srv_name="/rosbag2_recorder/stop",
+    )
+
+    control._call(client, object(), timeout_s=1.0)
 
 
 def test_zmq_unpack_frame_minimal():

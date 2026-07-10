@@ -48,7 +48,7 @@ class RosbagControl:
         """Call /record with a bag URI."""
         request = self._Record.Request()
         request.uri = str(uri)
-        self._call(self.record_client, request, timeout_s)
+        self._call(self.record_client, request, timeout_s, check_return_code=True)
 
     def resume(self, timeout_s: float = 15.0) -> None:
         """Call /resume."""
@@ -93,11 +93,28 @@ class RosbagControl:
         self.executor.shutdown()
         self.node.destroy_node()
 
-    def _call(self, client, request, timeout_s: float) -> None:
+    def _call(self, client, request, timeout_s: float, *, check_return_code: bool = False) -> None:
         future = client.call_async(request)
         self.executor.spin_until_future_complete(future, timeout_sec=timeout_s)
         if not future.done():
             raise TimeoutError(f'rosbag2 service call timed out: {client.srv_name}')
-        result = future.result()
+        try:
+            exception = future.exception()
+        except AttributeError:
+            exception = None
+        if exception is not None:
+            raise RuntimeError(f'rosbag2 service call failed: {client.srv_name}: {exception}') from exception
+        try:
+            result = future.result()
+        except Exception as exc:
+            raise RuntimeError(f'rosbag2 service call failed: {client.srv_name}: {exc}') from exc
         if result is None:
             raise RuntimeError(f'rosbag2 service call failed: {client.srv_name}')
+        if check_return_code:
+            return_code = getattr(result, 'return_code', 0)
+            if return_code != 0:
+                error_string = getattr(result, 'error_string', '') or 'no error string'
+                raise RuntimeError(
+                    f'rosbag2 service call failed: {client.srv_name}: '
+                    f'return_code={return_code}: {error_string}'
+                )
