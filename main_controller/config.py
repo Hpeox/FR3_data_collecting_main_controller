@@ -30,6 +30,7 @@ XENSE_SDK_CONDA_ENVS = {
     '2.0': 'xense2_bak',
     '2.0.1': 'xense2',
 }
+MOCKABLE_COMPONENTS = frozenset({'xense'})
 TASK_NAME_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
 WEIGHT_SUM_ABS_TOL = 1e-9
 
@@ -210,6 +211,7 @@ class RuntimeConfig:
     ft_fps: float = 100.0
     xense_fps: float = 30.0
     xense_sdk_version: str = '2.0.1'
+    mock_components: frozenset[str] = field(default_factory=frozenset)
     startup_timeout_s: float = 60.0
     init_timeout_s: float = 15.0
     ack_timeout_s: float = 2.0
@@ -284,6 +286,16 @@ class RuntimeConfig:
         if self.xense_sdk_version not in XENSE_SDK_CONDA_ENVS:
             allowed = ', '.join(sorted(XENSE_SDK_CONDA_ENVS))
             raise ValueError(f'unsupported xense_sdk_version {self.xense_sdk_version!r}; expected one of: {allowed}')
+        if isinstance(self.mock_components, str):
+            raise TypeError('mock_components must be a collection of component names')
+        mock_components = frozenset(self.mock_components)
+        unsupported_mock_components = mock_components - MOCKABLE_COMPONENTS
+        if unsupported_mock_components:
+            allowed = ', '.join(sorted(MOCKABLE_COMPONENTS))
+            unsupported = ', '.join(sorted(unsupported_mock_components))
+            raise ValueError(
+                f'unsupported mock components: {unsupported}; expected only: {allowed}'
+            )
         runtime_root = (
             repo_root
             if self.runtime_root is None
@@ -297,6 +309,7 @@ class RuntimeConfig:
             tuple(float(weight) for weight in self.task_instruction_weights),
         )
         object.__setattr__(self, 'repo_root', repo_root)
+        object.__setattr__(self, 'mock_components', mock_components)
         object.__setattr__(self, 'runtime_root', runtime_root)
         object.__setattr__(self, 'runtime_sessions_dir', runtime_root / 'runtime_sessions')
         object.__setattr__(self, 'runtime_frames_dir', runtime_root / 'runtime_frames')
