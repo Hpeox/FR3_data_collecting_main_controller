@@ -271,7 +271,7 @@ def test_gripper_plot_renders_tactile_preview_and_deletes_preview(tmp_path):
     force_resultant[1, :, 5] = [1.0, 1.1, 1.2]
     np.savez(
         preview_path,
-        sensor_ids=np.array(['OG000544', 'OG001009']),
+        sensor_ids=np.array(['OG001622', 'OG001623']),
         frame_index=np.arange(3, dtype=np.int64),
         force_resultant=force_resultant,
         edge_warning=np.array([False, True]),
@@ -279,14 +279,14 @@ def test_gripper_plot_renders_tactile_preview_and_deletes_preview(tmp_path):
     )
 
     loaded = load_tactile_preview(preview_path)
-    assert loaded.sensor_ids == ('OG000544', 'OG001009')
+    assert loaded.sensor_ids == ('OG001622', 'OG001623')
 
     result = render_gripper_plot(npz_path, output_path, preview_path)
 
     assert output_path.read_bytes().startswith(b'\x89PNG\r\n\x1a\n')
     assert result['tactile_preview_ok'] is True
     assert result['tactile_samples'] == 3
-    assert result['tactile_sensor_ids'] == ['OG000544', 'OG001009']
+    assert result['tactile_sensor_ids'] == ['OG001622', 'OG001623']
     assert not preview_path.exists()
 
 

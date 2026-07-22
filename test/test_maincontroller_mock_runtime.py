@@ -864,8 +864,8 @@ def test_xense_mock_demo_finalizes_with_tactile_qc_preview_and_alignment(tmp_pat
                 'has_warning': False,
                 'warnings': [],
                 'sensors': [
-                    {'sensor_id': 'OG000544', 'zero_force': True, 'edge_warning': False},
-                    {'sensor_id': 'OG001009', 'zero_force': True, 'edge_warning': False},
+                    {'sensor_id': 'OG001622', 'zero_force': True, 'edge_warning': False},
+                    {'sensor_id': 'OG001623', 'zero_force': True, 'edge_warning': False},
                 ],
             },
             'xense_tactile_preview': {
@@ -956,10 +956,10 @@ def test_xense_tactile_warning_keeps_done_and_plot_uses_preview_payload(tmp_path
             'xense_tactile_postcheck': {
                 'ok': True,
                 'has_warning': True,
-                'warnings': ['OG001009 tactile edge warning'],
+                'warnings': ['OG001623 tactile edge warning'],
                 'sensors': [
-                    {'sensor_id': 'OG000544', 'zero_force': False, 'edge_warning': False},
-                    {'sensor_id': 'OG001009', 'zero_force': False, 'edge_warning': True},
+                    {'sensor_id': 'OG001622', 'zero_force': False, 'edge_warning': False},
+                    {'sensor_id': 'OG001623', 'zero_force': False, 'edge_warning': True},
                 ],
             },
             'xense_tactile_preview': {
@@ -997,8 +997,8 @@ def test_xense_tactile_postcheck_failure_marks_failed_and_skips_alignment_plot(t
                 'has_warning': False,
                 'warnings': ['exactly one tactile sensor is zero-force'],
                 'sensors': [
-                    {'sensor_id': 'OG000544', 'zero_force': True, 'edge_warning': False},
-                    {'sensor_id': 'OG001009', 'zero_force': False, 'edge_warning': False},
+                    {'sensor_id': 'OG001622', 'zero_force': True, 'edge_warning': False},
+                    {'sensor_id': 'OG001623', 'zero_force': False, 'edge_warning': False},
                 ],
             },
             'xense_tactile_preview': {
@@ -1021,7 +1021,7 @@ def test_xense_tactile_postcheck_failure_marks_failed_and_skips_alignment_plot(t
         manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'failed'
         assert manifest['failure_stage'] == 'xense_tactile_postcheck'
-        assert manifest['failure_reason'] == 'exactly one tactile sensor is zero-force: OG000544'
+        assert manifest['failure_reason'] == 'exactly one tactile sensor is zero-force: OG001622'
         assert manifest['xense_tactile_postcheck']['ok'] is False
         assert calls == []
         assert controller.get_state() == ControllerState.STOPPED
