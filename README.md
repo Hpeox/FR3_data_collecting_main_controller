@@ -30,12 +30,32 @@ ros2 run main_controller main_controller -- \
 
 ```bash
 ros2 run main_controller main_controller -- \
-  --task-name gear-insert-big2small \
   --repo-root /home/robot/Desktop/gello-deploy \
   --zmq-connect tcp://192.168.10.37:6000 \
   --xense-sdk-version 2.0.1 \
   --sensor-flush-timeout-s 300 \
-  --alignment-base realsense:bundle
+  --alignment-base realsense:bundle \
+  --task-name 16mm-peg-in-hole
+```
+
+```bash
+ros2 run main_controller main_controller -- \
+  --repo-root /home/robot/Desktop/gello-deploy \
+  --zmq-connect tcp://192.168.10.37:6000 \
+  --xense-sdk-version 2.0.1 \
+  --sensor-flush-timeout-s 300 \
+  --alignment-base realsense:bundle \
+  --task-name gear-insert-big2small
+```
+
+```bash
+ros2 run main_controller main_controller -- \
+  --repo-root /home/robot/Desktop/gello-deploy \
+  --zmq-connect tcp://192.168.10.37:6000 \
+  --xense-sdk-version 2.0.1 \
+  --sensor-flush-timeout-s 300 \
+  --alignment-base realsense:bundle \
+  --task-name waterproof-connector-insert
 ```
 
 保存到 `/data/external/runtime/runtime_sessions/` 和
