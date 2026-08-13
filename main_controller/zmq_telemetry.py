@@ -25,6 +25,7 @@ class TelemetryFrame:
     """Decoded telemetry frame from the remote relay."""
 
     source: int
+    flags: int
     seq: int
     stamp: float
     valid_mask: int
@@ -38,7 +39,7 @@ def unpack_frame(payload: bytes) -> TelemetryFrame:
     if len(payload) != FRAME_SIZE:
         raise ValueError(f'expected telemetry frame size {FRAME_SIZE}, got {len(payload)}')
     unpacked = FRAME_STRUCT.unpack(payload)
-    magic, version, source, _flags, seq, stamp, valid_mask = unpacked[:7]
+    magic, version, source, flags, seq, stamp, valid_mask = unpacked[:7]
     if magic != MAGIC:
         raise ValueError(f'invalid telemetry magic {magic!r}')
     if version != VERSION:
@@ -46,6 +47,7 @@ def unpack_frame(payload: bytes) -> TelemetryFrame:
     floats = tuple(float(item) for item in unpacked[7 : 7 + FLOAT_COUNT])
     return TelemetryFrame(
         source=int(source),
+        flags=int(flags),
         seq=int(seq),
         stamp=float(stamp),
         valid_mask=int(valid_mask),

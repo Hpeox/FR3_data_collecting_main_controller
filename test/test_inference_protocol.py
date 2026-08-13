@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import mmap
-import socket
+import queue
+import sys
 import threading
 import time
 from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from main_controller.aligned_health import (
     ABI_VERSION,
@@ -47,6 +50,37 @@ def status(sequence: int, name: str, phase: str) -> bytes:
     )
 
 
+class MemoryPacketEndpoint:
+    def __init__(self):
+        self.incoming = queue.Queue()
+        self.peer = None
+        self.closed = False
+
+    def sendall(self, packet):
+        if self.closed or self.peer is None:
+            raise OSError('closed')
+        self.peer.incoming.put(bytes(packet))
+
+    def recv(self, _size):
+        return self.incoming.get()
+
+    def shutdown(self, _how):
+        self.closed = True
+        if self.peer is not None:
+            self.peer.incoming.put(b'')
+
+    def close(self):
+        self.closed = True
+
+
+def memory_packet_pair():
+    first = MemoryPacketEndpoint()
+    second = MemoryPacketEndpoint()
+    first.peer = second
+    second.peer = first
+    return first, second
+
+
 def test_protocol_strict_round_trip():
     command = json.loads(make_command(7, 'INITIALIZE'))
     assert command == {
@@ -64,7 +98,7 @@ def test_protocol_strict_round_trip():
 
 
 def test_transaction_waits_for_completion_status_and_rejection_does_not():
-    client_socket, server_socket = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    client_socket, server_socket = memory_packet_pair()
     client = ControlledClient('/unused')
     client._socket = client_socket
     client._receiver = threading.Thread(target=client._receive_loop, daemon=True)
@@ -94,7 +128,7 @@ def test_transaction_waits_for_completion_status_and_rejection_does_not():
 
 
 def test_ordinary_lock_serializes_transactions():
-    client_socket, server_socket = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    client_socket, server_socket = memory_packet_pair()
     client = ControlledClient('/unused')
     client._socket = client_socket
     client._receiver = threading.Thread(target=client._receive_loop, daemon=True)

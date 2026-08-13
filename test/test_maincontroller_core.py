@@ -196,6 +196,7 @@ def test_zmq_unpack_frame_minimal():
     frame = unpack_frame(payload)
 
     assert frame.source == 2
+    assert frame.flags == 0
     assert frame.seq == 42
     assert frame.stamp == 1.25
     assert frame.valid_mask == 2

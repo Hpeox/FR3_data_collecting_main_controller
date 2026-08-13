@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from dataclasses import dataclass, field
@@ -109,11 +110,10 @@ class InferenceConfig:
             f'--robot.command_endpoint={self.robot_command_endpoint}',
             f'--robot.telemetry_endpoint={self.robot_telemetry_endpoint}',
             f'--robot.observation_shm_name={self.observation_shm_name}',
-            f'--robot.realsense_shm_names={list(self.realsense_shm_names)!r}',
+            f'--robot.realsense_shm_names={json.dumps(self.realsense_shm_names)}',
             f'--robot.xense_shm_name={self.xense_shm_name}',
             f'--robot.ft300s_shm_name={self.ft_shm_name}',
             f'--robot.max_snapshot_age_ms={self.lerobot_aligned_max_age_ms}',
             f'--task={self.task}',
             '--duration=0',
         ]
-
