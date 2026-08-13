@@ -203,6 +203,32 @@ FT300S 字段使用 `ft300s_*` key，报告中显示为 `FT300S`；Xense 两路�
 
 TODO: materialize 实际训练数据暂不作为当前可用命令提供；需要先确认数据集具体组织格式。
 
+## Persistent inference controller
+
+The inference controller is a separate entrypoint and does not change the existing collection controller:
+
+```bash
+ros2 run main_controller inference_main_controller -- \
+  --repo-root /home/robot/Desktop/gello-deploy \
+  --policy-path /path/to/policy \
+  --task "task instruction" \
+  --zmq-connect tcp://192.168.1.37:6000 \
+  --robot-command-endpoint tcp://192.168.1.37:6001 \
+  --robot-telemetry-endpoint tcp://192.168.1.37:6000
+```
+
+It launches one persistent `lerobot-rollout --strategy.type=controlled` worker for the full inference session. Operator actions are explicit and state-validated when received:
+
+- `i`: prepare the next rollout with `INITIALIZE`.
+- `s`: start the prepared rollout and its recording.
+- `d`: normally stop and save the current rollout.
+- `a`: abort and fail the current rollout recording without ending the session.
+- `q`: normally terminate the session. From `RUNNING`, the controller first completes `STOP` and recording finalization, then sends `SHUTDOWN`.
+
+Invalid actions are rejected immediately and are not deferred into a later lifecycle state. `JUMP_HOLD` and aligned-observation sequence stalls abort only the active rollout. Required workstation process failure, LeRobot failure, and recording subsystem failure terminate the session through `FAIL_STOP`.
+
+Each run writes `runtime_sessions/inference_*/controller_events.jsonl`, a `session_manifest.json`, process logs, and per-rollout raw low-dimensional `.npz`, rosbag, and manifest artifacts. The implementation-to-constraint audit is maintained in `docs/inference_main_controller_constraint_conformance.md`.
+
 ## 监控与故障处理
 
 主控会持续读取 ZMQ，即使当前处于暂停状态也不会停止 drain，避免远端队列溢出。采集时会监控 FT300S、Xense、ZMQ 和 RealSense metadata 的 frame id / seq 连续性与帧间隔；发现不连续或间隔显著变大时，会同时打印到终端并写入 log。

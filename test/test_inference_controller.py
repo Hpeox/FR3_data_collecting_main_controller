@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,10 +22,11 @@ from main_controller.zmq_telemetry import TelemetryFrame
 
 
 def config(tmp_path, **overrides):
-    for relative in ('FT300S', 'XenseTacSensor', 'RealSense/launch'):
+    for relative in ('FT300S', 'XenseTacSensor', 'RealSense/launch', 'LeRobotFR3'):
         (tmp_path / relative).mkdir(parents=True, exist_ok=True)
     for relative in (
         'RealSense/launch/four_realsense_640x480_30.launch.py',
+        'RealSense/launch/four_realsense_shm_runtime.launch.py',
         'RealSense/launch/rosbag2_recorder.launch.py',
     ):
         (tmp_path / relative).touch()
@@ -286,6 +288,22 @@ def test_worker_shutdown_rejection_keeps_session_alive(tmp_path):
     assert not instance._resources_stopped
 
 
+def test_shutdown_from_running_settles_rollout_before_wire_shutdown(tmp_path):
+    instance = controller(tmp_path)
+    instance.set_state(InferenceState.RUNNING)
+    instance._begin_recording()
+    assert instance.admit_user_action('shutdown')
+    instance.handle_command(instance.commands.get_nowait())
+    assert instance.control.transactions == ['STOP']
+    assert instance.control.sent == ['SHUTDOWN']
+    assert instance.get_state() == InferenceState.STOPPED
+    manifest = json.loads(
+        (instance.session_dir / 'rollouts' / 'rollout_0001' / 'manifest.json').read_text()
+    )
+    assert manifest['status'] == 'done'
+    assert manifest['reason'] == 'user_shutdown'
+
+
 def test_required_process_exit_is_session_fatal_without_restart(tmp_path):
     instance = controller(tmp_path)
     observed = []
@@ -293,3 +311,19 @@ def test_required_process_exit_is_session_fatal_without_restart(tmp_path):
     instance._on_process_exit('realsense', 7)
     assert observed == [('realsense_unexpected_exit', 'returncode=7')]
     assert not hasattr(instance.processes.get('realsense'), 'restart')
+
+
+def test_fault_promotes_in_progress_shutdown_to_fail_stop(tmp_path):
+    instance = controller(tmp_path)
+    started = threading.Event()
+    instance._execute_fail_stop = started.set
+    instance.termination_mode = 'SHUTDOWN'
+    instance.termination_reason = 'user_requested'
+    instance.set_state(InferenceState.SHUTTING_DOWN)
+    instance.request_fail_stop('realsense_unexpected_exit', 'returncode=7')
+    assert started.wait(timeout=1.0)
+    assert instance.termination_mode == 'FAIL_STOP'
+    assert instance.termination_reason == 'realsense_unexpected_exit: returncode=7'
+    assert instance.get_state() == InferenceState.FAIL_STOPPING
+    assert instance._termination_thread is not None
+    instance._termination_thread.join(timeout=1.0)

@@ -11,6 +11,11 @@ from pathlib import Path
 from .config import XENSE_SDK_CONDA_ENVS, validate_repo_root
 
 
+EXPECTED_REALSENSE_SHM_NAMES = (
+    '/realsense_cam1', '/realsense_cam2', '/realsense_cam3', '/realsense_cam4',
+)
+
+
 def default_control_socket_path() -> str:
     """Return the per-user LeRobot Controlled socket path."""
     return f'/run/user/{os.getuid()}/lerobot_controlled.sock'
@@ -28,9 +33,7 @@ class InferenceConfig:
     runtime_frames_dir: Path = field(init=False)
     control_socket_path: str = field(default_factory=default_control_socket_path)
     observation_shm_name: str = '/fr3_aligned_observation'
-    realsense_shm_names: tuple[str, ...] = (
-        '/realsense_cam1', '/realsense_cam2', '/realsense_cam3', '/realsense_cam4',
-    )
+    realsense_shm_names: tuple[str, ...] = EXPECTED_REALSENSE_SHM_NAMES
     zmq_connect: str = 'tcp://192.168.1.37:6000'
     robot_command_endpoint: str = 'tcp://192.168.1.37:6001'
     robot_telemetry_endpoint: str = 'tcp://192.168.1.37:6000'
@@ -63,7 +66,18 @@ class InferenceConfig:
             raise ValueError('policy_path must be a non-empty string')
         if not isinstance(self.task, str) or not self.task.strip():
             raise ValueError('task must be a non-empty string')
+        if '\0' in self.task:
+            raise ValueError('task must not contain NUL characters')
+        if not self.control_socket_path:
+            raise ValueError('control_socket_path must be non-empty')
         root = validate_repo_root(self.repo_root)
+        inference_requirements = (
+            root / 'LeRobotFR3',
+            root / 'RealSense' / 'launch' / 'four_realsense_shm_runtime.launch.py',
+        )
+        missing = [str(path) for path in inference_requirements if not path.exists()]
+        if missing:
+            raise ValueError(f'inference repo requirements are missing: {missing}')
         runtime_root = root if self.runtime_root is None else Path(self.runtime_root).expanduser().resolve()
         if self.xense_sdk_version not in XENSE_SDK_CONDA_ENVS:
             raise ValueError(f'unsupported xense_sdk_version: {self.xense_sdk_version}')
@@ -89,10 +103,10 @@ class InferenceConfig:
                 'aligned_stall_timeout_s must be shorter than '
                 'lerobot_aligned_max_age_ms'
             )
-        if len(self.realsense_shm_names) == 0 or len(set(self.realsense_shm_names)) != len(self.realsense_shm_names):
-            raise ValueError('realsense_shm_names must be non-empty and unique')
-        if any(not name.startswith('/') or '/' in name[1:] for name in self.realsense_shm_names):
-            raise ValueError('realsense_shm_names must be simple POSIX SHM names')
+        if self.realsense_shm_names != EXPECTED_REALSENSE_SHM_NAMES:
+            raise ValueError(
+                'realsense_shm_names must match the current four-camera RealSense runtime'
+            )
         object.__setattr__(self, 'repo_root', root)
         object.__setattr__(self, 'runtime_root', runtime_root)
         object.__setattr__(self, 'runtime_sessions_dir', runtime_root / 'runtime_sessions')

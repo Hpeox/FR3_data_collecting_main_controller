@@ -26,6 +26,7 @@ from .zmq_telemetry import TelemetryFrame, ZmqTelemetryReceiver
 
 
 SOURCE_ROBOT = 2
+VALID_ROBOT = 1 << 1
 ROBOT_TELEMETRY_FLAG_RESETTING = 1 << 0
 ROBOT_TELEMETRY_FLAG_JUMP_HOLD = 1 << 1
 
@@ -111,7 +112,7 @@ class InferenceMainController:
 
     def __init__(self, config: InferenceConfig):
         self.config = config
-        self.run_id = time.strftime('inference_%Y%m%d_%H%M%S')
+        self.run_id = time.strftime('inference_%Y%m%d_%H%M%S') + f'_{os.getpid()}_{time.time_ns()}'
         self.session_dir = config.runtime_sessions_dir / self.run_id
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.logger = JsonlLogger(self.session_dir / 'controller_events.jsonl')
@@ -136,11 +137,13 @@ class InferenceMainController:
         self.rollout_started_ns: int | None = None
         self.rosbag_uri: Path | None = None
         self.recording_active = False
+        self._recording_lock = threading.RLock()
         self.rollout_index = 0
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: threading.Thread | None = None
         self._termination_thread: threading.Thread | None = None
         self._termination_lock = threading.Lock()
+        self._finalize_lock = threading.Lock()
         self.termination_mode: str | None = None
         self.termination_reason: str | None = None
         self._resources_stopped = False
@@ -186,8 +189,10 @@ class InferenceMainController:
             self.aligned_reader = AlignedHealthReader(self.config.observation_shm_name)
             health = self.aligned_reader.read()
             if health.fatal:
-                raise RuntimeError(
-                    f'aligned observation reports fatal {health.status_code}: {health.message}'
+                self.log(
+                    'sensorhub_fatal_observed',
+                    status_code=health.status_code,
+                    message=health.message,
                 )
             if not health.ready:
                 raise RuntimeError('aligned observation SHM is not ready')
@@ -204,6 +209,7 @@ class InferenceMainController:
             ('start', InferenceState.READY): InferenceState.STARTING,
             ('stop', InferenceState.RUNNING): InferenceState.STOPPING_ROLLOUT,
             ('abort', InferenceState.RUNNING): InferenceState.ABORTING,
+            ('shutdown', InferenceState.RUNNING): InferenceState.SHUTTING_DOWN,
             ('shutdown', InferenceState.WAIT_START): InferenceState.SHUTTING_DOWN,
             ('shutdown', InferenceState.READY): InferenceState.SHUTTING_DOWN,
         }
@@ -230,7 +236,23 @@ class InferenceMainController:
     def request_fail_stop(self, reason: str, message: str) -> None:
         """Establish a session-fatal intent once and execute it asynchronously."""
         with self._termination_lock:
-            if self.termination_mode is not None:
+            if self.state == InferenceState.STOPPED:
+                return
+            if self.termination_mode == 'FAIL_STOP':
+                return
+            if self.termination_mode == 'SHUTDOWN':
+                self.termination_mode = 'FAIL_STOP'
+                self.termination_reason = f'{reason}: {message}'
+                with self.state_lock:
+                    if self.state != InferenceState.STOPPED:
+                        self._set_state_locked(InferenceState.FAIL_STOPPING)
+                self.log('session_shutdown_promoted_to_fail_stop', reason=reason, message=message)
+                self._termination_thread = threading.Thread(
+                    target=self._execute_fail_stop,
+                    name='InferenceFailStop',
+                    daemon=True,
+                )
+                self._termination_thread.start()
                 return
             self.termination_mode = 'FAIL_STOP'
             self.termination_reason = f'{reason}: {message}'
@@ -258,7 +280,7 @@ class InferenceMainController:
             reason = payload.get('reason', 'user_abort')
             self._abort_rollout(str(reason), payload)
         elif command.name == 'shutdown':
-            self._execute_shutdown()
+            self._execute_shutdown((command.payload or {}).get('received_state'))
         elif command.name == 'rollout_completed':
             if self.get_state() == InferenceState.STOPPING_ROLLOUT:
                 try:
@@ -350,6 +372,10 @@ class InferenceMainController:
             self.request_fail_stop('lerobot_control_disconnect', str(exc))
 
     def _begin_recording(self) -> None:
+        with self._recording_lock:
+            self._begin_recording_locked()
+
+    def _begin_recording_locked(self) -> None:
         self.rollout_index += 1
         rollout_dir = self.session_dir / 'rollouts' / f'rollout_{self.rollout_index:04d}'
         rollout_dir.mkdir(parents=True, exist_ok=False)
@@ -370,16 +396,21 @@ class InferenceMainController:
             for client in started_sensors:
                 try:
                     self._sensor_command(
-                        client, MsgType.STOP_REQ, 'STOP_REQ', self.config.sensor_flush_timeout_s
+                        client, MsgType.STOP_REQ, 'STOP_REQ', self.config.sensor_ack_timeout_s
                     )
                 except BaseException:
                     pass
             raise
 
     def _finish_recording(self, status: str, extra: dict[str, Any]) -> Path | None:
+        with self._recording_lock:
+            return self._finish_recording_locked(status, extra)
+
+    def _finish_recording_locked(self, status: str, extra: dict[str, Any]) -> Path | None:
         store = self.rollout_store
         if store is None:
             return None
+        self.recording_active = False
         sensor_payloads: dict[str, dict[str, Any]] = {}
         errors: list[str] = []
         message_type = MsgType.DEMO_DONE_REQ if status == 'done' else MsgType.STOP_REQ
@@ -396,12 +427,11 @@ class InferenceMainController:
                 )
             except BaseException as exc:
                 errors.append(f'{client.name}: {exc}')
-        if self.rosbag is not None and self.recording_active:
+        if self.rosbag is not None:
             try:
                 self.rosbag.stop(timeout_s=self.config.rosbag_timeout_s)
             except BaseException as exc:
                 errors.append(f'rosbag: {exc}')
-        self.recording_active = False
         npz = store.save()
         final_status = status if not errors else 'failed'
         manifest = {
@@ -471,9 +501,10 @@ class InferenceMainController:
                 self.request_fail_stop('aligned_health_read_failure', str(exc))
                 return
             if health.fatal:
-                self.request_fail_stop(
-                    'sensorhub_fatal_observed',
-                    f'{health.status_code}: {health.message}',
+                self.log(
+                    'sensorhub_fatal_observed_waiting_for_lerobot',
+                    status_code=health.status_code,
+                    message=health.message,
                 )
                 return
             if not health.ready:
@@ -497,7 +528,7 @@ class InferenceMainController:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=1.0)
 
-    def _execute_shutdown(self) -> None:
+    def _execute_shutdown(self, received_state: str | None = None) -> None:
         with self._termination_lock:
             if self.termination_mode is not None:
                 return
@@ -506,14 +537,20 @@ class InferenceMainController:
         self.log('session_shutdown_requested')
         try:
             control = self._require_control()
+            if received_state == InferenceState.RUNNING.name:
+                settled = control.transact('STOP', {'STOPPED'})
+                if not settled.ack.accepted:
+                    raise RuntimeError(
+                        f'LeRobot rejected STOP during SHUTDOWN: '
+                        f'{settled.ack.code} in {settled.ack.phase}'
+                    )
+                self._stop_watchdog()
+                self._finish_recording('done', {'reason': 'user_shutdown'})
             sequence = control.send('SHUTDOWN')
             ack = control.wait_for_ack(sequence)
         except BaseException as exc:
-            self.termination_mode = 'FAIL_STOP'
-            self.termination_reason = f'shutdown_failure: {exc}'
-            self.set_state(InferenceState.FAIL_STOPPING)
             self.log('shutdown_failed', error=str(exc))
-            self._execute_fail_stop()
+            self.request_fail_stop('shutdown_failure', str(exc))
             return
         if not ack.accepted:
             self.termination_mode = None
@@ -522,10 +559,9 @@ class InferenceMainController:
             self.log('shutdown_rejected', code=ack.code, phase=ack.phase)
             return
         self._wait_for_worker_exit()
-        self._stop_runtime_resources()
-        self._write_session_manifest()
-        self.set_state(InferenceState.STOPPED)
-        self._close_logger()
+        if self.termination_mode == 'FAIL_STOP':
+            return
+        self._finalize_session()
 
     def _execute_fail_stop(self) -> None:
         self._stop_watchdog()
@@ -558,9 +594,17 @@ class InferenceMainController:
             if process is not None and process.poll() is None:
                 self._wait_for_worker_exit()
         finally:
+            self._finalize_session()
+
+    def _finalize_session(self) -> None:
+        """Stop remaining dependencies and persist one terminal session record."""
+        with self._finalize_lock:
+            if self.get_state() == InferenceState.STOPPED:
+                return
             self._stop_runtime_resources()
-            self._write_session_manifest()
-            self.set_state(InferenceState.STOPPED)
+            with self._termination_lock:
+                self._write_session_manifest()
+                self.set_state(InferenceState.STOPPED)
             self._close_logger()
 
     def _wait_for_worker_exit(self) -> None:
@@ -572,8 +616,19 @@ class InferenceMainController:
         while process.poll() is None and time.monotonic() < deadline:
             time.sleep(0.02)
         if process.poll() is None:
+            if self.termination_mode == 'SHUTDOWN':
+                self.request_fail_stop(
+                    'lerobot_shutdown_timeout',
+                    f'worker did not exit within {self.config.worker_exit_timeout_s}s',
+                )
             self.log('lerobot_force_terminate')
             process.stop(grace_s=1.0)
+        returncode = process.poll()
+        if self.termination_mode == 'SHUTDOWN' and returncode not in {None, 0}:
+            self.request_fail_stop(
+                'lerobot_shutdown_failure',
+                f'worker exited with returncode={returncode}',
+            )
 
     def _start_receivers(self) -> None:
         self.zmq_receiver = ZmqTelemetryReceiver(
@@ -721,7 +776,11 @@ class InferenceMainController:
         recv_time_ns: int,
         recv_monotonic_ns: int,
     ) -> None:
-        if frame.source == SOURCE_ROBOT and frame.flags & ROBOT_TELEMETRY_FLAG_JUMP_HOLD:
+        if (
+            frame.source == SOURCE_ROBOT
+            and frame.valid_mask & VALID_ROBOT
+            and frame.flags & ROBOT_TELEMETRY_FLAG_JUMP_HOLD
+        ):
             self.request_rollout_abort(
                 'jump_hold',
                 {'telemetry_sequence': frame.seq, 'telemetry_flags': frame.flags},

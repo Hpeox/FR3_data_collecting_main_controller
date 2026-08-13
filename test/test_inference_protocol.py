@@ -186,10 +186,11 @@ def test_aligned_health_reader_reads_header_only(tmp_path):
 
 
 def test_inference_config_enforces_watchdog_order_and_no_reset_target(tmp_path):
-    for relative in ('FT300S', 'XenseTacSensor', 'RealSense/launch'):
+    for relative in ('FT300S', 'XenseTacSensor', 'RealSense/launch', 'LeRobotFR3'):
         (tmp_path / relative).mkdir(parents=True, exist_ok=True)
     for relative in (
         'RealSense/launch/four_realsense_640x480_30.launch.py',
+        'RealSense/launch/four_realsense_shm_runtime.launch.py',
         'RealSense/launch/rosbag2_recorder.launch.py',
     ):
         (tmp_path / relative).touch()
@@ -203,3 +204,18 @@ def test_inference_config_enforces_watchdog_order_and_no_reset_target(tmp_path):
             policy_path='policy', task='task', repo_root=tmp_path,
             aligned_stall_timeout_s=0.1, lerobot_aligned_max_age_ms=100,
         )
+
+
+def test_response_correlation_rejects_wrong_ack_operation():
+    client_socket, server_socket = memory_packet_pair()
+    client = ControlledClient('/unused')
+    client._socket = client_socket
+    client._receiver = threading.Thread(target=client._receive_loop, daemon=True)
+    client._receiver.start()
+    sequence = client.send('INITIALIZE')
+    server_socket.recv(1025)
+    server_socket.sendall(ack(sequence, 'START'))
+    with pytest.raises(Exception, match='operation'):
+        client.wait_for_ack(sequence)
+    client.close()
+    server_socket.close()

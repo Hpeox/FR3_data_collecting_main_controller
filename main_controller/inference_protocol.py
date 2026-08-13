@@ -171,7 +171,9 @@ class ControlledClient:
         self._ordinary_lock = threading.Lock()
         self._condition = threading.Condition()
         self._acks: dict[int, Ack] = {}
+        self._sent_operations: dict[int, str] = {}
         self._statuses: list[Status] = []
+        self._last_status_sequence = -1
         self._stop = threading.Event()
         self._disconnected = threading.Event()
         self._error: BaseException | None = None
@@ -269,9 +271,13 @@ class ControlledClient:
         if sock is None:
             raise ControlledClientDisconnected('LeRobot control socket is not connected')
         try:
+            with self._condition:
+                self._sent_operations[sequence] = operation
             with self._send_lock:
                 sock.sendall(packet)
         except OSError as exc:
+            with self._condition:
+                self._sent_operations.pop(sequence, None)
             self._mark_disconnected(ControlledClientDisconnected(f'LeRobot control send failed: {exc}'))
             raise ControlledClientDisconnected(f'LeRobot control send failed: {exc}') from exc
         return sequence
@@ -314,8 +320,26 @@ class ControlledClient:
                 callback_status: Status | None = None
                 with self._condition:
                     if isinstance(response, Ack):
+                        expected = self._sent_operations.get(response.sequence)
+                        if expected is None:
+                            raise ControlledClientProtocolError(
+                                f'ACK references unknown sequence {response.sequence}'
+                            )
+                        if response.operation != expected:
+                            raise ControlledClientProtocolError(
+                                f'ACK operation {response.operation} does not match {expected}'
+                            )
+                        if response.sequence in self._acks:
+                            raise ControlledClientProtocolError(
+                                f'duplicate ACK for sequence {response.sequence}'
+                            )
                         self._acks[response.sequence] = response
                     else:
+                        if response.sequence <= self._last_status_sequence:
+                            raise ControlledClientProtocolError(
+                                'STATUS sequence must be strictly increasing'
+                            )
+                        self._last_status_sequence = response.sequence
                         self._statuses.append(response)
                         callback_status = response
                     self._condition.notify_all()
@@ -339,4 +363,3 @@ class ControlledClient:
             if isinstance(self._error, BaseException):
                 raise ControlledClientDisconnected(str(self._error)) from self._error
             raise ControlledClientDisconnected('LeRobot control socket disconnected')
-

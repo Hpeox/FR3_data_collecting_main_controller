@@ -41,8 +41,8 @@ class AlignedHealthReader:
         self.shm_name = shm_name
         self.path = shm_root / clean
         self._fd = os.open(self.path, os.O_RDONLY)
-        size = os.fstat(self._fd).st_size
-        if size < GLOBAL_HEADER_SIZE:
+        self._size = os.fstat(self._fd).st_size
+        if self._size < GLOBAL_HEADER_SIZE:
             os.close(self._fd)
             raise ValueError('aligned observation SHM is smaller than its global header')
         self._mapping = mmap.mmap(
@@ -59,9 +59,20 @@ class AlignedHealthReader:
     def read(self) -> AlignedHealth:
         """Return one global-header snapshot without accessing any slot payload."""
         fields = GLOBAL_HEADER.unpack_from(self._mapping, 0)
-        magic, version, ready, global_size = fields[:4]
+        magic, version, ready, global_size, slot_header_size, total_size = fields[:6]
         if magic != MAGIC or version != ABI_VERSION or global_size != GLOBAL_HEADER_SIZE:
             raise ValueError('aligned observation SHM ABI is unsupported')
+        slot_count, width, height, camera_count, slot_stride = fields[6:11]
+        if (
+            total_size != self._size
+            or slot_count != 2
+            or width != 640
+            or height != 480
+            or camera_count <= 0
+            or slot_header_size <= 0
+            or slot_stride <= slot_header_size
+        ):
+            raise ValueError('aligned observation SHM metadata is invalid')
         latest_sequence = fields[11]
         fatal = fields[12]
         status_code = fields[13]
