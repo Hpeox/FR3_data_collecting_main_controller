@@ -184,6 +184,9 @@ FR3/LeRobot/NUC path.
 Explicit `q`/`shutdown` is the only graceful termination path. From `RUNNING`,
 MainController first sends `STOP` and completes recording finalization, then
 sends `SHUTDOWN` so LeRobot may perform its normal return-home behavior.
+After a positive SHUTDOWN ACK, closure of the LeRobot control socket is an
+expected part of worker teardown; MainController still requires a timely clean
+process exit. A disconnect before a positive ACK remains session-fatal.
 
 `shutdown` is rejected during blocking lifecycle operations such as
 `INITIALIZE`; it is not queued for later. The operator may request it again

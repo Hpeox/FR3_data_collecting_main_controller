@@ -145,6 +145,7 @@ class InferenceMainController:
         self._watchdog_thread: threading.Thread | None = None
         self._termination_thread: threading.Thread | None = None
         self._termination_lock = threading.Lock()
+        self._shutdown_sequence: int | None = None
         self._fail_stop_requested = threading.Event()
         self._realsense_startup_fatal = threading.Event()
         self._realsense_startup_fatal_lock = threading.Lock()
@@ -401,6 +402,24 @@ class InferenceMainController:
                 self.commands.put(InferenceCommand('rollout_completed'))
 
     def _on_control_disconnect(self, exc: BaseException) -> None:
+        with self._termination_lock:
+            shutdown_sequence = self._shutdown_sequence
+            control = self.control
+            shutdown_ack = (
+                control.ack_if_received(shutdown_sequence)
+                if (
+                    self.termination_mode == 'SHUTDOWN'
+                    and shutdown_sequence is not None
+                    and control is not None
+                )
+                else None
+            )
+            expected_shutdown_disconnect = (
+                shutdown_ack is not None and shutdown_ack.accepted
+            )
+        if expected_shutdown_disconnect:
+            self.log('lerobot_control_disconnected_expected_after_shutdown_ack')
+            return
         process = self.processes.get('lerobot')
         if process is not None and process.poll() is not None:
             self.request_fail_stop('lerobot_exit', f'exit code {process.poll()}')
@@ -676,6 +695,7 @@ class InferenceMainController:
                 return
             self.termination_mode = 'SHUTDOWN'
             self.termination_reason = 'user_requested'
+            self._shutdown_sequence = None
         self.log('session_shutdown_requested')
         try:
             control = self._require_control()
@@ -688,7 +708,14 @@ class InferenceMainController:
                     )
                 self._stop_watchdog()
                 self._finish_recording('done', {'reason': 'user_shutdown'})
-            sequence = control.send('SHUTDOWN')
+            with self._termination_lock:
+                if (
+                    self.termination_mode != 'SHUTDOWN'
+                    or self._fail_stop_requested.is_set()
+                ):
+                    return
+                sequence = control.send('SHUTDOWN')
+                self._shutdown_sequence = sequence
             ack = control.wait_for_ack(sequence)
         except BaseException as exc:
             self.log('shutdown_failed', error=str(exc))
@@ -705,6 +732,7 @@ class InferenceMainController:
                     rejection_ignored = False
                     self.termination_mode = None
                     self.termination_reason = None
+                    self._shutdown_sequence = None
                     with self.state_lock:
                         if self.state == InferenceState.SHUTTING_DOWN:
                             self._set_state_locked(InferenceState.WAIT_START)

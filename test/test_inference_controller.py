@@ -642,6 +642,60 @@ def test_worker_shutdown_rejection_keeps_session_alive(tmp_path):
     assert not instance._resources_stopped
 
 
+def test_positive_shutdown_ack_makes_control_disconnect_expected(tmp_path):
+    instance = controller(tmp_path)
+
+    class AckThenDisconnectControl(FakeControl):
+        def __init__(self):
+            super().__init__()
+            self.received_ack = None
+
+        def wait_for_ack(self, sequence):
+            self.received_ack = ack(sequence, 'SHUTDOWN')
+            instance._on_control_disconnect(
+                RuntimeError('LeRobot control socket disconnected')
+            )
+            return self.received_ack
+
+        def ack_if_received(self, sequence):
+            return self.received_ack
+
+    instance.control = AckThenDisconnectControl()
+    instance.processes['lerobot'] = FakeProcess()
+    instance._execute_fail_stop = lambda: None
+    instance._wait_for_worker_exit = lambda: None
+    instance._finalize_session = lambda: None
+    instance.set_state(InferenceState.SHUTTING_DOWN)
+
+    instance._execute_shutdown()
+
+    assert instance.termination_mode == 'SHUTDOWN'
+    assert instance.termination_reason == 'user_requested'
+    assert not instance._fail_stop_requested.is_set()
+
+
+def test_shutdown_control_disconnect_without_positive_ack_is_fail_stop(tmp_path):
+    instance = controller(tmp_path)
+    fail_stop_started = threading.Event()
+    instance._execute_fail_stop = fail_stop_started.set
+    instance.termination_mode = 'SHUTDOWN'
+    instance.termination_reason = 'user_requested'
+    instance._shutdown_sequence = 1
+    instance.control.sent.append('SHUTDOWN')
+    instance.control.ack_after = 2
+    instance.set_state(InferenceState.SHUTTING_DOWN)
+
+    instance._on_control_disconnect(
+        RuntimeError('LeRobot control socket disconnected')
+    )
+
+    assert fail_stop_started.wait(timeout=1.0)
+    assert instance.termination_mode == 'FAIL_STOP'
+    assert instance.termination_reason == (
+        'lerobot_control_disconnect: LeRobot control socket disconnected'
+    )
+
+
 def test_shutdown_rejection_cannot_clear_concurrent_fail_stop(tmp_path):
     instance = controller(tmp_path)
     ack_waiting = threading.Event()
