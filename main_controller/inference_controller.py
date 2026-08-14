@@ -985,6 +985,7 @@ class InferenceMainController:
         with self._termination_lock:
             if self._resources_stopped:
                 return
+            self.expected_process_exits.update(self.processes)
             self._resources_stopped = True
         self._stop_watchdog()
         if self.control is not None:
@@ -998,7 +999,6 @@ class InferenceMainController:
         for name in ('lerobot', 'rosbag_recorder', 'realsense', 'xense', 'ft300'):
             process = self.processes.get(name)
             if process is not None:
-                self.expected_process_exits.add(name)
                 process.stop()
         if self.rosbag is not None:
             try:

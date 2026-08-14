@@ -370,6 +370,32 @@ def test_required_process_exit_is_session_fatal_without_restart(tmp_path):
     assert not hasattr(instance.processes.get('realsense'), 'restart')
 
 
+def test_cleanup_marks_managed_exits_expected_before_closing_uds_clients(tmp_path):
+    instance = controller(tmp_path)
+    managed_names = {'lerobot', 'rosbag_recorder', 'realsense', 'xense', 'ft300'}
+    instance.processes = {name: FakeProcess() for name in managed_names}
+    instance.termination_mode = 'FAIL_STOP'
+    instance.termination_reason = 'original startup failure'
+    expected_snapshots = []
+    fail_stops = []
+
+    class ExitOnClientClose(FakeSensor):
+        def stop(self):
+            expected_snapshots.append(set(instance.expected_process_exits))
+            instance._on_process_exit(self.name, 1)
+
+    instance.ft_client = ExitOnClientClose('ft300')
+    instance.xense_client = ExitOnClientClose('xense')
+    instance.request_fail_stop = lambda reason, message: fail_stops.append((reason, message))
+
+    instance._stop_runtime_resources()
+
+    assert expected_snapshots[0] == managed_names
+    assert 'xense' in expected_snapshots[1]
+    assert fail_stops == []
+    assert instance.termination_reason == 'original startup failure'
+
+
 def test_recoverable_realsense_startup_fatal_restarts_without_fail_stop(tmp_path):
     instance = controller(tmp_path)
     process = FakeRestartableProcess()
