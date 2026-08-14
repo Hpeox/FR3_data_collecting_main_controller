@@ -58,7 +58,7 @@ Example using the repository-local runtime directories:
 ```bash
 ros2 run main_controller inference_main_controller -- \
   --repo-root /home/robot/Desktop/gello-deploy \
-  --policy-path /path/to/policy \
+  --policy-path "/home/robot/Desktop/gello-deploy/LeRobotFR3/outputs/acmt_dp/peg/real/seed42/pretrained_model" \
   --task "insert the peg into the hole" \
   --zmq-connect tcp://192.168.1.37:6000 \
   --robot-command-endpoint tcp://192.168.1.37:6001 \
