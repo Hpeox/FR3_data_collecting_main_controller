@@ -9,6 +9,7 @@ import queue
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
@@ -143,6 +144,7 @@ class InferenceMainController:
         self._watchdog_thread: threading.Thread | None = None
         self._termination_thread: threading.Thread | None = None
         self._termination_lock = threading.Lock()
+        self._fail_stop_requested = threading.Event()
         self._finalize_lock = threading.Lock()
         self.termination_mode: str | None = None
         self.termination_reason: str | None = None
@@ -161,7 +163,7 @@ class InferenceMainController:
                     continue
                 self.handle_command(command)
         except KeyboardInterrupt:
-            self.admit_user_action('shutdown')
+            self.request_fail_stop('keyboard_interrupt', 'KeyboardInterrupt/SIGINT received')
         except BaseException as exc:
             self.request_fail_stop('main_controller_internal_error', str(exc))
         finally:
@@ -184,9 +186,14 @@ class InferenceMainController:
             self._start_lerobot()
             assert self.control is not None
             ready = self.control.wait_for_status({'READY'})
+            self._ensure_startup_active()
             if ready.phase != 'WAIT_INITIALIZE':
                 raise RuntimeError(f'unexpected LeRobot READY phase: {ready.phase}')
-            self.aligned_reader = AlignedHealthReader(self.config.observation_shm_name)
+            self._run_startup_resource_step(
+                'aligned health reader',
+                self._register_aligned_reader,
+            )
+            assert self.aligned_reader is not None
             health = self.aligned_reader.read()
             if health.fatal:
                 self.log(
@@ -196,8 +203,7 @@ class InferenceMainController:
                 )
             if not health.ready:
                 raise RuntimeError('aligned observation SHM is not ready')
-            self.set_state(InferenceState.WAIT_START)
-            self.log('session_ready')
+            self._run_startup_resource_step('complete startup', self._mark_session_ready)
         except BaseException:
             self._stop_runtime_resources()
             raise
@@ -235,6 +241,7 @@ class InferenceMainController:
 
     def request_fail_stop(self, reason: str, message: str) -> None:
         """Establish a session-fatal intent once and execute it asynchronously."""
+        self._fail_stop_requested.set()
         with self._termination_lock:
             if self.state == InferenceState.STOPPED:
                 return
@@ -553,10 +560,27 @@ class InferenceMainController:
             self.request_fail_stop('shutdown_failure', str(exc))
             return
         if not ack.accepted:
-            self.termination_mode = None
-            self.termination_reason = None
-            self.set_state(InferenceState.WAIT_START)
-            self.log('shutdown_rejected', code=ack.code, phase=ack.phase)
+            with self._termination_lock:
+                if (
+                    self.termination_mode != 'SHUTDOWN'
+                    or self._fail_stop_requested.is_set()
+                ):
+                    rejection_ignored = True
+                else:
+                    rejection_ignored = False
+                    self.termination_mode = None
+                    self.termination_reason = None
+                    with self.state_lock:
+                        if self.state == InferenceState.SHUTTING_DOWN:
+                            self._set_state_locked(InferenceState.WAIT_START)
+            if rejection_ignored:
+                self.log(
+                    'shutdown_rejection_ignored_after_fail_stop',
+                    code=ack.code,
+                    phase=ack.phase,
+                )
+            else:
+                self.log('shutdown_rejected', code=ack.code, phase=ack.phase)
             return
         self._wait_for_worker_exit()
         if self.termination_mode == 'FAIL_STOP':
@@ -631,16 +655,19 @@ class InferenceMainController:
             )
 
     def _start_receivers(self) -> None:
-        self.zmq_receiver = ZmqTelemetryReceiver(
-            self.config.zmq_connect,
-            self._on_zmq_frame,
-            self._on_zmq_error,
-            lambda message: self.request_fail_stop('zmq_receiver_fatal', message),
-            destroy_context_on_stop=True,
-        )
-        self.zmq_receiver.start()
-        self.ft_client.start()
-        self.xense_client.start()
+        def start_zmq_receiver() -> None:
+            self.zmq_receiver = ZmqTelemetryReceiver(
+                self.config.zmq_connect,
+                self._on_zmq_frame,
+                self._on_zmq_error,
+                lambda message: self.request_fail_stop('zmq_receiver_fatal', message),
+                destroy_context_on_stop=True,
+            )
+            self.zmq_receiver.start()
+
+        self._run_startup_resource_step('ZMQ receiver', start_zmq_receiver)
+        self._run_startup_resource_step('FT300S UDS client', self.ft_client.start)
+        self._run_startup_resource_step('Xense UDS client', self.xense_client.start)
 
     def _start_processes(self) -> None:
         root = self.config.repo_root
@@ -669,8 +696,78 @@ class InferenceMainController:
             ),
         }
         for name, (command, fatal_patterns) in specs.items():
+            self._start_managed_process(
+                name,
+                command,
+                root,
+                logs / f'{name}.log',
+                fatal_patterns=fatal_patterns,
+            )
+
+    def _wait_services_ready(self) -> None:
+        self._ensure_startup_active()
+        if not self.ft_client.wait_connected(self.config.startup_timeout_s):
+            raise RuntimeError('FT300S UDS did not connect')
+        self._ensure_startup_active()
+        if not self.xense_client.wait_connected(self.config.startup_timeout_s):
+            raise RuntimeError('Xense UDS did not connect')
+        self._ensure_startup_active()
+        if not self.ft_client.wait_init_ready(self.config.init_timeout_s):
+            raise RuntimeError('FT300S did not report INIT_READY')
+        self._ensure_startup_active()
+        if not self.xense_client.wait_init_ready(self.config.init_timeout_s):
+            raise RuntimeError('Xense did not report INIT_READY')
+        self._ensure_startup_active()
+
+        def register_rosbag() -> None:
+            self.rosbag = RosbagControl(node_name=f'inference_rosbag_{os.getpid()}')
+
+        self._run_startup_resource_step('rosbag control', register_rosbag)
+        assert self.rosbag is not None
+        if not self.rosbag.wait_ready(self.config.startup_timeout_s):
+            raise RuntimeError('rosbag recorder services did not become ready')
+        self._ensure_startup_active()
+        self.rosbag.stop(timeout_s=self.config.rosbag_timeout_s)
+        self._ensure_startup_active()
+
+    def _start_lerobot(self) -> None:
+        self._start_managed_process(
+            'lerobot',
+            self.config.lerobot_command(),
+            self.config.repo_root / 'LeRobotFR3',
+            self.session_dir / 'process_logs' / 'lerobot.log',
+        )
+
+        def register_control() -> None:
+            self.control = ControlledClient(
+                self.config.control_socket_path,
+                on_status=self._on_control_status,
+                on_disconnect=self._on_control_disconnect,
+            )
+
+        self._run_startup_resource_step('LeRobot control client', register_control)
+        assert self.control is not None
+        self.control.connect(self.config.startup_timeout_s)
+        self._ensure_startup_active()
+
+    def _start_managed_process(
+        self,
+        name: str,
+        command: list[str],
+        cwd: Path,
+        log_path: Path,
+        *,
+        fatal_patterns: tuple[str, ...] = (),
+    ) -> ManagedProcess:
+        process: ManagedProcess | None = None
+
+        def register_and_start() -> None:
+            nonlocal process
             process = ManagedProcess(
-                name, command, root, logs / f'{name}.log',
+                name,
+                command,
+                cwd,
+                log_path,
                 fatal_patterns=fatal_patterns,
                 on_fatal=lambda process_name, line: self.request_fail_stop(
                     f'{process_name}_fatal', line
@@ -681,35 +778,35 @@ class InferenceMainController:
             process.start()
             self.log('process_started', process=name, command=command)
 
-    def _wait_services_ready(self) -> None:
-        if not self.ft_client.wait_connected(self.config.startup_timeout_s):
-            raise RuntimeError('FT300S UDS did not connect')
-        if not self.xense_client.wait_connected(self.config.startup_timeout_s):
-            raise RuntimeError('Xense UDS did not connect')
-        if not self.ft_client.wait_init_ready(self.config.init_timeout_s):
-            raise RuntimeError('FT300S did not report INIT_READY')
-        if not self.xense_client.wait_init_ready(self.config.init_timeout_s):
-            raise RuntimeError('Xense did not report INIT_READY')
-        self.rosbag = RosbagControl(node_name=f'inference_rosbag_{os.getpid()}')
-        if not self.rosbag.wait_ready(self.config.startup_timeout_s):
-            raise RuntimeError('rosbag recorder services did not become ready')
-        self.rosbag.stop(timeout_s=self.config.rosbag_timeout_s)
+        self._run_startup_resource_step(f'{name} process', register_and_start)
+        assert process is not None
+        return process
 
-    def _start_lerobot(self) -> None:
-        process = ManagedProcess(
-            'lerobot', self.config.lerobot_command(), self.config.repo_root / 'LeRobotFR3',
-            self.session_dir / 'process_logs' / 'lerobot.log',
-            on_exit=self._on_process_exit,
-        )
-        self.processes['lerobot'] = process
-        process.start()
-        self.log('process_started', process='lerobot', command=process.cmd)
-        self.control = ControlledClient(
-            self.config.control_socket_path,
-            on_status=self._on_control_status,
-            on_disconnect=self._on_control_disconnect,
-        )
-        self.control.connect(self.config.startup_timeout_s)
+    def _run_startup_resource_step(self, name: str, action: Callable[[], None]) -> None:
+        """Create/register/start one resource atomically against fatal teardown."""
+        with self._termination_lock:
+            self._ensure_startup_active_locked(name)
+            action()
+            self._ensure_startup_active_locked(name)
+
+    def _ensure_startup_active(self) -> None:
+        with self._termination_lock:
+            self._ensure_startup_active_locked('startup')
+
+    def _ensure_startup_active_locked(self, name: str) -> None:
+        if (
+            self._fail_stop_requested.is_set()
+            or self.termination_mode is not None
+            or self._resources_stopped
+        ):
+            raise RuntimeError(f'session termination began during {name}')
+
+    def _register_aligned_reader(self) -> None:
+        self.aligned_reader = AlignedHealthReader(self.config.observation_shm_name)
+
+    def _mark_session_ready(self) -> None:
+        self.set_state(InferenceState.WAIT_START)
+        self.log('session_ready', scope='main_controller_dependencies')
 
     def _stop_runtime_resources(self) -> None:
         with self._termination_lock:

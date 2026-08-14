@@ -27,11 +27,11 @@ class AlignedHealth:
 
 
 class AlignedHealthReader:
-    """Version-pinned read-only fallback for the external FR3OBS2 ABI.
+    """Version-pinned read-only representation of the stable FR3OBS2 ABI.
 
-    LeRobotFR3 currently has no public header-only client. Keeping the fallback
-    in this small module prevents the rollout watchdog from copying image and
-    tactile payloads or importing policy/robot implementation state.
+    Keeping this intentional process-boundary representation in a small module
+    prevents the rollout watchdog from copying image and tactile payloads or
+    importing policy/robot implementation state.
     """
 
     def __init__(self, shm_name: str, *, shm_root: Path = Path('/dev/shm')):

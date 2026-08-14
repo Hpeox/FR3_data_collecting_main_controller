@@ -7,8 +7,11 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import main_controller.inference_controller as inference_controller_module
 from main_controller.inference_config import InferenceConfig
 from main_controller.inference_controller import (
     InferenceCommand,
@@ -288,6 +291,35 @@ def test_worker_shutdown_rejection_keeps_session_alive(tmp_path):
     assert not instance._resources_stopped
 
 
+def test_shutdown_rejection_cannot_clear_concurrent_fail_stop(tmp_path):
+    instance = controller(tmp_path)
+    ack_waiting = threading.Event()
+    release_ack = threading.Event()
+    fail_stop_started = threading.Event()
+
+    def wait_for_rejected_ack(sequence):
+        ack_waiting.set()
+        assert release_ack.wait(timeout=1.0)
+        return ack(sequence, 'SHUTDOWN', accepted=False)
+
+    instance.control.wait_for_ack = wait_for_rejected_ack
+    instance._execute_fail_stop = fail_stop_started.set
+    instance.set_state(InferenceState.SHUTTING_DOWN)
+    shutdown_thread = threading.Thread(target=instance._execute_shutdown)
+    shutdown_thread.start()
+    assert ack_waiting.wait(timeout=1.0)
+
+    instance.request_fail_stop('realsense_unexpected_exit', 'returncode=7')
+    assert fail_stop_started.wait(timeout=1.0)
+    release_ack.set()
+    shutdown_thread.join(timeout=1.0)
+
+    assert not shutdown_thread.is_alive()
+    assert instance.termination_mode == 'FAIL_STOP'
+    assert instance.termination_reason == 'realsense_unexpected_exit: returncode=7'
+    assert instance.get_state() == InferenceState.FAIL_STOPPING
+
+
 def test_shutdown_from_running_settles_rollout_before_wire_shutdown(tmp_path):
     instance = controller(tmp_path)
     instance.set_state(InferenceState.RUNNING)
@@ -327,3 +359,99 @@ def test_fault_promotes_in_progress_shutdown_to_fail_stop(tmp_path):
     assert instance.get_state() == InferenceState.FAIL_STOPPING
     assert instance._termination_thread is not None
     instance._termination_thread.join(timeout=1.0)
+
+
+def test_startup_does_not_create_resources_after_fail_stop_is_established(
+    tmp_path,
+    monkeypatch,
+):
+    instance = InferenceMainController(config(tmp_path))
+    instance.termination_mode = 'FAIL_STOP'
+    instance._fail_stop_requested.set()
+    created = []
+
+    def unexpected_process_creation(*args, **kwargs):
+        created.append((args, kwargs))
+        raise AssertionError('startup created a process after FAIL_STOP')
+
+    monkeypatch.setattr(
+        inference_controller_module,
+        'ManagedProcess',
+        unexpected_process_creation,
+    )
+
+    with pytest.raises(RuntimeError, match='session termination began'):
+        instance._start_processes()
+    assert created == []
+    assert instance.processes == {}
+
+
+def test_fatal_process_callback_during_startup_stops_progress_and_owned_process(
+    tmp_path,
+    monkeypatch,
+):
+    instance = InferenceMainController(config(tmp_path))
+    created = []
+    started = []
+    callback_threads = []
+    later_steps = []
+
+    class FatalDuringStartProcess:
+        def __init__(self, name, cmd, cwd, log_path, **kwargs):
+            self.name = name
+            self.cmd = cmd
+            self.on_exit = kwargs['on_exit']
+            self.stopped = False
+            created.append(self)
+
+        def start(self):
+            started.append(self.name)
+            if self.name == 'ft300':
+                thread = threading.Thread(target=lambda: self.on_exit(self.name, 7))
+                callback_threads.append(thread)
+                thread.start()
+                assert instance._fail_stop_requested.wait(timeout=1.0)
+
+        def poll(self):
+            return 0 if self.stopped else None
+
+        def stop(self, grace_s=5.0):
+            self.stopped = True
+
+    monkeypatch.setattr(
+        inference_controller_module,
+        'ManagedProcess',
+        FatalDuringStartProcess,
+    )
+    monkeypatch.setattr(instance, '_start_receivers', lambda: None)
+    monkeypatch.setattr(instance, '_wait_services_ready', lambda: later_steps.append('services'))
+    monkeypatch.setattr(instance, '_start_lerobot', lambda: later_steps.append('lerobot'))
+    monkeypatch.setattr(instance, '_execute_fail_stop', instance._stop_runtime_resources)
+
+    with pytest.raises(RuntimeError, match='session termination began during ft300 process'):
+        instance.startup()
+
+    for thread in callback_threads:
+        thread.join(timeout=1.0)
+    if instance._termination_thread is not None:
+        instance._termination_thread.join(timeout=1.0)
+
+    assert started == ['ft300']
+    assert later_steps == []
+    assert set(instance.processes.values()) == set(created)
+    assert all(process.stopped for process in created)
+    assert instance._resources_stopped
+
+
+def test_keyboard_interrupt_requests_fail_stop_directly(tmp_path):
+    instance = controller(tmp_path)
+
+    def interrupt_startup():
+        raise KeyboardInterrupt
+
+    instance.startup = interrupt_startup
+    instance.run()
+
+    assert instance.termination_mode == 'FAIL_STOP'
+    assert instance.termination_reason == 'keyboard_interrupt: KeyboardInterrupt/SIGINT received'
+    assert instance.get_state() == InferenceState.STOPPED
