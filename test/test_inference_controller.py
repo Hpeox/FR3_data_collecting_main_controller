@@ -257,6 +257,19 @@ class FakeProcess:
         self.stopped = True
 
 
+class FakeRestartableProcess(FakeProcess):
+    def __init__(self, *, restart_error=None):
+        super().__init__()
+        self.restart_count = 0
+        self.restart_error = restart_error
+
+    def restart(self, grace_s=5.0):
+        self.restart_count += 1
+        if self.restart_error is not None:
+            raise self.restart_error
+        self.stopped = False
+
+
 def test_fail_stop_retries_with_fresh_sequences_then_waits_for_exit(tmp_path):
     instance = InferenceMainController(config(tmp_path))
     control = FakeControl()
@@ -343,6 +356,91 @@ def test_required_process_exit_is_session_fatal_without_restart(tmp_path):
     instance._on_process_exit('realsense', 7)
     assert observed == [('realsense_unexpected_exit', 'returncode=7')]
     assert not hasattr(instance.processes.get('realsense'), 'restart')
+
+
+def test_recoverable_realsense_startup_fatal_restarts_without_fail_stop(tmp_path):
+    instance = controller(tmp_path)
+    process = FakeRestartableProcess()
+    instance.processes['realsense'] = process
+    instance.set_state(InferenceState.STARTING_SERVICES)
+    fail_stops = []
+    instance.request_fail_stop = lambda reason, message: fail_stops.append((reason, message))
+
+    instance._on_process_fatal('realsense', 'Depth stream start failure, Hardware Error')
+    instance._recover_realsense_startup_if_needed()
+
+    assert process.restart_count == 1
+    assert fail_stops == []
+    assert instance.termination_mode is None
+
+
+def test_successful_realsense_startup_recovery_allows_startup_to_continue(tmp_path):
+    instance = InferenceMainController(
+        config(tmp_path, realsense_startup_stabilization_s=0.001)
+    )
+    process = FakeRestartableProcess()
+    instance.processes['realsense'] = process
+    instance._start_receivers = lambda: None
+    instance._start_processes = lambda: None
+    instance._wait_services_ready = lambda: instance._on_process_fatal(
+        'realsense', 'Depth stream start failure, Hardware Error'
+    )
+    instance._start_lerobot = lambda: None
+    instance.control = SimpleNamespace(
+        wait_for_status=lambda expected: status(1, 'READY', 'WAIT_INITIALIZE')
+    )
+    instance._register_aligned_reader = lambda: setattr(
+        instance,
+        'aligned_reader',
+        SimpleNamespace(
+            read=lambda: SimpleNamespace(
+                ready=True,
+                latest_sequence=1,
+                fatal=False,
+                status_code=0,
+                message='',
+            )
+        ),
+    )
+
+    instance.startup()
+
+    assert process.restart_count == 1
+    assert instance.get_state() == InferenceState.WAIT_START
+    assert instance.termination_mode is None
+
+
+def test_failed_realsense_startup_recovery_escalates_to_fail_stop(tmp_path):
+    instance = InferenceMainController(
+        config(tmp_path, realsense_startup_stabilization_s=0.001)
+    )
+    process = FakeRestartableProcess(restart_error=RuntimeError('restart failed'))
+    instance.processes['realsense'] = process
+    instance._start_receivers = lambda: None
+    instance._start_processes = lambda: None
+    instance._wait_services_ready = lambda: instance._on_process_fatal(
+        'realsense', 'Depth stream start failure, Hardware Error'
+    )
+    instance._execute_fail_stop = instance._finalize_session
+
+    exit_code = instance.run()
+
+    assert exit_code == 1
+    assert process.restart_count == 1
+    assert instance.termination_mode == 'FAIL_STOP'
+    assert 'RealSense startup recovery attempt 1 failed: restart failed' in instance.termination_reason
+    assert instance.get_state() == InferenceState.STOPPED
+
+
+def test_non_realsense_required_process_fatal_still_requests_fail_stop(tmp_path):
+    instance = controller(tmp_path)
+    instance.set_state(InferenceState.STARTING_SERVICES)
+    observed = []
+    instance.request_fail_stop = lambda reason, message: observed.append((reason, message))
+
+    instance._on_process_fatal('xense', 'runtime failure')
+
+    assert observed == [('xense_fatal', 'runtime failure')]
 
 
 def test_fault_promotes_in_progress_shutdown_to_fail_stop(tmp_path):
@@ -450,8 +548,79 @@ def test_keyboard_interrupt_requests_fail_stop_directly(tmp_path):
         raise KeyboardInterrupt
 
     instance.startup = interrupt_startup
-    instance.run()
+    exit_code = instance.run()
 
+    assert exit_code == 1
     assert instance.termination_mode == 'FAIL_STOP'
     assert instance.termination_reason == 'keyboard_interrupt: KeyboardInterrupt/SIGINT received'
     assert instance.get_state() == InferenceState.STOPPED
+
+
+def test_state_and_ready_messages_are_printed_to_console(tmp_path, capsys):
+    instance = controller(tmp_path)
+
+    instance.set_state(InferenceState.STARTING_SERVICES)
+    instance._mark_session_ready()
+
+    output = capsys.readouterr().out
+    assert '[STARTING_SERVICES] [state] CREATED -> STARTING_SERVICES' in output
+    assert '[WAIT_START] [state] STARTING_SERVICES -> WAIT_START' in output
+    assert '[WAIT_START] Inference MainController ready.' in output
+
+
+def test_fail_stop_prints_reason_to_stderr_only_once(tmp_path, capsys):
+    instance = controller(tmp_path)
+    instance._execute_fail_stop = lambda: None
+
+    instance.request_fail_stop('test_failure', 'specific reason')
+    assert instance._termination_thread is not None
+    instance._termination_thread.join(timeout=1.0)
+    instance.request_fail_stop('duplicate_failure', 'duplicate reason')
+
+    error_output = capsys.readouterr().err
+    assert error_output.count('FAIL_STOP: test_failure: specific reason') == 1
+    assert 'duplicate reason' not in error_output
+
+
+def test_graceful_shutdown_run_returns_success(tmp_path, monkeypatch):
+    instance = controller(tmp_path)
+
+    def admit_shutdown_during_startup():
+        instance.set_state(InferenceState.WAIT_START)
+        assert instance.admit_user_action('shutdown')
+
+    instance.startup = admit_shutdown_during_startup
+    monkeypatch.setattr(inference_controller_module.InferenceInputThread, 'start', lambda self: None)
+
+    assert instance.run() == 0
+    assert instance.termination_mode == 'SHUTDOWN'
+    assert instance.get_state() == InferenceState.STOPPED
+
+
+def test_main_propagates_fail_stop_as_nonzero_exit(monkeypatch):
+    fake_controller = SimpleNamespace(run=lambda: 1)
+    monkeypatch.setattr(inference_controller_module, 'parse_inference_args', lambda: object())
+    monkeypatch.setattr(inference_controller_module, 'build_inference_config', lambda args: object())
+    monkeypatch.setattr(
+        inference_controller_module,
+        'InferenceMainController',
+        lambda config: fake_controller,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        inference_controller_module.main()
+
+    assert exc_info.value.code == 1
+
+
+def test_main_preserves_graceful_success_exit(monkeypatch):
+    fake_controller = SimpleNamespace(run=lambda: 0)
+    monkeypatch.setattr(inference_controller_module, 'parse_inference_args', lambda: object())
+    monkeypatch.setattr(inference_controller_module, 'build_inference_config', lambda args: object())
+    monkeypatch.setattr(
+        inference_controller_module,
+        'InferenceMainController',
+        lambda config: fake_controller,
+    )
+
+    assert inference_controller_module.main() is None

@@ -145,13 +145,17 @@ class InferenceMainController:
         self._termination_thread: threading.Thread | None = None
         self._termination_lock = threading.Lock()
         self._fail_stop_requested = threading.Event()
+        self._realsense_startup_fatal = threading.Event()
+        self._realsense_startup_fatal_lock = threading.Lock()
+        self._realsense_startup_fatal_message: str | None = None
+        self._realsense_startup_restart_count = 0
         self._finalize_lock = threading.Lock()
         self.termination_mode: str | None = None
         self.termination_reason: str | None = None
         self._resources_stopped = False
         self._logger_closed = False
 
-    def run(self) -> None:
+    def run(self) -> int:
         """Start the inference session and process admitted actions."""
         try:
             self.startup()
@@ -175,6 +179,7 @@ class InferenceMainController:
                 thread = self._termination_thread
                 if thread is not None and thread is not threading.current_thread():
                     thread.join(timeout=self.config.worker_exit_timeout_s + 5.0)
+        return 1 if self.termination_mode == 'FAIL_STOP' else 0
 
     def startup(self) -> None:
         """Start all required workstation processes, then connect persistent LeRobot."""
@@ -183,9 +188,14 @@ class InferenceMainController:
             self._start_receivers()
             self._start_processes()
             self._wait_services_ready()
+            self._recover_realsense_startup_if_needed(
+                wait_s=self.config.realsense_startup_stabilization_s,
+            )
             self._start_lerobot()
+            self._recover_realsense_startup_if_needed()
             assert self.control is not None
             ready = self.control.wait_for_status({'READY'})
+            self._recover_realsense_startup_if_needed()
             self._ensure_startup_active()
             if ready.phase != 'WAIT_INITIALIZE':
                 raise RuntimeError(f'unexpected LeRobot READY phase: {ready.phase}')
@@ -254,6 +264,7 @@ class InferenceMainController:
                     if self.state != InferenceState.STOPPED:
                         self._set_state_locked(InferenceState.FAIL_STOPPING)
                 self.log('session_shutdown_promoted_to_fail_stop', reason=reason, message=message)
+                self._print(f'[ERROR] FAIL_STOP: {self.termination_reason}', stream=sys.stderr)
                 self._termination_thread = threading.Thread(
                     target=self._execute_fail_stop,
                     name='InferenceFailStop',
@@ -267,6 +278,7 @@ class InferenceMainController:
                 if self.state != InferenceState.STOPPED:
                     self._set_state_locked(InferenceState.FAIL_STOPPING)
             self.log('session_fail_stop_requested', reason=reason, message=message)
+            self._print(f'[ERROR] FAIL_STOP: {self.termination_reason}', stream=sys.stderr)
             self._termination_thread = threading.Thread(
                 target=self._execute_fail_stop,
                 name='InferenceFailStop',
@@ -769,9 +781,7 @@ class InferenceMainController:
                 cwd,
                 log_path,
                 fatal_patterns=fatal_patterns,
-                on_fatal=lambda process_name, line: self.request_fail_stop(
-                    f'{process_name}_fatal', line
-                ),
+                on_fatal=self._on_process_fatal,
                 on_exit=self._on_process_exit,
             )
             self.processes[name] = process
@@ -805,8 +815,68 @@ class InferenceMainController:
         self.aligned_reader = AlignedHealthReader(self.config.observation_shm_name)
 
     def _mark_session_ready(self) -> None:
-        self.set_state(InferenceState.WAIT_START)
-        self.log('session_ready', scope='main_controller_dependencies')
+        with self._realsense_startup_fatal_lock:
+            if self._realsense_startup_fatal.is_set():
+                raise RuntimeError('RealSense fatal remained pending at startup completion')
+            self.set_state(InferenceState.WAIT_START)
+            self.log('session_ready', scope='main_controller_dependencies')
+            self._print('Inference MainController ready.')
+
+    def _on_process_fatal(self, name: str, line: str) -> None:
+        """Classify a managed-process fatal, including startup-only RealSense recovery."""
+        if name == 'realsense':
+            with self._realsense_startup_fatal_lock:
+                if (
+                    self.get_state() == InferenceState.STARTING_SERVICES
+                    and self.termination_mode is None
+                ):
+                    if not self._realsense_startup_fatal.is_set():
+                        self.expected_process_exits.add('realsense')
+                        self._realsense_startup_fatal_message = line
+                        self._realsense_startup_fatal.set()
+                        self.log('realsense_startup_fatal_detected', message=line)
+                        self._print(f'[WARN] RealSense startup fatal: {line}')
+                    return
+        self.request_fail_stop(f'{name}_fatal', line)
+
+    def _recover_realsense_startup_if_needed(self, *, wait_s: float = 0.0) -> None:
+        """Restart only RealSense for bounded, matching startup fatal events."""
+        while self._realsense_startup_fatal.wait(timeout=wait_s):
+            with self._realsense_startup_fatal_lock:
+                message = self._realsense_startup_fatal_message or 'unknown RealSense fatal'
+                self._realsense_startup_fatal_message = None
+                self._realsense_startup_fatal.clear()
+            if self._realsense_startup_restart_count >= self.config.realsense_startup_max_restarts:
+                raise RuntimeError(
+                    'RealSense startup recovery budget exhausted: '
+                    f'{message}'
+                )
+            process = self.processes.get('realsense')
+            if process is None:
+                raise RuntimeError('RealSense startup recovery process is unavailable')
+            self._realsense_startup_restart_count += 1
+            attempt = self._realsense_startup_restart_count
+            self.log(
+                'realsense_startup_restart_started',
+                attempt=attempt,
+                max_restarts=self.config.realsense_startup_max_restarts,
+                message=message,
+            )
+            self._print(
+                '[WARN] restarting RealSense after recoverable startup fatal '
+                f'({attempt}/{self.config.realsense_startup_max_restarts})'
+            )
+            try:
+                self._run_startup_resource_step(
+                    'RealSense startup recovery',
+                    process.restart,
+                )
+            except BaseException as exc:
+                raise RuntimeError(
+                    f'RealSense startup recovery attempt {attempt} failed: {exc}'
+                ) from exc
+            self.log('realsense_startup_restart_done', attempt=attempt)
+            wait_s = self.config.realsense_startup_stabilization_s
 
     def _stop_runtime_resources(self) -> None:
         with self._termination_lock:
@@ -935,6 +1005,7 @@ class InferenceMainController:
         self.state = state
         if previous != state:
             self.logger.event('state_transition', previous=previous.name, current=state.name)
+            self._print(f'[state] {previous.name} -> {state.name}')
 
     def get_state(self) -> InferenceState:
         with self.state_lock:
@@ -944,6 +1015,10 @@ class InferenceMainController:
         if self._logger_closed:
             return
         self.logger.event(event, state=self.get_state().name, **payload)
+
+    def _print(self, message: str, *, stream=None) -> None:
+        """Print one concise controller message with the current state."""
+        print(f'[{self.get_state().name}] {message}', file=stream, flush=True)
 
     def _close_logger(self) -> None:
         if not self._logger_closed:
@@ -998,9 +1073,11 @@ def build_inference_config(args: argparse.Namespace) -> InferenceConfig:
 def main() -> None:
     """Run the inference-specific controller."""
     controller = InferenceMainController(build_inference_config(parse_inference_args()))
-    controller.run()
+    exit_code = controller.run()
     sys.stdout.flush()
     sys.stderr.flush()
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 if __name__ == '__main__':

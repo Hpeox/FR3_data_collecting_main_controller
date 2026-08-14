@@ -136,6 +136,37 @@ def test_managed_process_reports_one_fatal_per_matching_line(tmp_path):
     assert calls == [('realsense_camera', 'Depth stream start failure, Hardware Error')]
 
 
+def test_managed_process_reader_waits_for_its_original_process_after_restart(tmp_path):
+    waits = []
+    managed = ManagedProcess('realsense', ['true'], tmp_path, tmp_path / 'process.log')
+
+    class ReplacementProcess:
+        stdout = ()
+
+        def wait(self):
+            raise AssertionError('old reader waited for replacement process')
+
+    replacement = ReplacementProcess()
+
+    class OriginalStdout:
+        def __iter__(self):
+            managed.process = replacement
+            return iter(())
+
+    class OriginalProcess:
+        stdout = OriginalStdout()
+
+        def wait(self):
+            waits.append('original')
+            return 0
+
+    managed.process = OriginalProcess()
+
+    managed._read_output(io.StringIO())
+
+    assert waits == ['original']
+
+
 def test_rosbag_call_accepts_successful_record_return_code():
     control = rosbag_control_for_call_tests()
     response = types.SimpleNamespace(return_code=0, error_string="")

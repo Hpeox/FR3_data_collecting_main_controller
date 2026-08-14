@@ -54,6 +54,8 @@ class InferenceConfig:
     lerobot_aligned_max_age_ms: int = 100
     fail_stop_retry_interval_s: float = 0.2
     worker_exit_timeout_s: float = 15.0
+    realsense_startup_max_restarts: int = 1
+    realsense_startup_stabilization_s: float = 1.5
     lerobot_conda_env: str = 'lerobot-fr3-312'
     fatal_realsense_patterns: tuple[str, ...] = (
         'Hardware Error',
@@ -94,10 +96,17 @@ class InferenceConfig:
             'lerobot_aligned_max_age_ms': self.lerobot_aligned_max_age_ms,
             'fail_stop_retry_interval_s': self.fail_stop_retry_interval_s,
             'worker_exit_timeout_s': self.worker_exit_timeout_s,
+            'realsense_startup_stabilization_s': self.realsense_startup_stabilization_s,
         }
         invalid = [name for name, value in positive.items() if not math.isfinite(value) or value <= 0]
         if invalid:
             raise ValueError(f'inference timeout/rate values must be positive: {invalid}')
+        if (
+            isinstance(self.realsense_startup_max_restarts, bool)
+            or not isinstance(self.realsense_startup_max_restarts, int)
+            or self.realsense_startup_max_restarts < 0
+        ):
+            raise ValueError('realsense_startup_max_restarts must be a non-negative integer')
         if self.aligned_stall_timeout_s * 1000 >= self.lerobot_aligned_max_age_ms:
             raise ValueError(
                 'aligned_stall_timeout_s must be shorter than '
