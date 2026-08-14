@@ -374,6 +374,72 @@ def test_recoverable_realsense_startup_fatal_restarts_without_fail_stop(tmp_path
     assert instance.termination_mode is None
 
 
+def test_duplicate_realsense_fatal_during_restart_does_not_consume_retry(tmp_path):
+    instance = controller(tmp_path)
+    fail_stops = []
+
+    class DuplicateFatalDuringRestart(FakeProcess):
+        def __init__(self):
+            super().__init__()
+            self.restart_count = 0
+
+        def restart(self, grace_s=5.0):
+            self.restart_count += 1
+            instance._on_process_fatal(
+                'realsense',
+                'Hardware Notification:Depth stream start failure, Hardware Error',
+            )
+            instance._on_process_exit('realsense', -2)
+
+    process = DuplicateFatalDuringRestart()
+    instance.processes['realsense'] = process
+    instance.set_state(InferenceState.STARTING_SERVICES)
+    instance.request_fail_stop = lambda reason, message: fail_stops.append((reason, message))
+
+    instance._on_process_fatal(
+        'realsense',
+        'XXX Hardware Notification:Depth stream start failure, Hardware Error',
+    )
+    instance._recover_realsense_startup_if_needed()
+
+    assert process.restart_count == 1
+    assert instance._realsense_startup_restart_count == 1
+    assert fail_stops == []
+    assert 'realsense' not in instance.expected_process_exits
+
+
+def test_realsense_startup_allows_five_real_restart_attempts(tmp_path):
+    instance = InferenceMainController(
+        config(tmp_path, realsense_startup_stabilization_s=0.001)
+    )
+
+    class CyclingProcess(FakeProcess):
+        def __init__(self):
+            super().__init__()
+            self.restart_count = 0
+
+        def restart(self, grace_s=5.0):
+            self.restart_count += 1
+            instance._on_process_exit('realsense', -2)
+
+    process = CyclingProcess()
+    instance.processes['realsense'] = process
+    instance.set_state(InferenceState.STARTING_SERVICES)
+
+    for attempt in range(5):
+        instance._on_process_fatal('realsense', f'Hardware Error attempt {attempt + 1}')
+        instance._recover_realsense_startup_if_needed()
+
+    assert process.restart_count == 5
+    assert instance._realsense_startup_restart_count == 5
+
+    instance._on_process_fatal('realsense', 'Hardware Error attempt 6')
+    with pytest.raises(RuntimeError, match='recovery budget exhausted'):
+        instance._recover_realsense_startup_if_needed()
+
+    assert process.restart_count == 5
+
+
 def test_successful_realsense_startup_recovery_allows_startup_to_continue(tmp_path):
     instance = InferenceMainController(
         config(tmp_path, realsense_startup_stabilization_s=0.001)

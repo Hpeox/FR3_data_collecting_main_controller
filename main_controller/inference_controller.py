@@ -148,6 +148,7 @@ class InferenceMainController:
         self._realsense_startup_fatal = threading.Event()
         self._realsense_startup_fatal_lock = threading.Lock()
         self._realsense_startup_fatal_message: str | None = None
+        self._realsense_startup_restart_in_progress = False
         self._realsense_startup_restart_count = 0
         self._finalize_lock = threading.Lock()
         self.termination_mode: str | None = None
@@ -830,6 +831,12 @@ class InferenceMainController:
                     self.get_state() == InferenceState.STARTING_SERVICES
                     and self.termination_mode is None
                 ):
+                    if self._realsense_startup_restart_in_progress:
+                        self.log(
+                            'realsense_startup_fatal_ignored_during_restart',
+                            message=line,
+                        )
+                        return
                     if not self._realsense_startup_fatal.is_set():
                         self.expected_process_exits.add('realsense')
                         self._realsense_startup_fatal_message = line
@@ -846,36 +853,42 @@ class InferenceMainController:
                 message = self._realsense_startup_fatal_message or 'unknown RealSense fatal'
                 self._realsense_startup_fatal_message = None
                 self._realsense_startup_fatal.clear()
-            if self._realsense_startup_restart_count >= self.config.realsense_startup_max_restarts:
-                raise RuntimeError(
-                    'RealSense startup recovery budget exhausted: '
-                    f'{message}'
-                )
-            process = self.processes.get('realsense')
-            if process is None:
-                raise RuntimeError('RealSense startup recovery process is unavailable')
-            self._realsense_startup_restart_count += 1
-            attempt = self._realsense_startup_restart_count
-            self.log(
-                'realsense_startup_restart_started',
-                attempt=attempt,
-                max_restarts=self.config.realsense_startup_max_restarts,
-                message=message,
-            )
-            self._print(
-                '[WARN] restarting RealSense after recoverable startup fatal '
-                f'({attempt}/{self.config.realsense_startup_max_restarts})'
-            )
+                self._realsense_startup_restart_in_progress = True
             try:
-                self._run_startup_resource_step(
-                    'RealSense startup recovery',
-                    process.restart,
+                if self._realsense_startup_restart_count >= self.config.realsense_startup_max_restarts:
+                    raise RuntimeError(
+                        'RealSense startup recovery budget exhausted: '
+                        f'{message}'
+                    )
+                process = self.processes.get('realsense')
+                if process is None:
+                    raise RuntimeError('RealSense startup recovery process is unavailable')
+                self._realsense_startup_restart_count += 1
+                attempt = self._realsense_startup_restart_count
+                self.log(
+                    'realsense_startup_restart_started',
+                    attempt=attempt,
+                    max_restarts=self.config.realsense_startup_max_restarts,
+                    message=message,
                 )
-            except BaseException as exc:
-                raise RuntimeError(
-                    f'RealSense startup recovery attempt {attempt} failed: {exc}'
-                ) from exc
-            self.log('realsense_startup_restart_done', attempt=attempt)
+                self._print(
+                    '[WARN] restarting RealSense after recoverable startup fatal '
+                    f'({attempt}/{self.config.realsense_startup_max_restarts})'
+                )
+                self.expected_process_exits.add('realsense')
+                try:
+                    self._run_startup_resource_step(
+                        'RealSense startup recovery',
+                        process.restart,
+                    )
+                except BaseException as exc:
+                    raise RuntimeError(
+                        f'RealSense startup recovery attempt {attempt} failed: {exc}'
+                    ) from exc
+                self.log('realsense_startup_restart_done', attempt=attempt)
+            finally:
+                with self._realsense_startup_fatal_lock:
+                    self._realsense_startup_restart_in_progress = False
             wait_s = self.config.realsense_startup_stabilization_s
 
     def _stop_runtime_resources(self) -> None:
