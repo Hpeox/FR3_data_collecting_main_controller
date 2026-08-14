@@ -119,10 +119,16 @@ Startup is session-scoped:
    one actual frame with the formal schema on each of the eight color/aligned
    depth image topics. The node-up lines are only a launch-stage signal; the
    image check is the authoritative RealSense usability gate.
-5. Start one persistent controlled LeRobot worker and connect its UDS control
-   channel.
-6. Wait for LeRobot `READY` in `WAIT_INITIALIZE`, map the aligned SHM header,
-   require `ready=1`, and enter `WAIT_START`.
+5. Send `START_REQ` to FT300S and Xense, in that order, and wait for both ACKs.
+   This startup-only warmup makes their SHM streams advance before SensorHub
+   attaches; it is not a separate readiness protocol.
+6. Start one persistent controlled LeRobot worker, connect its UDS control
+   channel, and wait for `READY` in `WAIT_INITIALIZE`. `FR3.connect()` and
+   SensorHub's first coherent aligned publication remain the authoritative
+   source-readiness gate.
+7. Map the aligned SHM header and require `ready=1` and `fatal=0`, then send
+   `DEMO_DISCARD_REQ` to both warmup sensors and wait for every ACK before
+   entering `WAIT_START`.
 
 The same two-stage RealSense gate runs after each bounded recovery restart and
 only accepts node-up lines from the restarted log generation. The additional
@@ -133,12 +139,16 @@ the next available synchronous check boundary.
 
 Resource registration and startup are synchronized with fatal teardown. Once
 a session-fatal request begins, startup stops scheduling resources. Anything
-already started remains registered for the one-shot teardown path.
+already started remains registered for the one-shot teardown path. After a
+warmup `START_REQ` ACK, any LeRobot launch/connect/READY or aligned-header
+failure first best-effort discards every ACK-confirmed active sensor. One
+discard failure does not skip the remaining sensors, and terminal `STOP_REQ`
+cannot interleave ahead of this bounded warmup finalization.
 
-An aligned-header `fatal` value is diagnostic in MainController. It is not a
-transfer of SensorHub fault ownership and is not proof that the complete
-system is healthy. SensorHub fatal propagation remains owned by the existing
-LeRobot/FR3 health path.
+An aligned-header `fatal` value prevents the explicit startup or rollout-start
+gate from admitting new work. Outside those gates it remains diagnostic in
+MainController: this does not add idle-phase SensorHub supervision or transfer
+general fatal-propagation ownership from the existing LeRobot/FR3 health path.
 
 ## Operator commands and lifecycle
 
@@ -148,7 +158,7 @@ commands are rejected immediately and are not deferred.
 | Input | Valid state | Result |
 | --- | --- | --- |
 | `i` or `initialize` | `WAIT_START` | Send `INITIALIZE`; successful `INITIALIZED` completion enters `READY`. |
-| `s` or `start` | `READY` | Start recording, send `START`, and enter `RUNNING` after `STARTED`. |
+| `s` or `start` | `READY` | Capture the aligned baseline, start FT/Xense, require a newer ready/non-fatal aligned sequence, start rosbag, send `START`, and enter `RUNNING` after `STARTED`. |
 | `d` or `stop` | `RUNNING` | Send `STOP`, finish the recording as `done`, and return to `WAIT_START`. |
 | `a` or `abort` | `RUNNING` | Send `ABORT`, finish the recording as `failed`, and return to `WAIT_START`. |
 | `q` or `shutdown` | `WAIT_START`, `READY`, or `RUNNING` | Perform normal graceful session `SHUTDOWN`. |
@@ -196,7 +206,9 @@ RealSense startup recovery described above.
 Before terminal cleanup closes either local sensor UDS client, MainController
 best-effort sends `STOP_REQ` (the sensor test clients' `q` command) to both
 FT300S and Xense and waits for each ACK. A missing ACK is logged but does not
-prevent the remaining teardown steps.
+prevent the remaining teardown steps. `STOP_REQ` is reserved for this terminal
+session cleanup; startup rollback and failed/aborted rollouts use
+`DEMO_DISCARD_REQ` so both persistent sensor processes return to `WAIT_START`.
 
 Do not use Ctrl-C when the intended operation is a normal graceful shutdown;
 enter `q` instead.
@@ -211,7 +223,16 @@ The following events are rollout-recoverable while `RUNNING`:
   `--aligned-stall-timeout-s`.
 
 They cause `ABORT`, a `failed` rollout recording, and return to `WAIT_START`
-without restarting LeRobot.
+without restarting LeRobot. MainController sends `DEMO_DISCARD_REQ` to every
+active FT/Xense acquisition and stops rosbag; it returns to `WAIT_START` only
+after all required cleanup ACKs succeed.
+
+Before every rollout `START`, MainController records the current aligned
+`latest_sequence`, starts FT300S and Xense, and polls only the existing aligned
+header until `ready=1`, `fatal=0`, and the sequence is strictly newer than the
+baseline. The wait is bounded by the existing startup timeout. rosbag recording
+and LeRobot `START` are not issued before this fresh aligned snapshot exists.
+No individual sensor `FRAME_READY` event is used as a duplicate readiness gate.
 
 Temporary loss of NUC robot/gripper telemetry is not independently timed out
 by MainController. If the loss causes the aligned sequence to stall during

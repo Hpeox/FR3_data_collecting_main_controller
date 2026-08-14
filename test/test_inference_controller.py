@@ -105,16 +105,57 @@ class FakeControl:
         self.disconnected = True
 
 
+class EventControl(FakeControl):
+    def __init__(self, events, *, start_accepted=True):
+        super().__init__()
+        self.events = events
+        self.start_accepted = start_accepted
+
+    def transact(self, operation, completion_statuses):
+        self.events.append(('lerobot', operation))
+        result = super().transact(operation, completion_statuses)
+        if operation == 'START' and not self.start_accepted:
+            return TransactionResult(
+                ack=ack(len(self.transactions), operation, accepted=False),
+                completion=None,
+            )
+        return result
+
+
+class StartupControl:
+    def __init__(self, events, *, ready=None, error=None):
+        self.events = events
+        self.ready = ready or status(1, 'READY', 'WAIT_INITIALIZE')
+        self.error = error
+
+    def wait_for_status(self, expected):
+        self.events.append(('lerobot', 'READY'))
+        if self.error is not None:
+            raise self.error
+        return self.ready
+
+    def close(self):
+        pass
+
+
 class FakeSensor:
-    def __init__(self, name):
+    def __init__(self, name, *, events=None, fail_commands=()):
         self.name = name
         self.commands = []
+        self.events = events
+        self.fail_commands = set(fail_commands)
 
     def send_and_wait_ack(self, message_type, command_name, timeout_s):
         self.commands.append(command_name)
+        if self.events is not None:
+            self.events.append((self.name, command_name))
+        if command_name in self.fail_commands:
+            return None
         return {'cmd': command_name}
 
     def last_error_for(self, command_name):
+        if command_name in self.fail_commands:
+            return {'error': 'injected_failure', 'cmd': command_name}
         return None
 
     def stop(self):
@@ -122,12 +163,15 @@ class FakeSensor:
 
 
 class FakeRosbag:
-    def __init__(self):
+    def __init__(self, *, events=None):
         self.calls = []
         self.image_readiness_ok = True
+        self.events = events
 
     def record(self, uri, timeout_s):
         self.calls.append(('record', Path(uri)))
+        if self.events is not None:
+            self.events.append(('rosbag', 'record'))
 
     def stop(self, timeout_s):
         self.calls.append(('stop', None))
@@ -147,14 +191,86 @@ class FakeRosbag:
         pass
 
 
+def aligned_health(sequence, *, ready=True, fatal=False, message=''):
+    return SimpleNamespace(
+        ready=ready,
+        latest_sequence=sequence,
+        fatal=fatal,
+        status_code=1 if fatal else 0,
+        message=message,
+    )
+
+
+class AdvancingAlignedReader:
+    def __init__(self, start=0, *, events=None):
+        self.sequence = start
+        self.events = events
+
+    def read(self):
+        self.sequence += 1
+        if self.events is not None:
+            self.events.append(('aligned', 'read', self.sequence))
+        return aligned_health(self.sequence)
+
+    def close(self):
+        pass
+
+
+class SequenceAlignedReader:
+    def __init__(self, values, *, events=None):
+        self.values = list(values)
+        self.events = events
+        self.last = self.values[-1]
+
+    def read(self):
+        if self.values:
+            self.last = self.values.pop(0)
+        if isinstance(self.last, BaseException):
+            raise self.last
+        if self.events is not None:
+            self.events.append(('aligned', 'read', self.last.latest_sequence))
+        return self.last
+
+    def close(self):
+        pass
+
+
 def controller(tmp_path):
     instance = InferenceMainController(config(tmp_path))
     instance.control = FakeControl()
     instance.ft_client = FakeSensor('ft300')
     instance.xense_client = FakeSensor('xense')
     instance.rosbag = FakeRosbag()
+    instance.aligned_reader = AdvancingAlignedReader()
     instance._start_watchdog = lambda: None
     instance._stop_watchdog = lambda: None
+    return instance
+
+
+def startup_controller(tmp_path, events):
+    instance = InferenceMainController(config(tmp_path))
+    instance.ft_client = FakeSensor('ft300', events=events)
+    instance.xense_client = FakeSensor('xense', events=events)
+    instance.rosbag = FakeRosbag(events=events)
+    instance._start_receivers = lambda: None
+    instance._start_processes = lambda: None
+    instance._wait_services_ready = lambda: None
+    instance._wait_realsense_startup_ready = lambda: None
+
+    def start_lerobot():
+        events.append(('lerobot', 'launch'))
+        instance.control = StartupControl(events)
+
+    instance._start_lerobot = start_lerobot
+
+    def register_aligned_reader():
+        events.append(('aligned', 'attach'))
+        instance.aligned_reader = SequenceAlignedReader(
+            [aligned_health(10)],
+            events=events,
+        )
+
+    instance._register_aligned_reader = register_aligned_reader
     return instance
 
 
@@ -185,6 +301,12 @@ def test_repeated_explicit_rollouts_keep_one_worker(tmp_path):
     assert instance.control.transactions == [
         'INITIALIZE', 'START', 'STOP', 'INITIALIZE', 'START', 'STOP'
     ]
+    assert instance.ft_client.commands == [
+        'START_REQ', 'DEMO_DONE_REQ', 'START_REQ', 'DEMO_DONE_REQ'
+    ]
+    assert instance.xense_client.commands == [
+        'START_REQ', 'DEMO_DONE_REQ', 'START_REQ', 'DEMO_DONE_REQ'
+    ]
     assert instance.rollout_index == 2
     for index in (1, 2):
         manifest = json.loads(
@@ -193,10 +315,213 @@ def test_repeated_explicit_rollouts_keep_one_worker(tmp_path):
         assert manifest['status'] == 'done'
 
 
+def test_rollout_rearms_aligned_stream_before_rosbag_and_lerobot_start(tmp_path):
+    events = []
+    instance = controller(tmp_path)
+    instance.ft_client = FakeSensor('ft300', events=events)
+    instance.xense_client = FakeSensor('xense', events=events)
+    instance.rosbag = FakeRosbag(events=events)
+    instance.control = EventControl(events)
+    instance.aligned_reader = SequenceAlignedReader(
+        [aligned_health(40), aligned_health(40), aligned_health(41)],
+        events=events,
+    )
+    instance.set_state(InferenceState.READY)
+
+    assert instance.admit_user_action('start')
+    instance.handle_command(instance.commands.get_nowait())
+
+    assert instance.get_state() == InferenceState.RUNNING
+    assert events == [
+        ('aligned', 'read', 40),
+        ('ft300', 'START_REQ'),
+        ('xense', 'START_REQ'),
+        ('aligned', 'read', 40),
+        ('aligned', 'read', 41),
+        ('rosbag', 'record'),
+        ('lerobot', 'START'),
+    ]
+
+
+def test_xense_start_failure_discards_only_acked_ft_without_stop(tmp_path):
+    events = []
+    instance = controller(tmp_path)
+    instance.ft_client = FakeSensor('ft300', events=events)
+    instance.xense_client = FakeSensor(
+        'xense',
+        events=events,
+        fail_commands={'START_REQ'},
+    )
+
+    with pytest.raises(RuntimeError, match='xense START_REQ failed'):
+        instance._start_sensor_acquisition()
+
+    assert events == [
+        ('ft300', 'START_REQ'),
+        ('xense', 'START_REQ'),
+        ('ft300', 'DEMO_DISCARD_REQ'),
+    ]
+    assert instance._active_sensor_clients == {}
+
+
+@pytest.mark.parametrize(
+    ('rearm_health', 'expected_reason'),
+    [
+        (aligned_health(10, ready=False), 'not ready'),
+        (aligned_health(10, fatal=True, message='source failed'), 'is fatal'),
+    ],
+)
+def test_unhealthy_aligned_rearm_discards_sensors_before_fail_stop(
+    tmp_path,
+    rearm_health,
+    expected_reason,
+):
+    events = []
+    instance = controller(tmp_path)
+    instance.ft_client = FakeSensor('ft300', events=events)
+    instance.xense_client = FakeSensor('xense', events=events)
+    instance.rosbag = FakeRosbag(events=events)
+    instance.aligned_reader = SequenceAlignedReader(
+        [aligned_health(10), rearm_health],
+        events=events,
+    )
+    fail_stops = []
+    instance.request_fail_stop = lambda reason, message: fail_stops.append((reason, message))
+    instance.set_state(InferenceState.STARTING)
+
+    instance._start_rollout()
+
+    assert expected_reason in fail_stops[0][1]
+    assert ('rosbag', 'record') not in events
+    assert instance.control.transactions == []
+    assert instance.ft_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+    assert instance.xense_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+    assert 'STOP_REQ' not in instance.ft_client.commands + instance.xense_client.commands
+
+
+def test_aligned_rearm_timeout_discards_sensors_without_downstream_start(tmp_path):
+    events = []
+    instance = controller(tmp_path)
+    instance.config = config(
+        tmp_path,
+        startup_timeout_s=0.01,
+        aligned_poll_interval_s=0.001,
+    )
+    instance.ft_client = FakeSensor('ft300', events=events)
+    instance.xense_client = FakeSensor('xense', events=events)
+    instance.rosbag = FakeRosbag(events=events)
+    instance.aligned_reader = SequenceAlignedReader(
+        [aligned_health(10)],
+        events=events,
+    )
+    fail_stops = []
+    instance.request_fail_stop = lambda reason, message: fail_stops.append((reason, message))
+    instance.set_state(InferenceState.STARTING)
+
+    instance._start_rollout()
+
+    assert 'did not advance' in fail_stops[0][1]
+    assert ('rosbag', 'record') not in events
+    assert instance.control.transactions == []
+    assert instance.ft_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+    assert instance.xense_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+
+
+def test_rollout_start_preserves_aligned_and_discard_failures(tmp_path):
+    instance = controller(tmp_path)
+    instance.ft_client = FakeSensor('ft300')
+    instance.xense_client = FakeSensor(
+        'xense',
+        fail_commands={'DEMO_DISCARD_REQ'},
+    )
+    instance.aligned_reader = SequenceAlignedReader(
+        [aligned_health(10), aligned_health(10, ready=False)]
+    )
+    fail_stops = []
+    instance.request_fail_stop = lambda reason, message: fail_stops.append((reason, message))
+    instance.set_state(InferenceState.STARTING)
+
+    instance._start_rollout()
+
+    assert 'not ready' in fail_stops[0][1]
+    assert 'xense DEMO_DISCARD_REQ failed' in fail_stops[0][1]
+    assert instance.ft_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+    assert instance.xense_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+    assert set(instance._active_sensor_clients) == {'xense'}
+
+
+def test_lerobot_start_rejection_discards_sensors_and_stops_rosbag(tmp_path):
+    events = []
+    instance = controller(tmp_path)
+    instance.ft_client = FakeSensor('ft300', events=events)
+    instance.xense_client = FakeSensor('xense', events=events)
+    instance.rosbag = FakeRosbag(events=events)
+    instance.control = EventControl(events, start_accepted=False)
+    fail_stops = []
+    instance.request_fail_stop = lambda reason, message: fail_stops.append((reason, message))
+    instance.set_state(InferenceState.STARTING)
+
+    instance._start_rollout()
+
+    assert fail_stops[0][0] == 'rollout_start_failure'
+    assert instance.ft_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+    assert instance.xense_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+    assert [call[0] for call in instance.rosbag.calls] == ['record', 'stop']
+
+
+def test_rosbag_start_failure_discards_sensors_without_lerobot_start(tmp_path):
+    events = []
+    instance = controller(tmp_path)
+    instance.ft_client = FakeSensor('ft300', events=events)
+    instance.xense_client = FakeSensor('xense', events=events)
+
+    class FailingRosbag(FakeRosbag):
+        def record(self, uri, timeout_s):
+            super().record(uri, timeout_s)
+            raise RuntimeError('record failed')
+
+    instance.rosbag = FailingRosbag(events=events)
+    fail_stops = []
+    instance.request_fail_stop = lambda reason, message: fail_stops.append((reason, message))
+    instance.set_state(InferenceState.STARTING)
+
+    instance._start_rollout()
+
+    assert 'record failed' in fail_stops[0][1]
+    assert instance.control.transactions == []
+    assert instance.ft_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+    assert instance.xense_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+    assert [call[0] for call in instance.rosbag.calls] == ['record', 'stop']
+
+
+def test_abort_discards_sensors_and_allows_another_rollout(tmp_path):
+    instance = controller(tmp_path)
+    instance.set_state(InferenceState.READY)
+    assert instance.admit_user_action('start')
+    instance.handle_command(instance.commands.get_nowait())
+    assert instance.admit_user_action('abort')
+    instance.handle_command(instance.commands.get_nowait())
+    assert instance.get_state() == InferenceState.WAIT_START
+
+    assert instance.admit_user_action('initialize')
+    instance.handle_command(instance.commands.get_nowait())
+    assert instance.admit_user_action('start')
+    instance.handle_command(instance.commands.get_nowait())
+
+    assert instance.get_state() == InferenceState.RUNNING
+    assert instance.ft_client.commands == [
+        'START_REQ', 'DEMO_DISCARD_REQ', 'START_REQ'
+    ]
+    assert instance.xense_client.commands == [
+        'START_REQ', 'DEMO_DISCARD_REQ', 'START_REQ'
+    ]
+
+
 def test_jump_hold_is_immediate_recoverable_abort_and_flags_are_recorded(tmp_path):
     instance = controller(tmp_path)
-    instance.set_state(InferenceState.RUNNING)
+    instance.set_state(InferenceState.STARTING)
     instance._begin_recording()
+    instance.set_state(InferenceState.RUNNING)
     frame = TelemetryFrame(
         source=2,
         flags=ROBOT_TELEMETRY_FLAG_JUMP_HOLD,
@@ -348,8 +673,9 @@ def test_shutdown_rejection_cannot_clear_concurrent_fail_stop(tmp_path):
 
 def test_shutdown_from_running_settles_rollout_before_wire_shutdown(tmp_path):
     instance = controller(tmp_path)
-    instance.set_state(InferenceState.RUNNING)
+    instance.set_state(InferenceState.STARTING)
     instance._begin_recording()
+    instance.set_state(InferenceState.RUNNING)
     assert instance.admit_user_action('shutdown')
     instance.handle_command(instance.commands.get_nowait())
     assert instance.control.transactions == ['STOP']
@@ -550,8 +876,11 @@ def test_successful_realsense_startup_recovery_allows_startup_to_continue(tmp_pa
     instance._wait_realsense_nodes_up = lambda *, start_position: True
     instance._wait_realsense_images_ready = lambda: True
     instance._start_lerobot = lambda: None
+    instance.ft_client = FakeSensor('ft300')
+    instance.xense_client = FakeSensor('xense')
     instance.control = SimpleNamespace(
-        wait_for_status=lambda expected: status(1, 'READY', 'WAIT_INITIALIZE')
+        wait_for_status=lambda expected: status(1, 'READY', 'WAIT_INITIALIZE'),
+        close=lambda: None,
     )
     instance._register_aligned_reader = lambda: setattr(
         instance,
@@ -572,6 +901,151 @@ def test_successful_realsense_startup_recovery_allows_startup_to_continue(tmp_pa
     assert process.restart_count == 1
     assert instance.get_state() == InferenceState.WAIT_START
     assert instance.termination_mode is None
+
+
+def test_startup_warmup_orders_sensor_start_lerobot_aligned_and_discard(tmp_path):
+    events = []
+    instance = startup_controller(tmp_path, events)
+
+    instance.startup()
+
+    assert instance.get_state() == InferenceState.WAIT_START
+    assert events == [
+        ('ft300', 'START_REQ'),
+        ('xense', 'START_REQ'),
+        ('lerobot', 'launch'),
+        ('lerobot', 'READY'),
+        ('aligned', 'attach'),
+        ('aligned', 'read', 10),
+        ('ft300', 'DEMO_DISCARD_REQ'),
+        ('xense', 'DEMO_DISCARD_REQ'),
+    ]
+    assert instance._active_sensor_clients == {}
+
+
+@pytest.mark.parametrize(
+    ('failure_stage', 'expected_reason'),
+    [
+        ('lerobot_launch', 'launch failed'),
+        ('lerobot_ready', 'READY failed'),
+        ('aligned_attach', 'attach failed'),
+        ('aligned_read', 'read failed'),
+        ('aligned_not_ready', 'not ready'),
+        ('aligned_fatal', 'is fatal'),
+    ],
+)
+def test_startup_failure_after_warmup_discards_all_active_sensors(
+    tmp_path,
+    failure_stage,
+    expected_reason,
+):
+    events = []
+    instance = startup_controller(tmp_path, events)
+    instance._stop_runtime_resources = lambda: events.append(('controller', 'terminal_cleanup'))
+
+    if failure_stage == 'lerobot_launch':
+        instance._start_lerobot = lambda: (_ for _ in ()).throw(RuntimeError('launch failed'))
+    elif failure_stage == 'lerobot_ready':
+        def start_lerobot():
+            events.append(('lerobot', 'launch'))
+            instance.control = StartupControl(events, error=RuntimeError('READY failed'))
+
+        instance._start_lerobot = start_lerobot
+    elif failure_stage == 'aligned_attach':
+        instance._register_aligned_reader = lambda: (_ for _ in ()).throw(
+            RuntimeError('attach failed')
+        )
+    elif failure_stage == 'aligned_read':
+        instance._register_aligned_reader = lambda: setattr(
+            instance,
+            'aligned_reader',
+            SequenceAlignedReader([RuntimeError('read failed')]),
+        )
+    elif failure_stage == 'aligned_not_ready':
+        instance._register_aligned_reader = lambda: setattr(
+            instance,
+            'aligned_reader',
+            SequenceAlignedReader([aligned_health(10, ready=False)]),
+        )
+    elif failure_stage == 'aligned_fatal':
+        instance._register_aligned_reader = lambda: setattr(
+            instance,
+            'aligned_reader',
+            SequenceAlignedReader(
+                [aligned_health(10, fatal=True, message='source failed')]
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match=expected_reason):
+        instance.startup()
+
+    assert instance.ft_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+    assert instance.xense_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+    assert events[-3:] == [
+        ('ft300', 'DEMO_DISCARD_REQ'),
+        ('xense', 'DEMO_DISCARD_REQ'),
+        ('controller', 'terminal_cleanup'),
+    ]
+
+
+def test_startup_preserves_primary_and_all_discard_failures(tmp_path):
+    events = []
+    instance = startup_controller(tmp_path, events)
+    instance.ft_client.fail_commands.add('DEMO_DISCARD_REQ')
+    instance.xense_client.fail_commands.add('DEMO_DISCARD_REQ')
+    instance._start_lerobot = lambda: (_ for _ in ()).throw(RuntimeError('launch failed'))
+    instance._stop_runtime_resources = lambda: None
+
+    with pytest.raises(RuntimeError) as exc_info:
+        instance.startup()
+
+    message = str(exc_info.value)
+    assert 'launch failed' in message
+    assert 'ft300 DEMO_DISCARD_REQ failed' in message
+    assert 'xense DEMO_DISCARD_REQ failed' in message
+    assert instance.ft_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+    assert instance.xense_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+    assert set(instance._active_sensor_clients) == {'ft300', 'xense'}
+
+
+def test_startup_final_discard_failure_continues_other_sensor_and_fails(tmp_path):
+    events = []
+    instance = startup_controller(tmp_path, events)
+    instance.ft_client.fail_commands.add('DEMO_DISCARD_REQ')
+    instance._stop_runtime_resources = lambda: events.append(('controller', 'terminal_cleanup'))
+
+    with pytest.raises(RuntimeError, match='ft300 DEMO_DISCARD_REQ failed'):
+        instance.startup()
+
+    assert instance.ft_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+    assert instance.xense_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+    assert set(instance._active_sensor_clients) == {'ft300'}
+    assert instance.get_state() == InferenceState.STARTING_SERVICES
+
+
+def test_concurrent_startup_fail_stop_waits_for_warmup_discard_before_stop(tmp_path):
+    events = []
+    instance = startup_controller(tmp_path, events)
+    instance._execute_fail_stop = instance._stop_runtime_resources
+
+    def start_lerobot():
+        events.append(('lerobot', 'launch'))
+        instance.control = StartupControl(events)
+        instance.request_fail_stop('injected_startup_fatal', 'fatal during startup')
+
+    instance._start_lerobot = start_lerobot
+
+    with pytest.raises(RuntimeError, match='session termination began'):
+        instance.startup()
+
+    assert instance._termination_thread is not None
+    instance._termination_thread.join(timeout=1.0)
+    assert not instance._termination_thread.is_alive()
+    ft_discard = events.index(('ft300', 'DEMO_DISCARD_REQ'))
+    xense_discard = events.index(('xense', 'DEMO_DISCARD_REQ'))
+    ft_stop = events.index(('ft300', 'STOP_REQ'))
+    xense_stop = events.index(('xense', 'STOP_REQ'))
+    assert ft_discard < xense_discard < ft_stop < xense_stop
 
 
 def test_four_node_lines_are_only_launch_gate_and_images_are_authoritative(tmp_path):

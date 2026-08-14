@@ -15,7 +15,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any
 
-from .aligned_health import AlignedHealthReader
+from .aligned_health import AlignedHealth, AlignedHealthReader
 from .buffers import JsonlLogger, TableBuffer
 from .config import XENSE_SDK_CONDA_ENVS, default_repo_root, validate_repo_root
 from .inference_config import EXPECTED_REALSENSE_CAMERAS, InferenceConfig
@@ -139,6 +139,7 @@ class InferenceMainController:
         self.rosbag_uri: Path | None = None
         self.recording_active = False
         self._recording_lock = threading.RLock()
+        self._active_sensor_clients: dict[str, UdsClient] = {}
         self.rollout_index = 0
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: threading.Thread | None = None
@@ -191,30 +192,34 @@ class InferenceMainController:
             self._start_processes()
             self._wait_services_ready()
             self._wait_realsense_startup_ready()
-            self._start_lerobot()
-            if self._recover_realsense_startup_if_needed():
-                self._wait_realsense_startup_ready()
-            assert self.control is not None
-            ready = self.control.wait_for_status({'READY'})
-            if self._recover_realsense_startup_if_needed():
-                self._wait_realsense_startup_ready()
-            self._ensure_startup_active()
-            if ready.phase != 'WAIT_INITIALIZE':
-                raise RuntimeError(f'unexpected LeRobot READY phase: {ready.phase}')
-            self._run_startup_resource_step(
-                'aligned health reader',
-                self._register_aligned_reader,
-            )
-            assert self.aligned_reader is not None
-            health = self.aligned_reader.read()
-            if health.fatal:
-                self.log(
-                    'sensorhub_fatal_observed',
-                    status_code=health.status_code,
-                    message=health.message,
-                )
-            if not health.ready:
-                raise RuntimeError('aligned observation SHM is not ready')
+            with self._recording_lock:
+                self._start_sensor_acquisition()
+                startup_error: BaseException | None = None
+                try:
+                    self._start_lerobot()
+                    if self._recover_realsense_startup_if_needed():
+                        self._wait_realsense_startup_ready()
+                    assert self.control is not None
+                    ready = self.control.wait_for_status({'READY'})
+                    if self._recover_realsense_startup_if_needed():
+                        self._wait_realsense_startup_ready()
+                    self._ensure_startup_active()
+                    if ready.phase != 'WAIT_INITIALIZE':
+                        raise RuntimeError(f'unexpected LeRobot READY phase: {ready.phase}')
+                    self._run_startup_resource_step(
+                        'aligned health reader',
+                        self._register_aligned_reader,
+                    )
+                    self._read_required_aligned_health('startup')
+                except BaseException as exc:
+                    startup_error = exc
+                discard_errors = self._discard_active_sensors_locked()
+            if startup_error is not None or discard_errors:
+                raise self._lifecycle_failure(
+                    'startup warmup',
+                    startup_error,
+                    discard_errors,
+                ) from startup_error
             self._run_startup_resource_step('complete startup', self._mark_session_ready)
         except BaseException:
             self._stop_runtime_resources()
@@ -325,21 +330,31 @@ class InferenceMainController:
             self.request_fail_stop('lerobot_initialize_failure', str(exc))
 
     def _start_rollout(self) -> None:
-        try:
-            self._begin_recording()
-            result = self._require_control().transact('START', {'STARTED'})
-            if not result.ack.accepted:
-                raise RuntimeError(
-                    f'LeRobot rejected START: {result.ack.code} in {result.ack.phase}'
-                )
-            assert result.completion is not None
-            self.log('rollout_started', status=result.completion.status)
-            if self.get_state() == InferenceState.STARTING:
-                self.set_state(InferenceState.RUNNING)
-                self._start_watchdog()
-        except BaseException as exc:
-            self._fail_recording_best_effort('start_failure', str(exc))
-            self.request_fail_stop('rollout_start_failure', str(exc))
+        with self._recording_lock:
+            try:
+                self._begin_recording_locked()
+                self._ensure_session_not_terminating('LeRobot START')
+                if self.get_state() != InferenceState.STARTING:
+                    raise RuntimeError(
+                        f'controller left STARTING before LeRobot START: '
+                        f'{self.get_state().name}'
+                    )
+                result = self._require_control().transact('START', {'STARTED'})
+                if not result.ack.accepted:
+                    raise RuntimeError(
+                        f'LeRobot rejected START: {result.ack.code} in {result.ack.phase}'
+                    )
+                assert result.completion is not None
+                self.log('rollout_started', status=result.completion.status)
+                if self.get_state() == InferenceState.STARTING:
+                    self.set_state(InferenceState.RUNNING)
+                    self._start_watchdog()
+            except BaseException as exc:
+                cleanup_error = self._fail_recording_best_effort('start_failure', str(exc))
+                message = str(exc)
+                if cleanup_error is not None:
+                    message = f'{message}; recording cleanup failed: {cleanup_error}'
+                self.request_fail_stop('rollout_start_failure', message)
 
     def _stop_rollout(self) -> None:
         self._finish_rollout_transaction('STOP', 'STOPPED', 'done', 'user_stop')
@@ -403,25 +418,20 @@ class InferenceMainController:
         self.rollout_store = InferenceRolloutStore(rollout_dir)
         self.rollout_started_ns = time.time_ns()
         self.rosbag_uri = rollout_dir / 'rosbag'
-        started_sensors: list[UdsClient] = []
-        try:
-            for client in (self.ft_client, self.xense_client):
-                self._sensor_command(client, MsgType.START_REQ, 'START_REQ', self.config.sensor_ack_timeout_s)
-                started_sensors.append(client)
-            if self.rosbag is None:
-                raise RuntimeError('rosbag recorder control is unavailable')
-            self.rosbag.record(self.rosbag_uri, timeout_s=self.config.rosbag_timeout_s)
-            self.recording_active = True
-            self.log('recording_started', rollout_dir=str(rollout_dir))
-        except BaseException:
-            for client in started_sensors:
-                try:
-                    self._sensor_command(
-                        client, MsgType.STOP_REQ, 'STOP_REQ', self.config.sensor_ack_timeout_s
-                    )
-                except BaseException:
-                    pass
-            raise
+        baseline = self._read_required_aligned_health('rollout start').latest_sequence
+        self.log('aligned_rearm_started', baseline_sequence=baseline)
+        self._start_sensor_acquisition()
+        health = self._wait_for_fresh_aligned_snapshot(baseline)
+        self.log(
+            'aligned_rearm_completed',
+            baseline_sequence=baseline,
+            latest_sequence=health.latest_sequence,
+        )
+        if self.rosbag is None:
+            raise RuntimeError('rosbag recorder control is unavailable')
+        self.rosbag.record(self.rosbag_uri, timeout_s=self.config.rosbag_timeout_s)
+        self.recording_active = True
+        self.log('recording_started', rollout_dir=str(rollout_dir))
 
     def _finish_recording(self, status: str, extra: dict[str, Any]) -> Path | None:
         with self._recording_lock:
@@ -434,20 +444,24 @@ class InferenceMainController:
         self.recording_active = False
         sensor_payloads: dict[str, dict[str, Any]] = {}
         errors: list[str] = []
-        message_type = MsgType.DEMO_DONE_REQ if status == 'done' else MsgType.STOP_REQ
-        command_name = 'DEMO_DONE_REQ' if status == 'done' else 'STOP_REQ'
+        message_type = (
+            MsgType.DEMO_DONE_REQ if status == 'done' else MsgType.DEMO_DISCARD_REQ
+        )
+        command_name = 'DEMO_DONE_REQ' if status == 'done' else 'DEMO_DISCARD_REQ'
         sensor_timeout_s = (
             self.config.sensor_flush_timeout_s
             if status == 'done'
             else self.config.sensor_ack_timeout_s
         )
-        for client in (self.ft_client, self.xense_client):
+        for client in tuple(self._active_sensor_clients.values()):
             try:
                 sensor_payloads[client.name] = self._sensor_command(
                     client, message_type, command_name, sensor_timeout_s
                 )
             except BaseException as exc:
                 errors.append(f'{client.name}: {exc}')
+            else:
+                self._active_sensor_clients.pop(client.name, None)
         if self.rosbag is not None:
             try:
                 self.rosbag.stop(timeout_s=self.config.rosbag_timeout_s)
@@ -478,11 +492,118 @@ class InferenceMainController:
             raise RuntimeError('; '.join(errors))
         return path
 
-    def _fail_recording_best_effort(self, stage: str, reason: str) -> None:
+    def _fail_recording_best_effort(self, stage: str, reason: str) -> str | None:
         try:
             self._finish_recording('failed', {'failure_stage': stage, 'failure_reason': reason})
         except BaseException as exc:
             self.log('recording_failure_cleanup_failed', error=str(exc))
+            return str(exc)
+        return None
+
+    def _start_sensor_acquisition(self) -> None:
+        """Start FT300S then Xense and roll back every ACK-confirmed partial start."""
+        with self._recording_lock:
+            if self._active_sensor_clients:
+                names = sorted(self._active_sensor_clients)
+                raise RuntimeError(f'sensor acquisition is already active: {names}')
+            try:
+                for client in (self.ft_client, self.xense_client):
+                    self._ensure_session_not_terminating('sensor START')
+                    self._sensor_command(
+                        client,
+                        MsgType.START_REQ,
+                        'START_REQ',
+                        self.config.sensor_ack_timeout_s,
+                    )
+                    self._active_sensor_clients[client.name] = client
+                    self._ensure_session_not_terminating('sensor START')
+            except BaseException as exc:
+                discard_errors = self._discard_active_sensors_locked()
+                raise self._lifecycle_failure(
+                    'sensor START',
+                    exc,
+                    discard_errors,
+                ) from exc
+
+    def _discard_active_sensors_locked(self) -> list[str]:
+        """Best-effort discard every active sensor and return all failures."""
+        errors: list[str] = []
+        for client in tuple(self._active_sensor_clients.values()):
+            try:
+                self._sensor_command(
+                    client,
+                    MsgType.DEMO_DISCARD_REQ,
+                    'DEMO_DISCARD_REQ',
+                    self.config.sensor_ack_timeout_s,
+                )
+            except BaseException as exc:
+                errors.append(f'{client.name}: {exc}')
+            else:
+                self._active_sensor_clients.pop(client.name, None)
+        return errors
+
+    def _read_required_aligned_health(self, context: str) -> AlignedHealth:
+        """Read one aligned header that is ready and non-fatal."""
+        if self.aligned_reader is None:
+            raise RuntimeError('aligned health reader is unavailable')
+        health = self.aligned_reader.read()
+        if health.fatal:
+            self.log(
+                'sensorhub_fatal_observed',
+                context=context,
+                status_code=health.status_code,
+                message=health.message,
+            )
+            raise RuntimeError(
+                f'aligned observation SHM is fatal during {context}: '
+                f'{health.status_code}: {health.message}'
+            )
+        if not health.ready:
+            raise RuntimeError(f'aligned observation SHM is not ready during {context}')
+        return health
+
+    def _wait_for_fresh_aligned_snapshot(self, baseline: int) -> AlignedHealth:
+        """Wait for one ready, non-fatal aligned sequence newer than baseline."""
+        deadline = time.monotonic() + self.config.startup_timeout_s
+        while True:
+            self._ensure_session_not_terminating('aligned re-arm')
+            if self.get_state() != InferenceState.STARTING:
+                raise RuntimeError(
+                    f'controller left STARTING during aligned re-arm: {self.get_state().name}'
+                )
+            health = self._read_required_aligned_health('rollout re-arm')
+            if health.latest_sequence > baseline:
+                return health
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    'aligned observation sequence did not advance before rollout start: '
+                    f'baseline={baseline} latest={health.latest_sequence} '
+                    f'timeout_s={self.config.startup_timeout_s}'
+                )
+            time.sleep(min(self.config.aligned_poll_interval_s, remaining))
+
+    def _ensure_session_not_terminating(self, context: str) -> None:
+        with self._termination_lock:
+            if (
+                self._fail_stop_requested.is_set()
+                or self.termination_mode is not None
+                or self._resources_stopped
+            ):
+                raise RuntimeError(f'session termination began during {context}')
+
+    @staticmethod
+    def _lifecycle_failure(
+        context: str,
+        primary_error: BaseException | None,
+        discard_errors: list[str],
+    ) -> RuntimeError:
+        details: list[str] = []
+        if primary_error is not None:
+            details.append(str(primary_error))
+        if discard_errors:
+            details.append(f'sensor discard failed: {"; ".join(discard_errors)}')
+        return RuntimeError(f'{context} failed: {"; ".join(details)}')
 
     def _sensor_command(
         self,
@@ -990,16 +1111,18 @@ class InferenceMainController:
         self._stop_watchdog()
         if self.control is not None:
             self.control.close()
-        for client in (self.ft_client, self.xense_client):
-            try:
-                self._sensor_command(
-                    client,
-                    MsgType.STOP_REQ,
-                    'STOP_REQ',
-                    self.config.sensor_ack_timeout_s,
-                )
-            except BaseException as exc:
-                self.log('sensor_shutdown_failed', sensor=client.name, error=str(exc))
+        with self._recording_lock:
+            for client in (self.ft_client, self.xense_client):
+                try:
+                    self._sensor_command(
+                        client,
+                        MsgType.STOP_REQ,
+                        'STOP_REQ',
+                        self.config.sensor_ack_timeout_s,
+                    )
+                except BaseException as exc:
+                    self.log('sensor_shutdown_failed', sensor=client.name, error=str(exc))
+            self._active_sensor_clients.clear()
         for client in (self.ft_client, self.xense_client):
             client.stop()
         if self.zmq_receiver is not None:
