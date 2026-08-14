@@ -123,12 +123,24 @@ class FakeSensor:
 class FakeRosbag:
     def __init__(self):
         self.calls = []
+        self.image_readiness_ok = True
 
     def record(self, uri, timeout_s):
         self.calls.append(('record', Path(uri)))
 
     def stop(self, timeout_s):
         self.calls.append(('stop', None))
+
+    def check_image_readiness(self, requirements, timeout_s, mode):
+        self.calls.append(('check_image_readiness', tuple(requirements)))
+        return SimpleNamespace(
+            ok=self.image_readiness_ok,
+            to_manifest=lambda: {
+                'ok': self.image_readiness_ok,
+                'mode': mode,
+                'required_topics': [requirement.topic for requirement in requirements],
+            },
+        )
 
     def close(self):
         pass
@@ -451,6 +463,8 @@ def test_successful_realsense_startup_recovery_allows_startup_to_continue(tmp_pa
     instance._wait_services_ready = lambda: instance._on_process_fatal(
         'realsense', 'Depth stream start failure, Hardware Error'
     )
+    instance._wait_realsense_nodes_up = lambda *, start_position: True
+    instance._wait_realsense_images_ready = lambda: True
     instance._start_lerobot = lambda: None
     instance.control = SimpleNamespace(
         wait_for_status=lambda expected: status(1, 'READY', 'WAIT_INITIALIZE')
@@ -474,6 +488,102 @@ def test_successful_realsense_startup_recovery_allows_startup_to_continue(tmp_pa
     assert process.restart_count == 1
     assert instance.get_state() == InferenceState.WAIT_START
     assert instance.termination_mode is None
+
+
+def test_four_node_lines_are_only_launch_gate_and_images_are_authoritative(tmp_path):
+    instance = controller(tmp_path)
+    process = FakeProcess()
+    process.log_path = tmp_path / 'realsense.log'
+    process.log_path.write_text(
+        ''.join(
+            f'[{camera}.camera]: RealSense Node Is Up!\n'
+            for camera in ('cam1', 'cam2', 'cam3', 'cam4')
+        ),
+        encoding='utf-8',
+    )
+    instance.processes['realsense'] = process
+    instance.rosbag.image_readiness_ok = False
+
+    assert instance._wait_realsense_nodes_up(start_position=0)
+    with pytest.raises(RuntimeError, match='image topics are not ready'):
+        instance._wait_realsense_images_ready()
+
+    assert [call[0] for call in instance.rosbag.calls] == ['check_image_readiness']
+
+
+def test_recoverable_fatal_during_image_readiness_restarts_and_regates(tmp_path):
+    instance = controller(tmp_path)
+    instance.config = config(
+        tmp_path,
+        realsense_startup_stabilization_s=0.001,
+    )
+    log_path = tmp_path / 'realsense.log'
+
+    class RestartingProcess(FakeRestartableProcess):
+        def __init__(self):
+            super().__init__()
+            self.log_path = log_path
+
+        def restart(self, grace_s=5.0):
+            super().restart(grace_s=grace_s)
+            with self.log_path.open('a', encoding='utf-8') as log_fp:
+                for camera in ('cam1', 'cam2', 'cam3', 'cam4'):
+                    log_fp.write(f'[{camera}.camera]: RealSense Node Is Up!\n')
+
+    process = RestartingProcess()
+    process.log_path.write_text(
+        ''.join(
+            f'[{camera}.camera]: RealSense Node Is Up!\n'
+            for camera in ('cam1', 'cam2', 'cam3', 'cam4')
+        ),
+        encoding='utf-8',
+    )
+    instance.processes['realsense'] = process
+    instance.set_state(InferenceState.STARTING_SERVICES)
+    readiness_calls = 0
+
+    def check_image_readiness(requirements, timeout_s, mode):
+        nonlocal readiness_calls
+        readiness_calls += 1
+        if readiness_calls == 1:
+            instance._on_process_fatal(
+                'realsense',
+                'Hardware Notification:Depth stream start failure, Hardware Error',
+            )
+        ok = readiness_calls > 1
+        return SimpleNamespace(
+            ok=ok,
+            to_manifest=lambda: {'ok': ok, 'mode': mode, 'required_topics': []},
+        )
+
+    instance.rosbag.check_image_readiness = check_image_readiness
+    instance._wait_realsense_startup_ready()
+
+    assert process.restart_count == 1
+    assert readiness_calls == 2
+    assert instance.termination_mode is None
+
+
+def test_realsense_restart_node_gate_ignores_previous_generation_lines(tmp_path):
+    instance = controller(tmp_path)
+    instance.config = config(tmp_path, startup_timeout_s=0.01)
+    process = FakeProcess()
+    process.log_path = tmp_path / 'realsense.log'
+    process.log_path.write_text(
+        ''.join(
+            f'[{camera}.camera]: RealSense Node Is Up!\n'
+            for camera in ('cam1', 'cam2', 'cam3', 'cam4')
+        ),
+        encoding='utf-8',
+    )
+    restart_position = process.log_path.stat().st_size
+    with process.log_path.open('a', encoding='utf-8') as log_fp:
+        for camera in ('cam1', 'cam2', 'cam3'):
+            log_fp.write(f'[{camera}.camera]: RealSense Node Is Up!\n')
+    instance.processes['realsense'] = process
+
+    with pytest.raises(RuntimeError, match=r"\['cam4'\]"):
+        instance._wait_realsense_nodes_up(start_position=restart_position)
 
 
 def test_failed_realsense_startup_recovery_escalates_to_fail_stop(tmp_path):

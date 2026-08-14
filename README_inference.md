@@ -115,10 +115,21 @@ Startup is session-scoped:
    processes.
 3. Wait for both sensor UDS connections and `INIT_READY`, then verify rosbag2
    recorder services.
-4. Start one persistent controlled LeRobot worker and connect its UDS control
+4. Wait for all four launch logs to report `RealSense Node Is Up!`, then require
+   one actual frame with the formal schema on each of the eight color/aligned
+   depth image topics. The node-up lines are only a launch-stage signal; the
+   image check is the authoritative RealSense usability gate.
+5. Start one persistent controlled LeRobot worker and connect its UDS control
    channel.
-5. Wait for LeRobot `READY` in `WAIT_INITIALIZE`, map the aligned SHM header,
+6. Wait for LeRobot `READY` in `WAIT_INITIALIZE`, map the aligned SHM header,
    require `ready=1`, and enter `WAIT_START`.
+
+The same two-stage RealSense gate runs after each bounded recovery restart and
+only accepts node-up lines from the restarted log generation. The additional
+1.5-second fatal-pattern stabilization window is not evidence of camera health
+and never replaces actual image readiness. A matching recoverable fatal that
+arrives during either gate enters the existing bounded startup-restart path at
+the next available synchronous check boundary.
 
 Resource registration and startup are synchronized with fatal teardown. Once
 a session-fatal request begins, startup stops scheduling resources. Anything
@@ -179,7 +190,8 @@ runtime error/disconnect, or an unrecoverable MainController error also
 establishes `FAIL_STOP`. MainController retransmits `FAIL_STOP` with increasing
 wire sequences until delivery/fatal teardown/process exit is confirmed, waits
 for bounded worker exit, and then stops remaining workstation resources. No
-managed process is transparently restarted.
+managed process is transparently restarted outside the narrow, bounded
+RealSense startup recovery described above.
 
 Do not use Ctrl-C when the intended operation is a normal graceful shutdown;
 enter `q` instead.

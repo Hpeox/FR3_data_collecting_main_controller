@@ -18,7 +18,7 @@ from typing import Any
 from .aligned_health import AlignedHealthReader
 from .buffers import JsonlLogger, TableBuffer
 from .config import XENSE_SDK_CONDA_ENVS, default_repo_root, validate_repo_root
-from .inference_config import InferenceConfig
+from .inference_config import EXPECTED_REALSENSE_CAMERAS, InferenceConfig
 from .inference_protocol import ControlledClient, Status
 from .processes import ManagedProcess, bash_cmd
 from .rosbag_control import RosbagControl
@@ -150,6 +150,7 @@ class InferenceMainController:
         self._realsense_startup_fatal_message: str | None = None
         self._realsense_startup_restart_in_progress = False
         self._realsense_startup_restart_count = 0
+        self._realsense_startup_log_position = 0
         self._finalize_lock = threading.Lock()
         self.termination_mode: str | None = None
         self.termination_reason: str | None = None
@@ -189,14 +190,14 @@ class InferenceMainController:
             self._start_receivers()
             self._start_processes()
             self._wait_services_ready()
-            self._recover_realsense_startup_if_needed(
-                wait_s=self.config.realsense_startup_stabilization_s,
-            )
+            self._wait_realsense_startup_ready()
             self._start_lerobot()
-            self._recover_realsense_startup_if_needed()
+            if self._recover_realsense_startup_if_needed():
+                self._wait_realsense_startup_ready()
             assert self.control is not None
             ready = self.control.wait_for_status({'READY'})
-            self._recover_realsense_startup_if_needed()
+            if self._recover_realsense_startup_if_needed():
+                self._wait_realsense_startup_ready()
             self._ensure_startup_active()
             if ready.phase != 'WAIT_INITIALIZE':
                 raise RuntimeError(f'unexpected LeRobot READY phase: {ready.phase}')
@@ -846,8 +847,9 @@ class InferenceMainController:
                     return
         self.request_fail_stop(f'{name}_fatal', line)
 
-    def _recover_realsense_startup_if_needed(self, *, wait_s: float = 0.0) -> None:
+    def _recover_realsense_startup_if_needed(self, *, wait_s: float = 0.0) -> bool:
         """Restart only RealSense for bounded, matching startup fatal events."""
+        restarted = False
         while self._realsense_startup_fatal.wait(timeout=wait_s):
             with self._realsense_startup_fatal_lock:
                 message = self._realsense_startup_fatal_message or 'unknown RealSense fatal'
@@ -863,6 +865,7 @@ class InferenceMainController:
                 process = self.processes.get('realsense')
                 if process is None:
                     raise RuntimeError('RealSense startup recovery process is unavailable')
+                self._realsense_startup_log_position = self._realsense_log_position(process)
                 self._realsense_startup_restart_count += 1
                 attempt = self._realsense_startup_restart_count
                 self.log(
@@ -886,10 +889,97 @@ class InferenceMainController:
                         f'RealSense startup recovery attempt {attempt} failed: {exc}'
                     ) from exc
                 self.log('realsense_startup_restart_done', attempt=attempt)
+                restarted = True
             finally:
                 with self._realsense_startup_fatal_lock:
                     self._realsense_startup_restart_in_progress = False
-            wait_s = self.config.realsense_startup_stabilization_s
+            wait_s = 0.0
+        return restarted
+
+    @staticmethod
+    def _realsense_log_position(process: ManagedProcess) -> int:
+        """Return the current RealSense log size for generation-scoped readiness."""
+        log_path = getattr(process, 'log_path', None)
+        if log_path is None:
+            return 0
+        try:
+            return log_path.stat().st_size
+        except OSError:
+            return 0
+
+    def _wait_realsense_startup_ready(self) -> None:
+        """Require launch-stage and actual-image readiness for the latest generation."""
+        while True:
+            self._recover_realsense_startup_if_needed()
+            start_position = self._realsense_startup_log_position
+            if not self._wait_realsense_nodes_up(start_position=start_position):
+                continue
+            if not self._wait_realsense_images_ready():
+                continue
+            if self._recover_realsense_startup_if_needed(
+                wait_s=self.config.realsense_startup_stabilization_s,
+            ):
+                continue
+            return
+
+    def _wait_realsense_nodes_up(self, *, start_position: int) -> bool:
+        """Wait for four launch-stage node-up lines from the current generation."""
+        process = self.processes.get('realsense')
+        if process is None:
+            raise RuntimeError('RealSense startup process is unavailable')
+        expected = set(EXPECTED_REALSENSE_CAMERAS)
+        ready: set[str] = set()
+        position = start_position
+        deadline = time.monotonic() + self.config.startup_timeout_s
+        self.log('realsense_nodes_up_wait', required_cameras=sorted(expected))
+        while time.monotonic() < deadline:
+            self._ensure_startup_active()
+            if self._realsense_startup_fatal.is_set():
+                return False
+            if process.log_path.exists():
+                with process.log_path.open('r', encoding='utf-8', errors='replace') as log_fp:
+                    log_fp.seek(position)
+                    while True:
+                        line = log_fp.readline()
+                        if not line:
+                            break
+                        if 'RealSense Node Is Up!' not in line:
+                            continue
+                        for camera in expected - ready:
+                            if f'[{camera}.camera]' in line:
+                                ready.add(camera)
+                                self.log('realsense_node_up', camera=camera)
+                    position = log_fp.tell()
+            if expected <= ready:
+                self.log('realsense_nodes_up_ready', cameras=sorted(ready))
+                return True
+            time.sleep(0.1)
+        missing = sorted(expected - ready)
+        self.log(
+            'realsense_nodes_up_timeout',
+            seen_cameras=sorted(ready),
+            missing_cameras=missing,
+        )
+        raise RuntimeError(f'RealSense nodes did not report ready: {missing}')
+
+    def _wait_realsense_images_ready(self) -> bool:
+        """Use actual image frames and schemas as the authoritative startup gate."""
+        if self._realsense_startup_fatal.is_set():
+            return False
+        if self.rosbag is None:
+            raise RuntimeError('rosbag control is unavailable for RealSense readiness')
+        readiness = self.rosbag.check_image_readiness(
+            self.config.realsense_image_requirements,
+            timeout_s=self.config.realsense_image_ready_timeout_s,
+            mode='formal',
+        )
+        manifest = readiness.to_manifest()
+        self.log('realsense_startup_image_readiness', **manifest)
+        if self._realsense_startup_fatal.is_set():
+            return False
+        if not readiness.ok:
+            raise RuntimeError('required RealSense image topics are not ready')
+        return True
 
     def _stop_runtime_resources(self) -> None:
         with self._termination_lock:

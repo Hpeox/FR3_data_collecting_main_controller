@@ -9,11 +9,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import XENSE_SDK_CONDA_ENVS, validate_repo_root
+from .realsense_image_guard import ImageTopicRequirement, formal_image_requirements
 
 
 EXPECTED_REALSENSE_SHM_NAMES = (
     '/realsense_cam1', '/realsense_cam2', '/realsense_cam3', '/realsense_cam4',
 )
+EXPECTED_REALSENSE_CAMERAS = ('cam1', 'cam2', 'cam3', 'cam4')
 
 
 def default_control_socket_path() -> str:
@@ -56,6 +58,7 @@ class InferenceConfig:
     worker_exit_timeout_s: float = 15.0
     realsense_startup_max_restarts: int = 5
     realsense_startup_stabilization_s: float = 1.5
+    realsense_image_ready_timeout_s: float = 30.0
     lerobot_conda_env: str = 'lerobot-fr3-312'
     fatal_realsense_patterns: tuple[str, ...] = (
         'Hardware Error',
@@ -97,6 +100,7 @@ class InferenceConfig:
             'fail_stop_retry_interval_s': self.fail_stop_retry_interval_s,
             'worker_exit_timeout_s': self.worker_exit_timeout_s,
             'realsense_startup_stabilization_s': self.realsense_startup_stabilization_s,
+            'realsense_image_ready_timeout_s': self.realsense_image_ready_timeout_s,
         }
         invalid = [name for name, value in positive.items() if not math.isfinite(value) or value <= 0]
         if invalid:
@@ -120,6 +124,22 @@ class InferenceConfig:
         object.__setattr__(self, 'runtime_root', runtime_root)
         object.__setattr__(self, 'runtime_sessions_dir', runtime_root / 'runtime_sessions')
         object.__setattr__(self, 'runtime_frames_dir', runtime_root / 'runtime_frames')
+
+    @property
+    def realsense_image_requirements(self) -> tuple[ImageTopicRequirement, ...]:
+        """Return the fixed formal image schema required by inference startup."""
+        return formal_image_requirements(
+            cameras=EXPECTED_REALSENSE_CAMERAS,
+            image_message_type='sensor_msgs/msg/Image',
+            color_width=640,
+            color_height=480,
+            color_encoding='rgb8',
+            color_step=1920,
+            depth_width=640,
+            depth_height=480,
+            depth_encoding='16UC1',
+            depth_step=1280,
+        )
 
     def lerobot_command(self) -> list[str]:
         """Build the persistent worker command without owning policy/reset state."""
