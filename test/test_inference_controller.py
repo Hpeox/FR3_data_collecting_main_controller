@@ -21,6 +21,7 @@ from main_controller.inference_controller import (
     ROBOT_TELEMETRY_FLAG_RESETTING,
 )
 from main_controller.inference_protocol import Ack, Status, TransactionResult
+from main_controller.uds_client import MsgType
 from main_controller.zmq_telemetry import TelemetryFrame
 
 
@@ -394,6 +395,63 @@ def test_cleanup_marks_managed_exits_expected_before_closing_uds_clients(tmp_pat
     assert 'xense' in expected_snapshots[1]
     assert fail_stops == []
     assert instance.termination_reason == 'original startup failure'
+
+
+def test_cleanup_sends_sensor_q_before_closing_either_uds_client(tmp_path):
+    instance = controller(tmp_path)
+    events = []
+    fail_stops = []
+
+    class OrderedSensor(FakeSensor):
+        def send_and_wait_ack(self, message_type, command_name, timeout_s):
+            events.append((self.name, 'send', message_type, command_name))
+            instance._on_uds_disconnect(self.name, [command_name])
+            return {'cmd': command_name}
+
+        def stop(self):
+            events.append((self.name, 'stop'))
+
+    instance.ft_client = OrderedSensor('ft300')
+    instance.xense_client = OrderedSensor('xense')
+    instance.request_fail_stop = lambda reason, message: fail_stops.append((reason, message))
+
+    instance._stop_runtime_resources()
+
+    assert events == [
+        ('ft300', 'send', MsgType.STOP_REQ, 'STOP_REQ'),
+        ('xense', 'send', MsgType.STOP_REQ, 'STOP_REQ'),
+        ('ft300', 'stop'),
+        ('xense', 'stop'),
+    ]
+    assert fail_stops == []
+
+
+def test_sensor_q_failure_does_not_skip_remaining_cleanup(tmp_path):
+    instance = controller(tmp_path)
+    events = []
+
+    class FailingStopSensor(FakeSensor):
+        def send_and_wait_ack(self, message_type, command_name, timeout_s):
+            events.append((self.name, 'send'))
+            return None if self.name == 'ft300' else {'cmd': command_name}
+
+        def last_error_for(self, command_name):
+            return {'error': 'send_failed'}
+
+        def stop(self):
+            events.append((self.name, 'stop'))
+
+    instance.ft_client = FailingStopSensor('ft300')
+    instance.xense_client = FailingStopSensor('xense')
+
+    instance._stop_runtime_resources()
+
+    assert events == [
+        ('ft300', 'send'),
+        ('xense', 'send'),
+        ('ft300', 'stop'),
+        ('xense', 'stop'),
+    ]
 
 
 def test_recoverable_realsense_startup_fatal_restarts_without_fail_stop(tmp_path):

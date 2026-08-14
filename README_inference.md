@@ -193,6 +193,11 @@ for bounded worker exit, and then stops remaining workstation resources. No
 managed process is transparently restarted outside the narrow, bounded
 RealSense startup recovery described above.
 
+Before terminal cleanup closes either local sensor UDS client, MainController
+best-effort sends `STOP_REQ` (the sensor test clients' `q` command) to both
+FT300S and Xense and waits for each ACK. A missing ACK is logged but does not
+prevent the remaining teardown steps.
+
 Do not use Ctrl-C when the intended operation is a normal graceful shutdown;
 enter `q` instead.
 

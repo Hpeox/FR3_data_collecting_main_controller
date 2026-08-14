@@ -990,8 +990,18 @@ class InferenceMainController:
         self._stop_watchdog()
         if self.control is not None:
             self.control.close()
-        self.ft_client.stop()
-        self.xense_client.stop()
+        for client in (self.ft_client, self.xense_client):
+            try:
+                self._sensor_command(
+                    client,
+                    MsgType.STOP_REQ,
+                    'STOP_REQ',
+                    self.config.sensor_ack_timeout_s,
+                )
+            except BaseException as exc:
+                self.log('sensor_shutdown_failed', sensor=client.name, error=str(exc))
+        for client in (self.ft_client, self.xense_client):
+            client.stop()
         if self.zmq_receiver is not None:
             self.zmq_receiver.stop()
         if self.aligned_reader is not None:
@@ -1035,6 +1045,13 @@ class InferenceMainController:
             )
 
     def _on_uds_disconnect(self, name: str, pending_commands: list[str]) -> None:
+        if self._resources_stopped:
+            self.log(
+                'sensor_uds_disconnected_during_cleanup',
+                sensor=name,
+                pending_commands=pending_commands,
+            )
+            return
         self.request_fail_stop(
             f'{name}_uds_disconnect',
             f'pending_commands={pending_commands}',
