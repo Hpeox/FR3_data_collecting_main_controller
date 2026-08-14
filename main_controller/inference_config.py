@@ -54,7 +54,7 @@ class InferenceConfig:
     lerobot_aligned_max_age_ms: int = 100
     fail_stop_retry_interval_s: float = 0.2
     worker_exit_timeout_s: float = 15.0
-    realsense_startup_max_restarts: int = 1
+    realsense_startup_max_restarts: int = 5
     realsense_startup_stabilization_s: float = 1.5
     lerobot_conda_env: str = 'lerobot-fr3-312'
     fatal_realsense_patterns: tuple[str, ...] = (

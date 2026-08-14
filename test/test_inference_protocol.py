@@ -195,6 +195,7 @@ def test_inference_config_enforces_watchdog_order_and_no_reset_target(tmp_path):
     ):
         (tmp_path / relative).touch()
     config = InferenceConfig(policy_path='policy', task='task', repo_root=tmp_path)
+    assert config.realsense_startup_max_restarts == 5
     command = config.lerobot_command()
     assert command[:5] == ['conda', 'run', '-n', 'lerobot-fr3-312', 'lerobot-rollout']
     assert '--strategy.type=controlled' in command
