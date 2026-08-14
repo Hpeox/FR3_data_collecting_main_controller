@@ -196,6 +196,11 @@ def test_inference_config_enforces_watchdog_order_and_no_reset_target(tmp_path):
         (tmp_path / relative).touch()
     config = InferenceConfig(policy_path='policy', task='task', repo_root=tmp_path)
     assert config.realsense_startup_max_restarts == 5
+    frames_timeout = (
+        "XXX Hardware Notification:Frames didn't arrived within 5 seconds,"
+        '1.78674e+12,Warn,Frames Timeout'
+    )
+    assert any(pattern in frames_timeout for pattern in config.fatal_realsense_patterns)
     assert config.zmq_connect == 'tcp://192.168.10.37:6000'
     assert config.robot_command_endpoint == 'tcp://192.168.10.37:6001'
     assert config.robot_telemetry_endpoint == 'tcp://192.168.10.37:6000'

@@ -63,6 +63,7 @@ class InferenceConfig:
     fatal_realsense_patterns: tuple[str, ...] = (
         'Hardware Error',
         'Depth stream start failure',
+        "Frames didn't arrived within 5 seconds",
     )
 
     def __post_init__(self) -> None:

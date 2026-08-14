@@ -135,7 +135,9 @@ only accepts node-up lines from the restarted log generation. The additional
 1.5-second fatal-pattern stabilization window is not evidence of camera health
 and never replaces actual image readiness. A matching recoverable fatal that
 arrives during either gate enters the existing bounded startup-restart path at
-the next available synchronous check boundary.
+the next available synchronous check boundary. The startup-recoverable patterns
+are `Hardware Error`, `Depth stream start failure`, and
+`Frames didn't arrived within 5 seconds`.
 
 Resource registration and startup are synchronized with fatal teardown. Once
 a session-fatal request begins, startup stops scheduling resources. Anything
