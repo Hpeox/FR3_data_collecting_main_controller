@@ -212,9 +212,9 @@ ros2 run main_controller inference_main_controller -- \
   --repo-root /home/robot/Desktop/gello-deploy \
   --policy-path /path/to/policy \
   --task "task instruction" \
-  --zmq-connect tcp://192.168.1.37:6000 \
-  --robot-command-endpoint tcp://192.168.1.37:6001 \
-  --robot-telemetry-endpoint tcp://192.168.1.37:6000
+  --zmq-connect tcp://192.168.10.37:6000 \
+  --robot-command-endpoint tcp://192.168.10.37:6001 \
+  --robot-telemetry-endpoint tcp://192.168.10.37:6000
 ```
 
 It launches one persistent `lerobot-rollout --strategy.type=controlled` worker for the full inference session. Operator actions are explicit and state-validated when received:

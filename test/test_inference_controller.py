@@ -1358,3 +1358,17 @@ def test_main_preserves_graceful_success_exit(monkeypatch):
     )
 
     assert inference_controller_module.main() is None
+
+
+def test_inference_cli_defaults_target_wired_nuc(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        ['inference_main_controller', '--policy-path', 'policy', '--task', 'task'],
+    )
+
+    args = inference_controller_module.parse_inference_args()
+
+    assert args.zmq_connect == 'tcp://192.168.10.37:6000'
+    assert args.robot_command_endpoint == 'tcp://192.168.10.37:6001'
+    assert args.robot_telemetry_endpoint == 'tcp://192.168.10.37:6000'

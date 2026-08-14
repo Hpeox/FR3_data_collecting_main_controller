@@ -36,9 +36,9 @@ class InferenceConfig:
     control_socket_path: str = field(default_factory=default_control_socket_path)
     observation_shm_name: str = '/fr3_aligned_observation'
     realsense_shm_names: tuple[str, ...] = EXPECTED_REALSENSE_SHM_NAMES
-    zmq_connect: str = 'tcp://192.168.1.37:6000'
-    robot_command_endpoint: str = 'tcp://192.168.1.37:6001'
-    robot_telemetry_endpoint: str = 'tcp://192.168.1.37:6000'
+    zmq_connect: str = 'tcp://192.168.10.37:6000'
+    robot_command_endpoint: str = 'tcp://192.168.10.37:6001'
+    robot_telemetry_endpoint: str = 'tcp://192.168.10.37:6000'
     ft_uds_path: str = '/tmp/ft300_sensor.sock'
     xense_uds_path: str = '/tmp/xense_sensor.sock'
     ft_shm_name: str = 'ft300_sensor_frame'

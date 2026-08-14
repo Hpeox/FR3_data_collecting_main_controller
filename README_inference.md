@@ -60,9 +60,9 @@ ros2 run main_controller inference_main_controller -- \
   --repo-root /home/robot/Desktop/gello-deploy \
   --policy-path "/home/robot/Desktop/gello-deploy/LeRobotFR3/outputs/acmt_dp/peg/real/seed42/pretrained_model" \
   --task "insert the peg into the hole" \
-  --zmq-connect tcp://192.168.1.37:6000 \
-  --robot-command-endpoint tcp://192.168.1.37:6001 \
-  --robot-telemetry-endpoint tcp://192.168.1.37:6000 \
+  --zmq-connect tcp://192.168.10.37:6000 \
+  --robot-command-endpoint tcp://192.168.10.37:6001 \
+  --robot-telemetry-endpoint tcp://192.168.10.37:6000 \
   --xense-sdk-version 2.0.1
 ```
 
@@ -74,9 +74,9 @@ ros2 run main_controller inference_main_controller -- \
   --runtime-root /data/external/runtime \
   --policy-path /path/to/policy \
   --task "insert the peg into the hole" \
-  --zmq-connect tcp://192.168.1.37:6000 \
-  --robot-command-endpoint tcp://192.168.1.37:6001 \
-  --robot-telemetry-endpoint tcp://192.168.1.37:6000
+  --zmq-connect tcp://192.168.10.37:6000 \
+  --robot-command-endpoint tcp://192.168.10.37:6001 \
+  --robot-telemetry-endpoint tcp://192.168.10.37:6000
 ```
 
 Show the current command-line interface with:
@@ -94,9 +94,9 @@ ros2 run main_controller inference_main_controller -- --help
 | `--repo-root` | No | Build-time/current checkout discovery | Integration repository root. |
 | `--runtime-root` | No | `repo-root` | Root containing `runtime_sessions/` and `runtime_frames/`. |
 | `--control-socket-path` | No | `/run/user/<uid>/lerobot_controlled.sock` | Controlled worker UDS path. |
-| `--zmq-connect` | No | `tcp://192.168.1.37:6000` | MainController direct FGT1 telemetry subscription. |
-| `--robot-command-endpoint` | No | `tcp://192.168.1.37:6001` | FR3 command endpoint passed to LeRobot. |
-| `--robot-telemetry-endpoint` | No | `tcp://192.168.1.37:6000` | FR3 telemetry endpoint passed to LeRobot/SensorHub. |
+| `--zmq-connect` | No | `tcp://192.168.10.37:6000` | MainController direct FGT1 telemetry subscription. |
+| `--robot-command-endpoint` | No | `tcp://192.168.10.37:6001` | FR3 command endpoint passed to LeRobot. |
+| `--robot-telemetry-endpoint` | No | `tcp://192.168.10.37:6000` | FR3 telemetry endpoint passed to LeRobot/SensorHub. |
 | `--aligned-stall-timeout-s` | No | `0.075` | RUNNING aligned-sequence stall threshold. |
 | `--lerobot-aligned-max-age-ms` | No | `100` | LeRobot stale-observation fallback threshold; it must remain longer than the MainController stall threshold. |
 | `--xense-sdk-version` | No | `2.0.1` | Xense runtime selection: `1.x`, `2.0`, or `2.0.1`. |
