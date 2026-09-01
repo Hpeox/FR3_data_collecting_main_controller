@@ -66,6 +66,7 @@ setup(
     entry_points={
         'console_scripts': [
             'main_controller = main_controller.main:main',
+            'inference_main_controller = main_controller.inference_controller:main',
         ],
     },
 )

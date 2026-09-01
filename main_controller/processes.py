@@ -100,15 +100,16 @@ class ManagedProcess:
         return self.process.poll()
 
     def _read_output(self, log_fp) -> None:
-        assert self.process is not None
-        assert self.process.stdout is not None
+        process = self.process
+        assert process is not None
+        assert process.stdout is not None
         try:
-            for line in self.process.stdout:
+            for line in process.stdout:
                 log_fp.write(line)
                 log_fp.flush()
                 if self.on_fatal is not None and any(pattern in line for pattern in self.fatal_patterns):
                     self.on_fatal(self.name, line.rstrip())
-            rc = self.process.wait()
+            rc = process.wait()
             if self.on_exit is not None:
                 self.on_exit(self.name, rc)
         finally:
