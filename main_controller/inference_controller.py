@@ -1219,10 +1219,17 @@ class InferenceMainController:
             and frame.valid_mask & VALID_ROBOT
             and frame.flags & ROBOT_TELEMETRY_FLAG_JUMP_HOLD
         ):
-            self.request_rollout_abort(
+            admitted = self.request_rollout_abort(
                 'jump_hold',
                 {'telemetry_sequence': frame.seq, 'telemetry_flags': frame.flags},
             )
+            if admitted:
+                self.log(
+                    'jump_hold_observed',
+                    telemetry_sequence=frame.seq,
+                    telemetry_flags=frame.flags,
+                    robot_q=list(frame.floats_58[8:15]),
+                )
         if not self.recording_active or self.rollout_store is None:
             return
         self.rollout_store.zmq.append(

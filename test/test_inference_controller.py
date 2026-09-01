@@ -548,6 +548,51 @@ def test_jump_hold_is_immediate_recoverable_abort_and_flags_are_recorded(tmp_pat
     assert arrays['flags'].tolist() == [ROBOT_TELEMETRY_FLAG_JUMP_HOLD]
 
 
+def test_jump_hold_observation_logs_robot_q_once(tmp_path):
+    instance = controller(tmp_path)
+    instance.set_state(InferenceState.RUNNING)
+    floats = [0.0] * 58
+    floats[8:15] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+    frame = TelemetryFrame(
+        source=2,
+        flags=ROBOT_TELEMETRY_FLAG_JUMP_HOLD,
+        seq=44,
+        stamp=1.0,
+        valid_mask=2,
+        floats_58=tuple(floats),
+        gripper_gPO=0,
+        gripper_gCU=0,
+    )
+
+    instance._on_zmq_frame(frame, 10, 11)
+    instance._on_zmq_frame(
+        TelemetryFrame(
+            source=2,
+            flags=ROBOT_TELEMETRY_FLAG_JUMP_HOLD,
+            seq=45,
+            stamp=1.1,
+            valid_mask=2,
+            floats_58=tuple(floats),
+            gripper_gPO=0,
+            gripper_gCU=0,
+        ),
+        12,
+        13,
+    )
+
+    events = [
+        json.loads(line)
+        for line in (instance.session_dir / 'controller_events.jsonl').read_text().splitlines()
+    ]
+    observed = [event for event in events if event['event'] == 'jump_hold_observed']
+    assert len(observed) == 1
+    assert observed[0]['telemetry_sequence'] == 44
+    assert observed[0]['telemetry_flags'] == ROBOT_TELEMETRY_FLAG_JUMP_HOLD
+    assert observed[0]['robot_q'] == floats[8:15]
+    assert instance.get_state() == InferenceState.ABORTING
+    assert instance.commands.qsize() == 1
+
+
 def test_raw_resetting_never_completes_initialize(tmp_path):
     instance = controller(tmp_path)
     instance.set_state(InferenceState.INITIALIZING)
