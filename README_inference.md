@@ -289,7 +289,8 @@ Each session creates:
   frame/timestamp receipt records, not copied sensor payloads.
 - `zmq_telemetry.npz` contains the directly received raw FGT1 frame fields and
   MainController receipt timestamps.
-- `rosbag/` is the per-rollout rosbag URI.
+- `rosbag/` is the per-rollout rosbag URI. Rollout startup calls `record` and then
+  the separate `resume` service before LeRobot `START`.
 - `manifest.json` records rollout status, timestamps, sensor command results,
   relative artifact paths, frame counts, and any failure details.
 

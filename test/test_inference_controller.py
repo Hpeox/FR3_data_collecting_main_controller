@@ -173,6 +173,11 @@ class FakeRosbag:
         if self.events is not None:
             self.events.append(('rosbag', 'record'))
 
+    def resume(self, timeout_s):
+        self.calls.append(('resume', None))
+        if self.events is not None:
+            self.events.append(('rosbag', 'resume'))
+
     def stop(self, timeout_s):
         self.calls.append(('stop', None))
 
@@ -339,6 +344,7 @@ def test_rollout_rearms_aligned_stream_before_rosbag_and_lerobot_start(tmp_path)
         ('aligned', 'read', 40),
         ('aligned', 'read', 41),
         ('rosbag', 'record'),
+        ('rosbag', 'resume'),
         ('lerobot', 'START'),
     ]
 
@@ -466,7 +472,7 @@ def test_lerobot_start_rejection_discards_sensors_and_stops_rosbag(tmp_path):
     assert fail_stops[0][0] == 'rollout_start_failure'
     assert instance.ft_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
     assert instance.xense_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
-    assert [call[0] for call in instance.rosbag.calls] == ['record', 'stop']
+    assert [call[0] for call in instance.rosbag.calls] == ['record', 'resume', 'stop']
 
 
 def test_rosbag_start_failure_discards_sensors_without_lerobot_start(tmp_path):
@@ -492,6 +498,31 @@ def test_rosbag_start_failure_discards_sensors_without_lerobot_start(tmp_path):
     assert instance.ft_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
     assert instance.xense_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
     assert [call[0] for call in instance.rosbag.calls] == ['record', 'stop']
+
+
+def test_rosbag_resume_failure_discards_sensors_without_lerobot_start(tmp_path):
+    events = []
+    instance = controller(tmp_path)
+    instance.ft_client = FakeSensor('ft300', events=events)
+    instance.xense_client = FakeSensor('xense', events=events)
+
+    class FailingRosbag(FakeRosbag):
+        def resume(self, timeout_s):
+            super().resume(timeout_s)
+            raise RuntimeError('resume failed')
+
+    instance.rosbag = FailingRosbag(events=events)
+    fail_stops = []
+    instance.request_fail_stop = lambda reason, message: fail_stops.append((reason, message))
+    instance.set_state(InferenceState.STARTING)
+
+    instance._start_rollout()
+
+    assert 'resume failed' in fail_stops[0][1]
+    assert instance.control.transactions == []
+    assert instance.ft_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+    assert instance.xense_client.commands == ['START_REQ', 'DEMO_DISCARD_REQ']
+    assert [call[0] for call in instance.rosbag.calls] == ['record', 'resume', 'stop']
 
 
 def test_abort_discards_sensors_and_allows_another_rollout(tmp_path):

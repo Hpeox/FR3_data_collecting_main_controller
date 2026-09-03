@@ -449,6 +449,7 @@ class InferenceMainController:
         if self.rosbag is None:
             raise RuntimeError('rosbag recorder control is unavailable')
         self.rosbag.record(self.rosbag_uri, timeout_s=self.config.rosbag_timeout_s)
+        self.rosbag.resume(timeout_s=self.config.rosbag_timeout_s)
         self.recording_active = True
         self.log('recording_started', rollout_dir=str(rollout_dir))
 
