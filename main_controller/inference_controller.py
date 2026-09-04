@@ -853,7 +853,11 @@ class InferenceMainController:
                 (),
             ),
             'realsense': (
-                bash_cmd('conda deactivate >/dev/null 2>&1 || true; ros2 launch ./RealSense/launch/four_realsense_shm_runtime.launch.py'),
+                bash_cmd(
+                    'conda deactivate >/dev/null 2>&1 || true; '
+                    'RCUTILS_COLORIZED_OUTPUT=0 ros2 launch '
+                    './RealSense/launch/four_realsense_shm_runtime.launch.py'
+                ),
                 self.config.fatal_realsense_patterns,
             ),
             'rosbag_recorder': (
