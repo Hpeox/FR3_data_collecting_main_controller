@@ -926,6 +926,8 @@ def test_runtime_config_rejects_invalid_task_name(task_name):
 def test_realsense_formal_image_requirements_are_four_cameras_eight_topics():
     config = RuntimeConfig(
         repo_root=REPO_ROOT,
+        cameras=('cam1', 'cam2', 'cam3', 'cam4'),
+        realsense_capture_mode='formal',
     )
     requirements = config.realsense_image_requirements
 
@@ -1027,8 +1029,10 @@ def test_realsense_image_readiness_uses_shallow_qos_and_destroys_ready_subscript
 
 
 def test_realsense_rosbag_postcheck_detects_missing_and_skew(tmp_path):
+    skew_limit_percent = 1.25
     config = RuntimeConfig(
         repo_root=REPO_ROOT,
+        realsense_rosbag_count_skew_limit_percent=skew_limit_percent,
     )
     requirements = config.realsense_image_requirements
     metadata = {
@@ -1049,7 +1053,8 @@ def test_realsense_rosbag_postcheck_detects_missing_and_skew(tmp_path):
     assert result.missing_topics == (requirements[-1].topic,)
     assert result.count_skew == 90
     assert result.count_skew_reference_count == 10
-    assert result.count_skew_limit == 0.05
+    assert result.count_skew_limit == 0.125
+    assert result.count_skew_limit_percent == skew_limit_percent
 
 
 def test_read_rosbag_topic_metadata_uses_detected_storage_id(tmp_path, monkeypatch):

@@ -629,19 +629,18 @@ def demo_rosbag_calls(runtime: "MockRuntime") -> list[tuple[str, str | None]]:
     return runtime.rosbag.calls[1:]
 
 
-def test_default_realsense_topics_are_four_cameras_eight_streams():
-    topics = RuntimeConfig(repo_root=REPO_ROOT).realsense_metadata_topics
+def test_realsense_metadata_topics_expand_each_configured_camera():
+    topics = RuntimeConfig(
+        repo_root=REPO_ROOT,
+        cameras=('left', 'right'),
+    ).realsense_metadata_topics
 
-    assert len(topics) == 8
+    assert len(topics) == 4
     assert topics == (
-        '/cam1/camera/color/metadata',
-        '/cam1/camera/depth/metadata',
-        '/cam2/camera/color/metadata',
-        '/cam2/camera/depth/metadata',
-        '/cam3/camera/color/metadata',
-        '/cam3/camera/depth/metadata',
-        '/cam4/camera/color/metadata',
-        '/cam4/camera/depth/metadata',
+        '/left/camera/color/metadata',
+        '/left/camera/depth/metadata',
+        '/right/camera/color/metadata',
+        '/right/camera/depth/metadata',
     )
 
 
@@ -708,7 +707,6 @@ def test_mock_runtime_start_pause_resume_done(tmp_path, monkeypatch):
         manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'done'
         assert manifest['run_id'] == controller.run_id
-        assert manifest['xense_sdk_version'] == '2.0.1'
         assert manifest['task_name'] == TASK_NAME
         assert manifest['language_instruction'] == LANGUAGE_INSTRUCTION
         assert choice_calls == [((LANGUAGE_INSTRUCTION,), (1.0,), 1)]
@@ -1472,7 +1470,6 @@ def test_start_processes_stops_earlier_processes_on_later_failure(tmp_path, monk
     assert by_name['ft300'].log_path == (
         controller.runtime_sessions_dir / 'process_logs' / controller.run_id / 'ft300.log'
     )
-    assert by_name['xense'].cmd[:4] == ['conda', 'run', '-n', 'xense2']
     assert by_name['ft300'].cmd[-2:] == ['--save-dir', str(tmp_path / 'runtime_frames')]
     assert by_name['xense'].cmd[by_name['xense'].cmd.index('--save-dir') + 1] == str(tmp_path / 'runtime_frames')
     assert '--xense-tactile-zero-force-mean-tolerance' in by_name['xense'].cmd
@@ -1534,7 +1531,9 @@ def test_start_processes_passes_mock_flag_only_for_mock_xense(tmp_path, monkeypa
     assert '--mock' not in by_name['rosbag_recorder'].cmd
 
 
-def test_start_processes_waits_for_xense_init_before_realsense(tmp_path, monkeypatch):
+def test_start_processes_maps_xense_sdk_201_and_waits_for_init_before_realsense(
+    tmp_path, monkeypatch
+):
     from main_controller import main as main_module
 
     events: list[str] = []
@@ -1577,7 +1576,13 @@ def test_start_processes_waits_for_xense_init_before_realsense(tmp_path, monkeyp
             events.append(f'{self.name}:stop')
 
     monkeypatch.setattr(main_module, 'ManagedProcess', FakeManagedProcess)
-    controller = MainController(RuntimeConfig(repo_root=REPO_ROOT, runtime_root=tmp_path))
+    controller = MainController(
+        RuntimeConfig(
+            repo_root=REPO_ROOT,
+            runtime_root=tmp_path,
+            xense_sdk_version='2.0.1',
+        )
+    )
     controller.ft_client = FakeStartedUdsClient('ft300')
     controller.xense_client = FakeStartedUdsClient('xense')
 
@@ -1916,7 +1921,12 @@ def test_realsense_rosbag_postcheck_failure_stops_controller(tmp_path, monkeypat
 
 
 def test_realsense_rosbag_postcheck_count_skew_reason_is_specific(tmp_path, monkeypatch):
-    with MockRuntime(tmp_path, monkeypatch) as runtime:
+    skew_limit_percent = 1.25
+    with MockRuntime(
+        tmp_path,
+        monkeypatch,
+        realsense_rosbag_count_skew_limit_percent=skew_limit_percent,
+    ) as runtime:
         controller = runtime.controller
         assert controller is not None
         demo_dir = runtime.start_and_wait_for_frames()
@@ -1933,10 +1943,13 @@ def test_realsense_rosbag_postcheck_count_skew_reason_is_specific(tmp_path, monk
         manifest = json.loads((demo_dir / 'manifest.json').read_text(encoding='utf-8'))
         assert manifest['status'] == 'failed'
         assert manifest['failure_stage'] == 'realsense_rosbag_postcheck'
-        assert manifest['failure_reason'] == 'RealSense rosbag count skew 4 exceeds limit 0.050'
+        assert manifest['failure_reason'] == 'RealSense rosbag count skew 4 exceeds limit 0.125'
         assert manifest['realsense_rosbag_postcheck']['count_skew'] == 4
-        assert manifest['realsense_rosbag_postcheck']['count_skew_limit'] == 0.05
-        assert manifest['realsense_rosbag_postcheck']['count_skew_limit_percent'] == 0.5
+        assert manifest['realsense_rosbag_postcheck']['count_skew_limit'] == 0.125
+        assert (
+            manifest['realsense_rosbag_postcheck']['count_skew_limit_percent']
+            == skew_limit_percent
+        )
         assert manifest['realsense_rosbag_postcheck']['count_skew_reference_count'] == 10
 
 

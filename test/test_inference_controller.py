@@ -960,9 +960,14 @@ def test_duplicate_realsense_fatal_during_restart_does_not_consume_retry(tmp_pat
     assert 'realsense' not in instance.expected_process_exits
 
 
-def test_realsense_startup_allows_five_real_restart_attempts(tmp_path):
+def test_realsense_startup_honors_configured_restart_budget(tmp_path):
+    restart_budget = 2
     instance = InferenceMainController(
-        config(tmp_path, realsense_startup_stabilization_s=0.001)
+        config(
+            tmp_path,
+            realsense_startup_max_restarts=restart_budget,
+            realsense_startup_stabilization_s=0.001,
+        )
     )
 
     class CyclingProcess(FakeProcess):
@@ -978,18 +983,20 @@ def test_realsense_startup_allows_five_real_restart_attempts(tmp_path):
     instance.processes['realsense'] = process
     instance.set_state(InferenceState.STARTING_SERVICES)
 
-    for attempt in range(5):
+    for attempt in range(restart_budget):
         instance._on_process_fatal('realsense', f'Hardware Error attempt {attempt + 1}')
         instance._recover_realsense_startup_if_needed()
 
-    assert process.restart_count == 5
-    assert instance._realsense_startup_restart_count == 5
+    assert process.restart_count == restart_budget
+    assert instance._realsense_startup_restart_count == restart_budget
 
-    instance._on_process_fatal('realsense', 'Hardware Error attempt 6')
+    instance._on_process_fatal(
+        'realsense', f'Hardware Error attempt {restart_budget + 1}'
+    )
     with pytest.raises(RuntimeError, match='recovery budget exhausted'):
         instance._recover_realsense_startup_if_needed()
 
-    assert process.restart_count == 5
+    assert process.restart_count == restart_budget
 
 
 def test_successful_realsense_startup_recovery_allows_startup_to_continue(tmp_path):
@@ -1490,15 +1497,32 @@ def test_main_preserves_graceful_success_exit(monkeypatch):
     assert inference_controller_module.main() is None
 
 
-def test_inference_cli_defaults_target_wired_nuc(monkeypatch):
+def test_inference_cli_routes_explicit_endpoints(monkeypatch, tmp_path):
+    for relative in ('FT300S', 'XenseTacSensor', 'RealSense/launch', 'LeRobotFR3'):
+        (tmp_path / relative).mkdir(parents=True, exist_ok=True)
+    for relative in (
+        'RealSense/launch/four_realsense_640x480_30.launch.py',
+        'RealSense/launch/four_realsense_shm_runtime.launch.py',
+        'RealSense/launch/rosbag2_recorder.launch.py',
+    ):
+        (tmp_path / relative).touch()
     monkeypatch.setattr(
         sys,
         'argv',
-        ['inference_main_controller', '--policy-path', 'policy', '--task', 'task'],
+        [
+            'inference_main_controller',
+            '--policy-path', 'policy',
+            '--task', 'task',
+            '--repo-root', str(tmp_path),
+            '--zmq-connect', 'tcp://controller.example:7000',
+            '--robot-command-endpoint', 'tcp://robot.example:7001',
+            '--robot-telemetry-endpoint', 'tcp://robot.example:7000',
+        ],
     )
 
     args = inference_controller_module.parse_inference_args()
+    config = inference_controller_module.build_inference_config(args)
 
-    assert args.zmq_connect == 'tcp://192.168.10.37:6000'
-    assert args.robot_command_endpoint == 'tcp://192.168.10.37:6001'
-    assert args.robot_telemetry_endpoint == 'tcp://192.168.10.37:6000'
+    assert config.zmq_connect == 'tcp://controller.example:7000'
+    assert config.robot_command_endpoint == 'tcp://robot.example:7001'
+    assert config.robot_telemetry_endpoint == 'tcp://robot.example:7000'

@@ -185,7 +185,9 @@ def test_aligned_health_reader_reads_header_only(tmp_path):
     assert health.message == 'sensor fatal'
 
 
-def test_inference_config_enforces_watchdog_order_and_no_reset_target(tmp_path):
+def test_inference_config_routes_worker_arguments_and_enforces_runtime_invariants(
+    tmp_path,
+):
     for relative in ('FT300S', 'XenseTacSensor', 'RealSense/launch', 'LeRobotFR3'):
         (tmp_path / relative).mkdir(parents=True, exist_ok=True)
     for relative in (
@@ -194,24 +196,33 @@ def test_inference_config_enforces_watchdog_order_and_no_reset_target(tmp_path):
         'RealSense/launch/rosbag2_recorder.launch.py',
     ):
         (tmp_path / relative).touch()
-    config = InferenceConfig(policy_path='policy', task='task', repo_root=tmp_path)
-    assert config.realsense_startup_max_restarts == 5
+    config = InferenceConfig(
+        policy_path='policy',
+        task='task',
+        repo_root=tmp_path,
+        zmq_connect='tcp://controller.example:7000',
+        robot_command_endpoint='tcp://robot.example:7001',
+        robot_telemetry_endpoint='tcp://robot.example:7000',
+        lerobot_conda_env='test-lerobot',
+    )
     frames_timeout = (
         "XXX Hardware Notification:Frames didn't arrived within 5 seconds,"
         '1.78674e+12,Warn,Frames Timeout'
     )
     assert any(pattern in frames_timeout for pattern in config.fatal_realsense_patterns)
-    assert config.zmq_connect == 'tcp://192.168.10.37:6000'
-    assert config.robot_command_endpoint == 'tcp://192.168.10.37:6001'
-    assert config.robot_telemetry_endpoint == 'tcp://192.168.10.37:6000'
     command = config.lerobot_command()
     assert command[:6] == [
-        'conda', 'run', '--no-capture-output', '-n', 'lerobot-fr3-312', 'lerobot-rollout'
+        'conda', 'run', '--no-capture-output', '-n', 'test-lerobot', 'lerobot-rollout'
     ]
     assert '--strategy.type=controlled' in command
-    assert '--robot.command_endpoint=tcp://192.168.10.37:6001' in command
-    assert '--robot.telemetry_endpoint=tcp://192.168.10.37:6000' in command
+    assert '--robot.command_endpoint=tcp://robot.example:7001' in command
+    assert '--robot.telemetry_endpoint=tcp://robot.example:7000' in command
     assert not any('q_reset' in item or 'rollout_init_delta' in item for item in command)
+    with pytest.raises(ValueError, match='non-negative integer'):
+        InferenceConfig(
+            policy_path='policy', task='task', repo_root=tmp_path,
+            realsense_startup_max_restarts=-1,
+        )
     with pytest.raises(ValueError, match='shorter'):
         InferenceConfig(
             policy_path='policy', task='task', repo_root=tmp_path,
