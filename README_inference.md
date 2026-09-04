@@ -104,8 +104,8 @@ ros2 run main_controller inference_main_controller -- --help
 | `--zmq-connect` | No | `tcp://192.168.10.37:6000` | MainController direct FGT1 telemetry subscription. |
 | `--robot-command-endpoint` | No | `tcp://192.168.10.37:6001` | FR3 command endpoint passed to LeRobot. |
 | `--robot-telemetry-endpoint` | No | `tcp://192.168.10.37:6000` | FR3 telemetry endpoint passed to LeRobot/SensorHub. |
-| `--aligned-stall-timeout-s` | No | `0.075` | RUNNING aligned-sequence stall threshold. |
-| `--lerobot-aligned-max-age-ms` | No | `100` | LeRobot stale-observation fallback threshold; it must remain longer than the MainController stall threshold. |
+| `--aligned-stall-timeout-s` | No | `0.1` | RUNNING aligned-sequence stall threshold. |
+| `--lerobot-aligned-max-age-ms` | No | `150` | LeRobot stale-observation fallback threshold; it must remain longer than the MainController stall threshold. |
 | `--xense-sdk-version` | No | `2.0.1` | Xense runtime selection: `1.x`, `2.0`, or `2.0.1`. |
 
 The fixed v1 aligned-observation SHM name is

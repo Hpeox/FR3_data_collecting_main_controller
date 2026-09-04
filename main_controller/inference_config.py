@@ -52,8 +52,8 @@ class InferenceConfig:
     sensor_flush_timeout_s: float = 300.0
     rosbag_timeout_s: float = 15.0
     aligned_poll_interval_s: float = 0.01
-    aligned_stall_timeout_s: float = 0.075
-    lerobot_aligned_max_age_ms: int = 100
+    aligned_stall_timeout_s: float = 0.1
+    lerobot_aligned_max_age_ms: int = 150
     fail_stop_retry_interval_s: float = 0.2
     worker_exit_timeout_s: float = 15.0
     realsense_startup_max_restarts: int = 5

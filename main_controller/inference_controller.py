@@ -1329,8 +1329,8 @@ def parse_inference_args() -> argparse.Namespace:
     parser.add_argument('--zmq-connect', default='tcp://192.168.10.37:6000')
     parser.add_argument('--robot-command-endpoint', default='tcp://192.168.10.37:6001')
     parser.add_argument('--robot-telemetry-endpoint', default='tcp://192.168.10.37:6000')
-    parser.add_argument('--aligned-stall-timeout-s', type=float, default=0.075)
-    parser.add_argument('--lerobot-aligned-max-age-ms', type=int, default=100)
+    parser.add_argument('--aligned-stall-timeout-s', type=float, default=0.1)
+    parser.add_argument('--lerobot-aligned-max-age-ms', type=int, default=150)
     parser.add_argument('--xense-sdk-version', choices=sorted(XENSE_SDK_CONDA_ENVS), default='2.0.1')
     return parser.parse_args()
 

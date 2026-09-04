@@ -217,6 +217,8 @@ def test_inference_config_routes_worker_arguments_and_enforces_runtime_invariant
     assert '--strategy.type=controlled' in command
     assert '--robot.command_endpoint=tcp://robot.example:7001' in command
     assert '--robot.telemetry_endpoint=tcp://robot.example:7000' in command
+    assert '--robot.max_snapshot_age_ms=150' in command
+    assert config.aligned_stall_timeout_s == 0.1
     assert not any('q_reset' in item or 'rollout_init_delta' in item for item in command)
     with pytest.raises(ValueError, match='non-negative integer'):
         InferenceConfig(
