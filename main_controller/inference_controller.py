@@ -839,13 +839,15 @@ class InferenceMainController:
         xense_env = XENSE_SDK_CONDA_ENVS[self.config.xense_sdk_version]
         specs = {
             'ft300': (
-                ['conda', 'run', '-n', 'modbus314', 'python', '-m', 'FT300S.app',
+                ['conda', 'run', '--no-capture-output', '-n', 'modbus314',
+                 'python', '-m', 'FT300S.app',
                  '--uds-path', self.config.ft_uds_path, '--shm-name', self.config.ft_shm_name,
                  '--fps', str(self.config.ft_fps), '--save-dir', str(self.config.runtime_frames_dir)],
                 (),
             ),
             'xense': (
-                ['conda', 'run', '-n', xense_env, 'python', '-m', 'XenseTacSensor.app',
+                ['conda', 'run', '--no-capture-output', '-n', xense_env,
+                 'python', '-m', 'XenseTacSensor.app',
                  '--uds-path', self.config.xense_uds_path, '--shm-name', self.config.xense_shm_name,
                  '--fps', str(self.config.xense_fps), '--save-dir', str(self.config.runtime_frames_dir)],
                 (),

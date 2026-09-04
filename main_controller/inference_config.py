@@ -145,7 +145,7 @@ class InferenceConfig:
     def lerobot_command(self) -> list[str]:
         """Build the persistent worker command without owning policy/reset state."""
         return [
-            'conda', 'run', '-n', self.lerobot_conda_env,
+            'conda', 'run', '--no-capture-output', '-n', self.lerobot_conda_env,
             'lerobot-rollout',
             '--strategy.type=controlled',
             f'--strategy.control_socket_path={self.control_socket_path}',

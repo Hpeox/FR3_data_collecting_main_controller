@@ -205,7 +205,9 @@ def test_inference_config_enforces_watchdog_order_and_no_reset_target(tmp_path):
     assert config.robot_command_endpoint == 'tcp://192.168.10.37:6001'
     assert config.robot_telemetry_endpoint == 'tcp://192.168.10.37:6000'
     command = config.lerobot_command()
-    assert command[:5] == ['conda', 'run', '-n', 'lerobot-fr3-312', 'lerobot-rollout']
+    assert command[:6] == [
+        'conda', 'run', '--no-capture-output', '-n', 'lerobot-fr3-312', 'lerobot-rollout'
+    ]
     assert '--strategy.type=controlled' in command
     assert '--robot.command_endpoint=tcp://192.168.10.37:6001' in command
     assert '--robot.telemetry_endpoint=tcp://192.168.10.37:6000' in command
