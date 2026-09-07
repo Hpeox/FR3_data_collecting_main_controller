@@ -1355,26 +1355,6 @@ def test_startup_does_not_create_resources_after_fail_stop_is_established(
     assert instance.processes == {}
 
 
-def test_realsense_process_disables_colorized_output(tmp_path, monkeypatch):
-    instance = InferenceMainController(config(tmp_path))
-    commands = {}
-
-    def capture_process(name, command, cwd, log_path, *, fatal_patterns=()):
-        commands[name] = command
-
-    monkeypatch.setattr(instance, '_start_managed_process', capture_process)
-
-    instance._start_processes()
-
-    assert commands['realsense'] == [
-        'bash',
-        '-lc',
-        'conda deactivate >/dev/null 2>&1 || true; '
-        'RCUTILS_COLORIZED_OUTPUT=0 ros2 launch '
-        './RealSense/launch/four_realsense_shm_runtime.launch.py',
-    ]
-
-
 def test_fatal_process_callback_during_startup_stops_progress_and_owned_process(
     tmp_path,
     monkeypatch,

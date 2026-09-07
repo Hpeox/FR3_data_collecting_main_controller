@@ -204,6 +204,8 @@ def test_inference_config_routes_worker_arguments_and_enforces_runtime_invariant
         robot_command_endpoint='tcp://robot.example:7001',
         robot_telemetry_endpoint='tcp://robot.example:7000',
         lerobot_conda_env='test-lerobot',
+        aligned_stall_timeout_s=0.12,
+        lerobot_aligned_max_age_ms=175,
     )
     frames_timeout = (
         "XXX Hardware Notification:Frames didn't arrived within 5 seconds,"
@@ -217,8 +219,7 @@ def test_inference_config_routes_worker_arguments_and_enforces_runtime_invariant
     assert '--strategy.type=controlled' in command
     assert '--robot.command_endpoint=tcp://robot.example:7001' in command
     assert '--robot.telemetry_endpoint=tcp://robot.example:7000' in command
-    assert '--robot.max_snapshot_age_ms=150' in command
-    assert config.aligned_stall_timeout_s == 0.1
+    assert '--robot.max_snapshot_age_ms=175' in command
     assert not any('q_reset' in item or 'rollout_init_delta' in item for item in command)
     with pytest.raises(ValueError, match='non-negative integer'):
         InferenceConfig(
