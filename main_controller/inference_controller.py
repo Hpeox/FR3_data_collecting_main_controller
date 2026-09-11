@@ -1329,6 +1329,8 @@ def parse_inference_args() -> argparse.Namespace:
     parser.add_argument('--zmq-connect', default='tcp://192.168.10.37:6000')
     parser.add_argument('--robot-command-endpoint', default='tcp://192.168.10.37:6001')
     parser.add_argument('--robot-telemetry-endpoint', default='tcp://192.168.10.37:6000')
+    parser.add_argument('--inference-type', choices=('sync', 'rtc'), default='sync')
+    parser.add_argument('--inference-rtc-execution-horizon', type=int, default=10)
     parser.add_argument('--aligned-stall-timeout-s', type=float, default=0.1)
     parser.add_argument('--lerobot-aligned-max-age-ms', type=int, default=150)
     parser.add_argument('--xense-sdk-version', choices=sorted(XENSE_SDK_CONDA_ENVS), default='2.0.1')
@@ -1346,6 +1348,8 @@ def build_inference_config(args: argparse.Namespace) -> InferenceConfig:
         'zmq_connect': args.zmq_connect,
         'robot_command_endpoint': args.robot_command_endpoint,
         'robot_telemetry_endpoint': args.robot_telemetry_endpoint,
+        'inference_type': args.inference_type,
+        'inference_rtc_execution_horizon': args.inference_rtc_execution_horizon,
         'aligned_stall_timeout_s': args.aligned_stall_timeout_s,
         'lerobot_aligned_max_age_ms': args.lerobot_aligned_max_age_ms,
         'xense_sdk_version': args.xense_sdk_version,

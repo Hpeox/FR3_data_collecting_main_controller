@@ -73,6 +73,28 @@ ros2 run main_controller inference_main_controller -- \
   --xense-sdk-version 2.0.1
 ```
 
+For an ACMT-PI05 peg `none` artifact, use the policy-local camera mapping and
+enable RTC explicitly:
+
+```bash
+ros2 run main_controller inference_main_controller -- \
+  --repo-root /home/robot/Desktop/gello-deploy \
+  --policy-path "/home/robot/Desktop/gello-deploy/LeRobotFR3/outputs/acmt_pi05/peg/none/seed42/pretrained_model" \
+  --task "insert the peg into the hole" \
+  --zmq-connect tcp://192.168.10.37:6000 \
+  --robot-command-endpoint tcp://192.168.10.37:6001 \
+  --robot-telemetry-endpoint tcp://192.168.10.37:6000 \
+  --xense-sdk-version 2.0.1 \
+  --inference-type rtc \
+  --inference-rtc-execution-horizon 10
+```
+
+PI05 consumes four RGB inputs after the policy processor maps
+`top<-cam4`, `side<-cam3`, `wrist_left<-cam1`, and `wrist_right<-cam2`, with
+the training `320x580` crops.  Its `none` tactile mode does not feed Xense
+values into the model.  PI05 gripper semantics are `0=open -> gPO3` and
+`1=closed -> gPO255`; this is distinct from older ACMT adapters.
+
 To keep runtime artifacts outside the source checkout:
 
 ```bash
@@ -107,6 +129,8 @@ ros2 run main_controller inference_main_controller -- --help
 | `--aligned-stall-timeout-s` | No | `0.1` | RUNNING aligned-sequence stall threshold. |
 | `--lerobot-aligned-max-age-ms` | No | `150` | LeRobot stale-observation fallback threshold; it must remain longer than the MainController stall threshold. |
 | `--xense-sdk-version` | No | `2.0.1` | Xense runtime selection: `1.x`, `2.0`, or `2.0.1`. |
+| `--inference-type` | No | `sync` | LeRobot inference backend; use `rtc` for relative-action PI05. |
+| `--inference-rtc-execution-horizon` | No | `10` | RTC execution horizon passed to LeRobot when `--inference-type=rtc`. |
 
 The fixed v1 aligned-observation SHM name is
 `/fr3_aligned_observation`. MainController reads only its version-pinned,

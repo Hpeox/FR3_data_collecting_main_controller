@@ -233,6 +233,41 @@ def test_inference_config_routes_worker_arguments_and_enforces_runtime_invariant
         )
 
 
+def test_inference_config_passes_rtc_options_only_when_requested(tmp_path):
+    for relative in ('FT300S', 'XenseTacSensor', 'RealSense/launch', 'LeRobotFR3'):
+        (tmp_path / relative).mkdir(parents=True, exist_ok=True)
+    for relative in (
+        'RealSense/launch/four_realsense_640x480_30.launch.py',
+        'RealSense/launch/four_realsense_shm_runtime.launch.py',
+        'RealSense/launch/rosbag2_recorder.launch.py',
+    ):
+        (tmp_path / relative).touch()
+
+    sync = InferenceConfig(policy_path='policy', task='task', repo_root=tmp_path)
+    assert not any(item.startswith('--inference.') for item in sync.lerobot_command())
+
+    rtc = InferenceConfig(
+        policy_path='policy',
+        task='task',
+        repo_root=tmp_path,
+        inference_type='rtc',
+        inference_rtc_execution_horizon=10,
+    )
+    command = rtc.lerobot_command()
+    assert '--inference.type=rtc' in command
+    assert '--inference.rtc.execution_horizon=10' in command
+
+    with pytest.raises(ValueError, match='inference_type'):
+        InferenceConfig(policy_path='policy', task='task', repo_root=tmp_path, inference_type='invalid')
+    with pytest.raises(ValueError, match='execution_horizon'):
+        InferenceConfig(
+            policy_path='policy',
+            task='task',
+            repo_root=tmp_path,
+            inference_rtc_execution_horizon=0,
+        )
+
+
 def test_response_correlation_rejects_wrong_ack_operation():
     client_socket, server_socket = memory_packet_pair()
     client = ControlledClient('/unused')

@@ -46,6 +46,8 @@ class InferenceConfig:
     ft_fps: float = 100.0
     xense_fps: float = 30.0
     xense_sdk_version: str = '2.0.1'
+    inference_type: str = 'sync'
+    inference_rtc_execution_horizon: int = 10
     startup_timeout_s: float = 60.0
     init_timeout_s: float = 15.0
     sensor_ack_timeout_s: float = 2.0
@@ -87,6 +89,14 @@ class InferenceConfig:
         runtime_root = root if self.runtime_root is None else Path(self.runtime_root).expanduser().resolve()
         if self.xense_sdk_version not in XENSE_SDK_CONDA_ENVS:
             raise ValueError(f'unsupported xense_sdk_version: {self.xense_sdk_version}')
+        if self.inference_type not in ('sync', 'rtc'):
+            raise ValueError("inference_type must be 'sync' or 'rtc'")
+        if (
+            isinstance(self.inference_rtc_execution_horizon, bool)
+            or not isinstance(self.inference_rtc_execution_horizon, int)
+            or self.inference_rtc_execution_horizon <= 0
+        ):
+            raise ValueError('inference_rtc_execution_horizon must be a positive integer')
         positive = {
             'ft_fps': self.ft_fps,
             'xense_fps': self.xense_fps,
@@ -144,7 +154,7 @@ class InferenceConfig:
 
     def lerobot_command(self) -> list[str]:
         """Build the persistent worker command without owning policy/reset state."""
-        return [
+        command = [
             'conda', 'run', '--no-capture-output', '-n', self.lerobot_conda_env,
             'lerobot-rollout',
             '--strategy.type=controlled',
@@ -161,3 +171,9 @@ class InferenceConfig:
             f'--task={self.task}',
             '--duration=0',
         ]
+        if self.inference_type == 'rtc':
+            command.extend([
+                '--inference.type=rtc',
+                f'--inference.rtc.execution_horizon={self.inference_rtc_execution_horizon}',
+            ])
+        return command

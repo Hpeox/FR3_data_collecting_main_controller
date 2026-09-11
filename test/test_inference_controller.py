@@ -1517,6 +1517,8 @@ def test_inference_cli_routes_explicit_endpoints(monkeypatch, tmp_path):
             '--zmq-connect', 'tcp://controller.example:7000',
             '--robot-command-endpoint', 'tcp://robot.example:7001',
             '--robot-telemetry-endpoint', 'tcp://robot.example:7000',
+            '--inference-type', 'rtc',
+            '--inference-rtc-execution-horizon', '10',
         ],
     )
 
@@ -1526,3 +1528,5 @@ def test_inference_cli_routes_explicit_endpoints(monkeypatch, tmp_path):
     assert config.zmq_connect == 'tcp://controller.example:7000'
     assert config.robot_command_endpoint == 'tcp://robot.example:7001'
     assert config.robot_telemetry_endpoint == 'tcp://robot.example:7000'
+    assert config.inference_type == 'rtc'
+    assert config.inference_rtc_execution_horizon == 10
