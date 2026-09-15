@@ -257,6 +257,25 @@ def test_inference_config_passes_rtc_options_only_when_requested(tmp_path):
     assert '--inference.type=rtc' in command
     assert '--inference.rtc.execution_horizon=10' in command
 
+    extended = InferenceConfig(
+        policy_path='policy',
+        task='task',
+        repo_root=tmp_path,
+        inference_type='rtc',
+        inference_rtc_execution_horizon=10,
+        inference_rtc_queue_threshold=5,
+        policy_dtype='float16',
+        policy_tactile_source='none',
+        policy_tokenizer_name='/offline/tokenizer',
+        rename_map={'observation.images.cam1': 'observation.images.top'},
+    )
+    extended_command = extended.lerobot_command()
+    assert '--inference.queue_threshold=5' in extended_command
+    assert '--policy.dtype=float16' in extended_command
+    assert '--policy.tactile_source=none' in extended_command
+    assert '--policy.tokenizer_name=/offline/tokenizer' in extended_command
+    assert '--rename_map={"observation.images.cam1":"observation.images.top"}' in extended_command
+
     with pytest.raises(ValueError, match='inference_type'):
         InferenceConfig(policy_path='policy', task='task', repo_root=tmp_path, inference_type='invalid')
     with pytest.raises(ValueError, match='execution_horizon'):
@@ -266,6 +285,18 @@ def test_inference_config_passes_rtc_options_only_when_requested(tmp_path):
             repo_root=tmp_path,
             inference_rtc_execution_horizon=0,
         )
+    with pytest.raises(ValueError, match='queue_threshold'):
+        InferenceConfig(
+            policy_path='policy', task='task', repo_root=tmp_path, inference_rtc_queue_threshold=-1
+        )
+    with pytest.raises(ValueError, match='policy_dtype'):
+        InferenceConfig(policy_path='policy', task='task', repo_root=tmp_path, policy_dtype='fp16')
+    with pytest.raises(ValueError, match='policy_tactile_source'):
+        InferenceConfig(policy_path='policy', task='task', repo_root=tmp_path, policy_tactile_source='generated')
+    with pytest.raises(ValueError, match='policy_tokenizer_name'):
+        InferenceConfig(policy_path='policy', task='task', repo_root=tmp_path, policy_tokenizer_name=' ')
+    with pytest.raises(ValueError, match='rename_map'):
+        InferenceConfig(policy_path='policy', task='task', repo_root=tmp_path, rename_map={'cam': 1})
 
 
 def test_response_correlation_rejects_wrong_ack_operation():

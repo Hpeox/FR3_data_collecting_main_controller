@@ -62,6 +62,13 @@ class InferenceConfig:
     realsense_startup_stabilization_s: float = 1.5
     realsense_image_ready_timeout_s: float = 30.0
     lerobot_conda_env: str = 'lerobot-fr3-312'
+    # Optional policy/runtime overrides.  The RTC defaults are kept explicit
+    # for compatibility with the upstream rollout options.
+    inference_rtc_queue_threshold: int | None = None
+    policy_dtype: str | None = None
+    policy_tactile_source: str | None = None
+    policy_tokenizer_name: str | None = None
+    rename_map: dict[str, str] = field(default_factory=dict)
     fatal_realsense_patterns: tuple[str, ...] = (
         'Hardware Error',
         'Depth stream start failure',
@@ -131,6 +138,25 @@ class InferenceConfig:
             raise ValueError(
                 'realsense_shm_names must match the current four-camera RealSense runtime'
             )
+        if (
+            isinstance(self.inference_rtc_queue_threshold, bool)
+            or self.inference_rtc_queue_threshold is not None
+            and (
+                not isinstance(self.inference_rtc_queue_threshold, int)
+                or self.inference_rtc_queue_threshold < 0
+            )
+        ):
+            raise ValueError('inference_rtc_queue_threshold must be a non-negative integer or None')
+        if self.policy_dtype is not None and self.policy_dtype not in {'bfloat16', 'float16', 'float32'}:
+            raise ValueError('policy_dtype must be bfloat16, float16, float32, or None')
+        if self.policy_tactile_source is not None and self.policy_tactile_source not in {'none', 'real', 'substitution'}:
+            raise ValueError('policy_tactile_source must be none, real, substitution, or None')
+        if self.policy_tokenizer_name is not None and not self.policy_tokenizer_name.strip():
+            raise ValueError('policy_tokenizer_name must be non-empty when provided')
+        if not isinstance(self.rename_map, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str) for key, value in self.rename_map.items()
+        ):
+            raise ValueError('rename_map must map string observation keys to string observation keys')
         object.__setattr__(self, 'repo_root', root)
         object.__setattr__(self, 'runtime_root', runtime_root)
         object.__setattr__(self, 'runtime_sessions_dir', runtime_root / 'runtime_sessions')
@@ -176,4 +202,14 @@ class InferenceConfig:
                 '--inference.type=rtc',
                 f'--inference.rtc.execution_horizon={self.inference_rtc_execution_horizon}',
             ])
+        if self.inference_rtc_queue_threshold is not None:
+            command.append(f'--inference.queue_threshold={self.inference_rtc_queue_threshold}')
+        if self.policy_dtype is not None:
+            command.append(f'--policy.dtype={self.policy_dtype}')
+        if self.policy_tactile_source is not None:
+            command.append(f'--policy.tactile_source={self.policy_tactile_source}')
+        if self.policy_tokenizer_name is not None:
+            command.append(f'--policy.tokenizer_name={self.policy_tokenizer_name}')
+        if self.rename_map:
+            command.append(f'--rename_map={json.dumps(self.rename_map, separators=(",", ":"))}')
         return command

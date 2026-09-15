@@ -1519,6 +1519,11 @@ def test_inference_cli_routes_explicit_endpoints(monkeypatch, tmp_path):
             '--robot-telemetry-endpoint', 'tcp://robot.example:7000',
             '--inference-type', 'rtc',
             '--inference-rtc-execution-horizon', '10',
+            '--inference-rtc-queue-threshold', '5',
+            '--policy-dtype', 'float16',
+            '--policy-tactile-source', 'none',
+            '--policy-tokenizer-name', '/offline/tokenizer',
+            '--rename-map', '{"observation.images.cam1":"observation.images.top"}',
         ],
     )
 
@@ -1530,3 +1535,8 @@ def test_inference_cli_routes_explicit_endpoints(monkeypatch, tmp_path):
     assert config.robot_telemetry_endpoint == 'tcp://robot.example:7000'
     assert config.inference_type == 'rtc'
     assert config.inference_rtc_execution_horizon == 10
+    assert config.inference_rtc_queue_threshold == 5
+    assert config.policy_dtype == 'float16'
+    assert config.policy_tactile_source == 'none'
+    assert config.policy_tokenizer_name == '/offline/tokenizer'
+    assert config.rename_map == {'observation.images.cam1': 'observation.images.top'}

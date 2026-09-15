@@ -1334,6 +1334,11 @@ def parse_inference_args() -> argparse.Namespace:
     parser.add_argument('--aligned-stall-timeout-s', type=float, default=0.1)
     parser.add_argument('--lerobot-aligned-max-age-ms', type=int, default=150)
     parser.add_argument('--xense-sdk-version', choices=sorted(XENSE_SDK_CONDA_ENVS), default='2.0.1')
+    parser.add_argument('--inference-rtc-queue-threshold', type=int, default=None)
+    parser.add_argument('--policy-dtype', choices=('bfloat16', 'float16', 'float32'), default=None)
+    parser.add_argument('--policy-tactile-source', choices=('none', 'real', 'substitution'), default=None)
+    parser.add_argument('--policy-tokenizer-name', default=None)
+    parser.add_argument('--rename-map', default=None, help='JSON map from live observation keys to policy keys')
     return parser.parse_args()
 
 
@@ -1348,12 +1353,24 @@ def build_inference_config(args: argparse.Namespace) -> InferenceConfig:
         'zmq_connect': args.zmq_connect,
         'robot_command_endpoint': args.robot_command_endpoint,
         'robot_telemetry_endpoint': args.robot_telemetry_endpoint,
-        'inference_type': args.inference_type,
-        'inference_rtc_execution_horizon': args.inference_rtc_execution_horizon,
         'aligned_stall_timeout_s': args.aligned_stall_timeout_s,
         'lerobot_aligned_max_age_ms': args.lerobot_aligned_max_age_ms,
         'xense_sdk_version': args.xense_sdk_version,
+        'inference_type': args.inference_type,
+        'inference_rtc_execution_horizon': args.inference_rtc_execution_horizon,
+        'inference_rtc_queue_threshold': args.inference_rtc_queue_threshold,
+        'policy_dtype': args.policy_dtype,
+        'policy_tactile_source': args.policy_tactile_source,
+        'policy_tokenizer_name': args.policy_tokenizer_name,
     }
+    if args.rename_map is not None:
+        try:
+            rename_map = json.loads(args.rename_map)
+        except json.JSONDecodeError as exc:
+            raise ValueError('--rename-map must be valid JSON') from exc
+        if not isinstance(rename_map, dict):
+            raise ValueError('--rename-map must be a JSON object')
+        values['rename_map'] = rename_map
     if args.control_socket_path is not None:
         values['control_socket_path'] = args.control_socket_path
     return InferenceConfig(**values)
